@@ -1,0 +1,10 @@
+{
+  "name": "@kb-agent/storage",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}

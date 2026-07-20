@@ -1,0 +1,13 @@
+node_modules/
+dist/
+out/
+coverage/
+.DS_Store
+*.log
+*.tsbuildinfo
+apps/desktop/electron/*.js
+apps/desktop/electron/*.d.ts
+apps/desktop/src/**/*.js
+apps/desktop/src/**/*.d.ts
+packages/*/src/**/*.js
+packages/*/src/**/*.d.ts

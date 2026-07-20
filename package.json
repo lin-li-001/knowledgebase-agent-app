@@ -1,0 +1,24 @@
+{
+  "name": "knowledgebase-agent-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @kb-agent/desktop dev",
+    "test": "vitest run",
+    "test:e2e": "pnpm --filter @kb-agent/desktop test:e2e",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "qa": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "electron": "^31.0.0",
+    "electron-vite": "^2.3.0",
+    "eslint": "^9.0.0",
+    "playwright": "^1.45.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.3.0",
+    "vitest": "^2.0.0"
+  }
+}
