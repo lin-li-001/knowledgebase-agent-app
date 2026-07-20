@@ -66,7 +66,7 @@ async function collectMarkdownFiles(rootPath: string): Promise<string[]> {
       continue;
     }
 
-    if (entry.isFile() && entry.name.endsWith(".md")) {
+    if (entry.isFile() && entry.name.endsWith(".md") && entry.name !== "AGENTS.md") {
       files.push(fullPath);
     }
   }

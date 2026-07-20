@@ -15,7 +15,11 @@ export async function createReviewItem(db: AppDatabase, item: ReviewItem): Promi
     )
     .run({
       ...item,
+      targetPath: item.targetPath ?? null,
       payloadJson: JSON.stringify(item.payload),
+      appliedAt: item.appliedAt ?? null,
+      supersededBy: item.supersededBy ?? null,
+      failureReason: item.failureReason ?? null,
     });
 }
 

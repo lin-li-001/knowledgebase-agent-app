@@ -72,6 +72,9 @@ importers:
 
   packages/core:
     dependencies:
+      '@kb-agent/model':
+        specifier: workspace:^
+        version: link:../model
       '@kb-agent/storage':
         specifier: workspace:^
         version: link:../storage

@@ -9,7 +9,11 @@ export async function recordActivity(db: AppDatabase, event: ActivityEvent): Pro
         @id, @workspaceId, @kind, @title, @message, @entityPath, @reviewItemId, @createdAt
       )`,
     )
-    .run(event);
+    .run({
+      ...event,
+      entityPath: event.entityPath ?? null,
+      reviewItemId: event.reviewItemId ?? null,
+    });
 }
 
 export async function listActivity(

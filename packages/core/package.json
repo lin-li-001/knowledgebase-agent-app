@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@kb-agent/model": "workspace:^",
     "@kb-agent/storage": "workspace:^",
     "@kb-agent/workspace": "workspace:^",
     "zod": "^4.4.3"
