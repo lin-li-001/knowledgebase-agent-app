@@ -1,4 +1,10 @@
 import { app, BrowserWindow } from "electron";
+import { ipcMain } from "electron";
+import { allowedChannels, handleIpcRequest, type IpcServices } from "./ipc";
+
+const ipcServices: IpcServices = {
+  activeTurns: new Set(),
+};
 
 async function createWindow(): Promise<void> {
   const window = new BrowserWindow({
@@ -17,6 +23,10 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(createWindow);
+
+for (const channel of allowedChannels) {
+  ipcMain.handle(channel, async (_event, input) => handleIpcRequest(ipcServices, channel, input));
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
