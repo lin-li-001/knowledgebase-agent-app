@@ -1,3 +1,10 @@
 export { assertInsideWorkspace } from "./pathGuard";
+export { exportLlmsFlat } from "./exporter";
+export { parseFrontmatter } from "./frontmatter";
+export { indexWorkspace, workspaceIdForRoot } from "./indexer";
+export { parseMarkdownNote } from "./markdown";
 export { createWorkspace } from "./workspace";
+export type { NoteFrontmatter } from "./frontmatter";
+export type { IndexWorkspaceResult } from "./indexer";
+export type { ParsedMarkdownNote } from "./markdown";
 export type { WorkspaceInfo } from "./workspace";
