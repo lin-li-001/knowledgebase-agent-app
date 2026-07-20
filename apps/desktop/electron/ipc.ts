@@ -2,32 +2,13 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { assertInsideWorkspace, createWorkspace } from "@kb-agent/workspace";
-
-export const allowedChannels = [
-  "workspace:create",
-  "workspace:open",
-  "workspace:get-active",
-  "settings:get",
-  "settings:update",
-  "chat:run-turn",
-  "notes:search",
-  "notes:read",
-  "review:list",
-  "review:approve",
-  "review:reject",
-  "activity:list",
-  "index:rebuild",
-  "chat:cancel-turn",
-] as const;
-
-export type IpcChannel = (typeof allowedChannels)[number];
+import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
+export { allowedChannels, isAllowedChannel } from "./ipcContract";
 
 export interface IpcServices {
   workspaceRoot?: string;
   activeTurns: Set<string>;
 }
-
-export type IpcResult<T = unknown> = { ok: true; data: T } | { ok: false; error: string };
 
 const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "workspace:create": z.object({ rootPath: z.string() }),
@@ -45,10 +26,6 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "index:rebuild": z.object({}),
   "chat:cancel-turn": z.object({ sessionId: z.string() }),
 };
-
-export function isAllowedChannel(channel: string): channel is IpcChannel {
-  return (allowedChannels as readonly string[]).includes(channel);
-}
 
 export async function handleIpcRequest(
   services: IpcServices,

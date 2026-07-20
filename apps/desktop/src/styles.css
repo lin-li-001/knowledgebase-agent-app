@@ -1,0 +1,201 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f6f7f4;
+  color: #17201b;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #9aa89f;
+  border-radius: 6px;
+  background: #1e4d3a;
+  color: #ffffff;
+  cursor: pointer;
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr) 300px;
+  min-height: 100vh;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-right: 1px solid #d7ddd7;
+  background: #fbfbf8;
+  padding: 16px;
+}
+
+.brand {
+  margin-bottom: 12px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.nav-button {
+  justify-content: flex-start;
+  background: transparent;
+  color: #17201b;
+  text-align: left;
+}
+
+.nav-button.active {
+  background: #1e4d3a;
+  color: #ffffff;
+}
+
+.content-area {
+  min-width: 0;
+  padding: 20px;
+}
+
+.route-panel,
+.activity-panel {
+  height: 100%;
+}
+
+.route-header,
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: 24px;
+}
+
+h2 {
+  font-size: 17px;
+}
+
+.activity-panel {
+  border-left: 1px solid #d7ddd7;
+  background: #ffffff;
+  padding: 16px;
+}
+
+.empty-state,
+.empty-box,
+.inline-note {
+  color: #59665f;
+}
+
+.empty-box,
+.transcript,
+.review-card {
+  border: 1px solid #d7ddd7;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 16px;
+}
+
+.composer,
+.button-row {
+  display: flex;
+  gap: 8px;
+}
+
+.composer {
+  margin-top: 16px;
+}
+
+.composer input {
+  flex: 1;
+}
+
+input,
+select {
+  min-height: 36px;
+  border: 1px solid #b8c0ba;
+  border-radius: 6px;
+  padding: 0 10px;
+}
+
+.secondary-button {
+  background: #ffffff;
+  color: #17201b;
+}
+
+.status-pill,
+.activity-kind,
+.review-meta span {
+  border-radius: 999px;
+  background: #e9efe9;
+  color: #1e4d3a;
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.review-list,
+.activity-list,
+.settings-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.review-meta {
+  display: flex;
+  gap: 6px;
+}
+
+.patch-preview {
+  margin: 12px 0;
+  border-left: 3px solid #c58b28;
+  background: #fff8ea;
+  padding: 10px;
+}
+
+.error-text {
+  color: #9d2b2b;
+}
+
+.settings-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+
+  .activity-panel {
+    border-left: 0;
+    border-top: 1px solid #d7ddd7;
+  }
+}

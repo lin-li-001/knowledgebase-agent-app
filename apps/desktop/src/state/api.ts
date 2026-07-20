@@ -1,4 +1,4 @@
-import type { IpcChannel, IpcResult } from "../../electron/ipc";
+import type { IpcChannel, IpcResult } from "../../electron/ipcContract";
 
 export interface RendererApi {
   invoke<T = unknown>(channel: IpcChannel, input: unknown): Promise<IpcResult<T>>;

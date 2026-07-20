@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { allowedChannels, type IpcChannel } from "./ipc";
+import { allowedChannels, type IpcChannel } from "./ipcContract";
 
 contextBridge.exposeInMainWorld("kbAgent", {
   version: "0.1.0",
