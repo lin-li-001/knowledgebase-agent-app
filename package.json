@@ -4,11 +4,11 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @kb-agent/desktop dev",
-    "test": "vitest run",
+    "test": "pnpm -r test",
     "test:e2e": "pnpm --filter @kb-agent/desktop test:e2e",
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
-    "qa": "pnpm typecheck && pnpm test"
+    "qa": "pnpm typecheck && pnpm test && pnpm --filter @kb-agent/desktop test:e2e"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
