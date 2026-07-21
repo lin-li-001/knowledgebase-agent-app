@@ -156,6 +156,24 @@ Broken.
       expect.arrayContaining([expect.objectContaining({ title: "Graph Memory" })]),
     );
   });
+
+  it("ignores raw markdown files in attachments", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-index-"));
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await mkdir(path.join(root, "06-Attachments/Imports/resume"), { recursive: true });
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    await writeFile(path.join(root, "06-Attachments/Imports/resume/Resume.md"), "# Raw imported resume\n\nNo frontmatter here.", "utf8");
+
+    const result = await indexWorkspace(root, db);
+
+    expect(result.noteCount).toBe(1);
+    expect(db.sqlite.prepare("SELECT path FROM notes").all()).toEqual([
+      { path: "03-Knowledge/Graph Memory.md" },
+    ]);
+  });
 });
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {

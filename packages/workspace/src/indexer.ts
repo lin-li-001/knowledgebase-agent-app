@@ -80,7 +80,7 @@ async function collectMarkdownFiles(rootPath: string): Promise<string[]> {
 }
 
 function shouldSkipDirectory(name: string): boolean {
-  return name === ".app" || name === "node_modules" || name.startsWith(".");
+  return name === ".app" || name === "06-Attachments" || name === "node_modules" || name.startsWith(".");
 }
 
 function insertParsedNote(
