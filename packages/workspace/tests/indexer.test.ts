@@ -66,7 +66,36 @@ Broken.
     );
 
     await expect(parseMarkdownNote(notePath)).rejects.toThrow(
-      "Missing required frontmatter field: title",
+      "Invalid frontmatter field title",
+    );
+  });
+
+  it("accepts profile notes created by the default workspace template", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-md-"));
+    const notePath = path.join(root, "Profile.md");
+    await writeFile(
+      notePath,
+      `---
+title: Default Profile
+type: profile
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Default Profile
+
+Profile body.
+`,
+    );
+
+    await expect(parseMarkdownNote(notePath)).resolves.toEqual(
+      expect.objectContaining({
+        frontmatter: expect.objectContaining({ type: "profile" }),
+      }),
     );
   });
 });
@@ -121,7 +150,7 @@ Broken.
 `,
     );
 
-    await expect(indexWorkspace(root, db)).rejects.toThrow("Missing required frontmatter field: title");
+    await expect(indexWorkspace(root, db)).rejects.toThrow("Invalid frontmatter field title");
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM notes").get()).toEqual({ count: 1 });
     await expect(searchNotes(db, "memory", { workspaceId: first.workspaceId })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ title: "Graph Memory" })]),

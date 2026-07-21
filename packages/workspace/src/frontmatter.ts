@@ -10,7 +10,7 @@ const frontmatterDate = z.preprocess((value) => {
 
 export const noteFrontmatterSchema = z.object({
   title: z.string().min(1),
-  type: z.enum(["inbox", "project", "knowledge", "memory", "decision", "resource"]),
+  type: z.enum(["inbox", "project", "knowledge", "memory", "decision", "resource", "profile"]),
   status: z.string().min(1),
   owner: z.string().min(1),
   scope: z.enum(["personal", "shared"]),
@@ -32,7 +32,7 @@ export function parseFrontmatter(data: unknown): NoteFrontmatter {
   if (!result.success) {
     const firstIssue = result.error.issues[0];
     if (firstIssue?.path[0]) {
-      throw new Error(`Missing required frontmatter field: ${String(firstIssue.path[0])}`);
+      throw new Error(`Invalid frontmatter field ${String(firstIssue.path[0])}: ${firstIssue.message}`);
     }
 
     throw new Error("Invalid frontmatter");

@@ -22,6 +22,7 @@ test("launch desktop app and show v0.1A shell", async () => {
   await window.getByLabel("Workspace Root").fill(workspaceRoot);
   await window.getByRole("button", { name: "Create Workspace" }).click();
   await expect(window.getByText(/Could not dynamically require/u)).not.toBeVisible();
+  await expect(window.getByText("Workspace active")).toBeVisible();
 
   await app.close();
 });

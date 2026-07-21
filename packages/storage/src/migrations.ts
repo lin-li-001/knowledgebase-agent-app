@@ -1,10 +1,7 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
+import { schemaSql } from "./schema";
 
 export const latestMigrationVersion = 1;
-
-const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
 export function runMigrations(db: Database.Database): void {
   db.pragma("foreign_keys = ON");
@@ -14,7 +11,6 @@ export function runMigrations(db: Database.Database): void {
     return;
   }
 
-  const schemaSql = readFileSync(schemaPath, "utf8");
   const migrate = db.transaction(() => {
     db.exec(schemaSql);
     db.prepare(

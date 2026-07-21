@@ -4,7 +4,7 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "test": "vitest run",
+    "test": "pnpm rebuild better-sqlite3 && vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
