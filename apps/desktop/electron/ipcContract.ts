@@ -12,6 +12,8 @@ export const allowedChannels = [
   "review:reject",
   "activity:list",
   "index:rebuild",
+  "import:start",
+  "import:get-job",
   "chat:cancel-turn",
 ] as const;
 

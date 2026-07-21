@@ -193,6 +193,44 @@ Existing memory.
       "- User's name is Lin Li.",
     );
   });
+
+  it("imports local documents into attachments and a summary note", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-import-sources-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(path.join(sourceDir, "2026-01 Electric.txt"), "Electric bill January 2026\nAmount: $123.45\n", "utf8");
+    await writeFile(path.join(sourceDir, "2026-02 Water.txt"), "Water bill February 2026\nAmount: $67.89\n", "utf8");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "import:start", {
+        batchName: "2026 Utility Bills",
+        filePaths: [
+          path.join(sourceDir, "2026-01 Electric.txt"),
+          path.join(sourceDir, "2026-02 Water.txt"),
+        ],
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          state: "completed",
+          summaryNotePath: "04-Resources/Imports/2026 Utility Bills.md",
+        }),
+      }),
+    );
+
+    await expect(readFile(path.join(root, "04-Resources/Imports/2026 Utility Bills.md"), "utf8")).resolves.toContain(
+      "Electric bill January 2026",
+    );
+  });
 });
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {

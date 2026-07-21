@@ -3,6 +3,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it } from "vitest";
 import { App } from "../src/App";
+import { ImportDropzone } from "../src/components/ImportDropzone";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
 
 describe("desktop shell", () => {
@@ -57,5 +58,13 @@ describe("desktop shell", () => {
 
     expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+  });
+
+  it("renders import controls for document batches", () => {
+    render(<ImportDropzone disabled={false} onImport={async () => undefined} />);
+
+    expect(screen.getByLabelText("Batch name")).toBeVisible();
+    expect(screen.getByLabelText("Import files")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
   });
 });

@@ -184,6 +184,20 @@ select {
   gap: 12px;
 }
 
+.import-panel {
+  display: grid;
+  max-width: 720px;
+  gap: 12px;
+  margin-top: 20px;
+  border-top: 1px solid #d7ddd7;
+  padding-top: 16px;
+}
+
+.import-panel label {
+  display: grid;
+  gap: 6px;
+}
+
 .review-meta {
   display: flex;
   gap: 6px;

@@ -4,7 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
-import { runTurn, type ToolHandler, type MvpToolName } from "@kb-agent/core";
+import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
@@ -36,6 +36,8 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "review:reject": z.object({ id: z.string() }),
   "activity:list": z.object({}),
   "index:rebuild": z.object({}),
+  "import:start": z.object({ batchName: z.string(), filePaths: z.array(z.string()).min(1) }),
+  "import:get-job": z.object({ id: z.string() }),
   "chat:cancel-turn": z.object({ sessionId: z.string() }),
 };
 
@@ -138,6 +140,18 @@ export async function handleIpcRequest(
         });
         return { ok: true, data: result };
       }
+      case "import:start": {
+        const job = await startImportBatch({
+          db: requireDatabase(services),
+          workspaceRoot: requireWorkspaceRoot(services),
+          workspaceId: requireWorkspaceId(services),
+          batchName: payload.batchName as string,
+          files: payload.filePaths as string[],
+        });
+        return { ok: true, data: job };
+      }
+      case "import:get-job":
+        return { ok: true, data: getImportJob(requireDatabase(services), payload.id as string) };
       case "chat:cancel-turn": {
         services.activeTurns.delete(payload.sessionId as string);
         services.abortControllers?.get(payload.sessionId as string)?.abort();
@@ -151,6 +165,34 @@ export async function handleIpcRequest(
       error: error instanceof Error ? error.message : "Unknown error",
     };
   }
+}
+
+function getImportJob(db: AppDatabase, id: string): unknown {
+  const row = db.sqlite
+    .prepare(
+      `SELECT
+        id,
+        batch_name as batchName,
+        state,
+        attachment_dir as attachmentDir,
+        summary_note_path as summaryNotePath,
+        source_files_json as sourceFilesJson,
+        completed_at as completedAt,
+        failure_reason as failureReason
+      FROM import_jobs
+      WHERE id = ?`,
+    )
+    .get(id) as { sourceFilesJson: string | null } | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    sourceFiles: row.sourceFilesJson ? JSON.parse(row.sourceFilesJson) : [],
+    sourceFilesJson: undefined,
+  };
 }
 
 async function approveReviewItem(services: IpcServices, id: string): Promise<IpcResult> {

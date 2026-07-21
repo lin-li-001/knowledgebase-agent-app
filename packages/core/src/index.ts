@@ -1,4 +1,5 @@
 export { recordActivityEvent, listRecentActivity } from "./activity/activityService";
+export { startImportBatch } from "./imports/importService";
 export { buildTurnContext } from "./orchestrator/contextBuilder";
 export { runTurn } from "./orchestrator/productOrchestrator";
 export { buildRequestMessages } from "./orchestrator/requestMessages";
@@ -10,6 +11,7 @@ export { reviewWorkerPrompt } from "./review/reviewPrompt";
 export { executeToolCall } from "./tools/toolExecutor";
 export { createToolRegistry, mvpToolNames } from "./tools/toolRegistry";
 export type { Proposal, ProposalRisk } from "./risk/riskPolicy";
+export type { StartImportBatchInput } from "./imports/importService";
 export type { TurnContext } from "./orchestrator/contextBuilder";
 export type { RunTurnInput, TurnEvent } from "./orchestrator/productOrchestrator";
 export type { RetrievedSnippet } from "./orchestrator/requestMessages";

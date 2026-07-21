@@ -141,6 +141,24 @@ export function App() {
     await refreshPanels();
   }
 
+  async function runImportBatch(input: { batchName: string; filePaths: string[] }) {
+    if (!api || !workspace) {
+      setError("Create or open a workspace before importing.");
+      return;
+    }
+
+    setError(null);
+    const result = await api.invoke<{ state: string; summaryNotePath?: string; failureReason?: string }>("import:start", input);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    if (result.data.state === "failed") {
+      setError(result.data.failureReason ?? "Import failed.");
+    }
+    await refreshPanels();
+  }
+
   async function updateSettings(next: { apiKey?: string; modelName?: string }) {
     if (!api) {
       setError("Desktop bridge unavailable in browser preview.");
@@ -217,7 +235,14 @@ export function App() {
             onCancel={cancelTurn}
           />
         ) : null}
-        {activeRoute === "Knowledge" ? <KnowledgeRoute rebuilding={false} onRebuild={rebuildIndex} /> : null}
+        {activeRoute === "Knowledge" ? (
+          <KnowledgeRoute
+            rebuilding={false}
+            importDisabled={!workspace}
+            onRebuild={rebuildIndex}
+            onImport={runImportBatch}
+          />
+        ) : null}
         {activeRoute === "Review" ? (
           <ReviewRoute
             items={reviewItems}
