@@ -2,7 +2,7 @@
   "name": "@kb-agent/desktop",
   "private": true,
   "type": "module",
-  "main": "electron/main.ts",
+  "main": "out/main/main.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",

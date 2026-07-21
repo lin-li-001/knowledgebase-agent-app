@@ -145,6 +145,28 @@ export function App() {
     }
   }
 
+  async function activateWorkspace(channel: "workspace:open" | "workspace:create", rootPath: string) {
+    if (!api) {
+      return;
+    }
+
+    setError(null);
+    const trimmed = rootPath.trim();
+    if (!trimmed) {
+      setError("Workspace path is required.");
+      return;
+    }
+
+    const result = await api.invoke<WorkspaceState>(channel, { rootPath: trimmed });
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+
+    setWorkspace(result.data);
+    await refreshPanels();
+  }
+
   async function updateReviewState(channel: "review:approve" | "review:reject", id: string) {
     if (!api) {
       return;
@@ -199,6 +221,8 @@ export function App() {
             modelName={settings.modelName ?? "mock"}
             workspaceRoot={workspace?.rootPath ?? ""}
             onSave={updateSettings}
+            onOpenWorkspace={(rootPath) => activateWorkspace("workspace:open", rootPath)}
+            onCreateWorkspace={(rootPath) => activateWorkspace("workspace:create", rootPath)}
           />
         ) : null}
       </div>
