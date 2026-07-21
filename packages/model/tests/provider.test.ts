@@ -105,7 +105,7 @@ describe("OpenAIProvider", () => {
 
     await expect(
       provider.complete({ model: "gpt-test", messages: [{ role: "user", content: "hi" }] }),
-    ).rejects.toThrow("Model request failed: 429");
+    ).rejects.toThrow("Model request failed: 429 nope");
   });
 });
 

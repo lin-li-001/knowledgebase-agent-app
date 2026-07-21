@@ -24,7 +24,7 @@ interface SettingsState {
 }
 
 interface ChatMessage {
-  role: "assistant" | "user";
+  role: "assistant" | "user" | "error";
   content: string;
 }
 
@@ -104,10 +104,17 @@ export function App() {
     }
 
     const assistantMessages = result.data.events
-      .filter((event) => event.type === "message" && event.content)
-      .map((event) => ({ role: "assistant" as const, content: event.content ?? "" }));
+      .filter((event) => (event.type === "message" && event.content) || (event.type === "error" && event.error))
+      .map((event) => ({
+        role: event.type === "error" ? "error" as const : "assistant" as const,
+        content: event.type === "error" ? `Error: ${event.error ?? "Unknown error"}` : event.content ?? "",
+      }));
     setChatMessages((messages) => [...messages, ...assistantMessages]);
-    setTurnState(result.data.events.some((event) => event.type === "error") ? "failed" : "complete");
+    const errorEvent = result.data.events.find((event) => event.type === "error");
+    if (errorEvent?.error) {
+      setError(errorEvent.error);
+    }
+    setTurnState(errorEvent ? "failed" : "complete");
     await refreshPanels();
   }
 

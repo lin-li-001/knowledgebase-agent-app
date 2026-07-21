@@ -134,7 +134,8 @@ h2 {
 }
 
 .assistant-message,
-.user-message {
+.user-message,
+.error-message {
   border-radius: 6px;
   margin-bottom: 10px;
   padding: 10px;
@@ -146,6 +147,11 @@ h2 {
 
 .user-message {
   background: #f7f2e7;
+}
+
+.error-message {
+  background: #fff0f0;
+  color: #9d2b2b;
 }
 
 input,

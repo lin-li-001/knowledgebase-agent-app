@@ -10,7 +10,7 @@ export function ChatRoute({
   onSend,
   onCancel,
 }: {
-  messages: Array<{ role: "assistant" | "user"; content: string }>;
+  messages: Array<{ role: "assistant" | "user" | "error"; content: string }>;
   hasWorkspace: boolean;
   hasApiKey: boolean;
   turnState: ChatTurnState;
@@ -43,7 +43,10 @@ export function ChatRoute({
           {!hasApiKey ? <p className="inline-note">Mock provider active until an API key is saved.</p> : null}
           <div className="transcript">
             {messages.map((message, index) => (
-              <p key={`${message.role}-${index}`} className={message.role === "assistant" ? "assistant-message" : "user-message"}>
+              <p
+                key={`${message.role}-${index}`}
+                className={message.role === "user" ? "user-message" : message.role === "error" ? "error-message" : "assistant-message"}
+              >
                 {message.content}
               </p>
             ))}

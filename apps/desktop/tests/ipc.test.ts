@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { CostEstimate, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent } from "@kb-agent/model";
 import { allowedChannels, handleIpcRequest, isAllowedChannel, type IpcServices } from "../electron/ipc";
 
 const opened: IpcServices[] = [];
@@ -78,6 +79,34 @@ describe("IPC contract", () => {
       }),
     );
   });
+
+  it("returns chat error events instead of silently dropping model failures", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: new FailingProvider("bad model"),
+    };
+    opened.push(services);
+
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "Find memory" }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          events: expect.arrayContaining([expect.objectContaining({ type: "error", error: "bad model" })]),
+        }),
+      }),
+    );
+  });
 });
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {
@@ -100,4 +129,23 @@ ${body}
 `,
     "utf8",
   );
+}
+
+class FailingProvider implements ModelProvider {
+  readonly supportsToolCalling = true;
+  readonly supportsPromptCache = false;
+
+  constructor(private readonly message: string) {}
+
+  async complete(_input: ModelRequest): Promise<ModelResponse> {
+    throw new Error(this.message);
+  }
+
+  async *stream(_input: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    throw new Error(this.message);
+  }
+
+  async estimateCost(): Promise<CostEstimate> {
+    return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
 }

@@ -73,7 +73,8 @@ export class OpenAIProvider implements ModelProvider {
     });
 
     if (!response.ok) {
-      throw new Error(`Model request failed: ${response.status}`);
+      const body = await response.text();
+      throw new Error(`Model request failed: ${response.status}${body ? ` ${body.slice(0, 500)}` : ""}`);
     }
 
     const json = (await response.json()) as OpenAIChatCompletion;
