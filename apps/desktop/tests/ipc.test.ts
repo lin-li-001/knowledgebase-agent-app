@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -132,10 +132,65 @@ describe("IPC contract", () => {
       .run("review-1", services.workspaceId, "proposed", "high", "propose_memory", "{\"body\":\"Remember Lin\"}", "reason", services.sessionId, "turn-1", now);
 
     await expect(handleIpcRequest(services, "review:approve", { id: "review-1" })).resolves.toEqual(
-      { ok: true, data: { id: "review-1", state: "approved" } },
+      { ok: true, data: { id: "review-1", state: "applied" } },
     );
     await expect(handleIpcRequest(services, "review:approve", { id: "review-1" })).resolves.toEqual(
-      { ok: true, data: { id: "review-1", state: "approved" } },
+      { ok: true, data: { id: "review-1", state: "applied" } },
+    );
+  });
+
+  it("applies approved memory proposals to the default memory note", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "02-Profiles/default"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(
+      path.join(root, "02-Profiles/default/Memory.md"),
+      `---
+title: Default Memory
+type: memory
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Default Memory
+
+Existing memory.
+`,
+      "utf8",
+    );
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    const openResult = await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    expect(openResult).toEqual(expect.objectContaining({ ok: true }));
+    expect(services.workspaceId).toBeTruthy();
+    expect(services.sessionId).toBeTruthy();
+
+    const now = new Date().toISOString();
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-memory-1", services.workspaceId, "proposed", "high", "propose_memory", "{\"body\":\"User's name is Lin Li.\"}", "reason", services.sessionId, "turn-1", now);
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-memory-1" })).resolves.toEqual(
+      { ok: true, data: { id: "review-memory-1", state: "applied" } },
+    );
+
+    await expect(readFile(path.join(root, "02-Profiles/default/Memory.md"), "utf8")).resolves.toContain(
+      "- User's name is Lin Li.",
     );
   });
 });

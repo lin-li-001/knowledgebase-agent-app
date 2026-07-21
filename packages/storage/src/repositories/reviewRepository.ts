@@ -28,10 +28,11 @@ export async function transitionReviewItem(
   id: string,
   from: ReviewState,
   to: ReviewState,
+  options: { appliedAt?: string; failureReason?: string | null } = {},
 ): Promise<void> {
   const result = db.sqlite
-    .prepare("UPDATE review_items SET state = ? WHERE id = ? AND state = ?")
-    .run(to, id, from);
+    .prepare("UPDATE review_items SET state = ?, applied_at = ?, failure_reason = ? WHERE id = ? AND state = ?")
+    .run(to, options.appliedAt ?? null, options.failureReason ?? null, id, from);
 
   if (result.changes !== 1) {
     throw new Error("Invalid review transition");
@@ -44,6 +45,32 @@ export async function getReviewItemState(db: AppDatabase, id: string): Promise<R
     .get(id) as { state: ReviewState } | undefined;
 
   return row?.state ?? null;
+}
+
+export async function getReviewItem(db: AppDatabase, id: string): Promise<ReviewItem | null> {
+  const row = db.sqlite
+    .prepare(
+      `SELECT
+        id,
+        workspace_id as workspaceId,
+        state,
+        risk,
+        proposal_type as proposalType,
+        target_path as targetPath,
+        payload_json as payloadJson,
+        reason,
+        source_session_id as sourceSessionId,
+        source_turn_id as sourceTurnId,
+        created_at as createdAt,
+        applied_at as appliedAt,
+        superseded_by as supersededBy,
+        failure_reason as failureReason
+      FROM review_items
+      WHERE id = ?`,
+    )
+    .get(id) as (ReviewItem & { payloadJson: string | null }) | undefined;
+
+  return row ? parseReviewRow(row) : null;
 }
 
 export async function listReviewItems(
@@ -77,31 +104,33 @@ export async function listReviewItems(
     )
     .all({ workspaceId, state, limit }) as Array<ReviewItem & { payloadJson: string | null }>;
 
-  return rows.map(({ payloadJson, ...row }) => {
-    const item: ReviewItem = {
-      id: row.id,
-      workspaceId: row.workspaceId,
-      state: row.state,
-      risk: row.risk,
-      proposalType: row.proposalType,
-      payload: payloadJson ? JSON.parse(payloadJson) : null,
-      reason: row.reason,
-      sourceSessionId: row.sourceSessionId,
-      sourceTurnId: row.sourceTurnId,
-      createdAt: row.createdAt,
-    };
-    if (row.targetPath) {
-      item.targetPath = row.targetPath;
-    }
-    if (row.appliedAt) {
-      item.appliedAt = row.appliedAt;
-    }
-    if (row.supersededBy) {
-      item.supersededBy = row.supersededBy;
-    }
-    if (row.failureReason) {
-      item.failureReason = row.failureReason;
-    }
-    return item;
-  });
+  return rows.map(parseReviewRow);
+}
+
+function parseReviewRow({ payloadJson, ...row }: ReviewItem & { payloadJson: string | null }): ReviewItem {
+  const item: ReviewItem = {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    state: row.state,
+    risk: row.risk,
+    proposalType: row.proposalType,
+    payload: payloadJson ? JSON.parse(payloadJson) : null,
+    reason: row.reason,
+    sourceSessionId: row.sourceSessionId,
+    sourceTurnId: row.sourceTurnId,
+    createdAt: row.createdAt,
+  };
+  if (row.targetPath) {
+    item.targetPath = row.targetPath;
+  }
+  if (row.appliedAt) {
+    item.appliedAt = row.appliedAt;
+  }
+  if (row.supersededBy) {
+    item.supersededBy = row.supersededBy;
+  }
+  if (row.failureReason) {
+    item.failureReason = row.failureReason;
+  }
+  return item;
 }

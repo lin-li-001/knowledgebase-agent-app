@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { createReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
+import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
@@ -121,9 +121,9 @@ export async function handleIpcRequest(
       case "review:list":
         return { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
       case "review:approve":
-        return approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "approved");
+        return await approveReviewItem(services, payload.id as string);
       case "review:reject":
-        return approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
+        return await approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
       case "activity:list":
         return { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
       case "index:rebuild": {
@@ -153,6 +153,50 @@ export async function handleIpcRequest(
   }
 }
 
+async function approveReviewItem(services: IpcServices, id: string): Promise<IpcResult> {
+  const db = requireDatabase(services);
+  const item = await getReviewItem(db, id);
+  if (!item) {
+    return { ok: false, error: "Review item not found" };
+  }
+  if (item.state === "applied") {
+    return { ok: true, data: { id, state: "applied" } };
+  }
+  if (item.state !== "proposed" && item.state !== "approved") {
+    return { ok: false, error: `Review item is already ${item.state}` };
+  }
+
+  if (item.proposalType !== "propose_memory") {
+    if (item.state === "approved") {
+      return { ok: true, data: { id, state: "approved" } };
+    }
+
+    await transitionReviewItem(db, id, "proposed", "approved");
+    return { ok: true, data: { id, state: "approved" } };
+  }
+
+  if (item.state === "proposed") {
+    await transitionReviewItem(db, id, "proposed", "approved");
+  }
+
+  await applyMemoryProposal(services, item);
+  const appliedAt = new Date().toISOString();
+  await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
+  await recordActivity(db, {
+    id: randomUUID(),
+    workspaceId: item.workspaceId,
+    kind: "review",
+    title: "Memory saved",
+    message: "Approved memory proposal was saved.",
+    entityPath: "02-Profiles/default/Memory.md",
+    reviewItemId: id,
+    createdAt: appliedAt,
+  });
+  await indexWorkspace(requireWorkspaceRoot(services), db);
+
+  return { ok: true, data: { id, state: "applied" } };
+}
+
 async function approveOrRejectReviewItem(db: AppDatabase, id: string, targetState: Extract<ReviewState, "approved" | "rejected">): Promise<IpcResult> {
   const currentState = await getReviewItemState(db, id);
   if (!currentState) {
@@ -167,6 +211,51 @@ async function approveOrRejectReviewItem(db: AppDatabase, id: string, targetStat
 
   await transitionReviewItem(db, id, "proposed", targetState);
   return { ok: true, data: { id, state: targetState } };
+}
+
+async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Promise<void> {
+  const body = extractMemoryBody(item.payload);
+  if (!body) {
+    throw new Error("Memory proposal is missing body");
+  }
+
+  const relativePath = "02-Profiles/default/Memory.md";
+  const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
+  await mkdir(path.dirname(targetPath), { recursive: true });
+  const current = await readFile(targetPath, "utf8").catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      const created = new Date().toISOString().slice(0, 10);
+      return `---
+title: Default Memory
+type: memory
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: ${created}
+tags: []
+---
+
+# Default Memory
+`;
+    }
+    throw error;
+  });
+  const bullet = `- ${body}`;
+  if (current.includes(bullet) || current.includes(body)) {
+    return;
+  }
+
+  await writeFile(targetPath, `${current.trimEnd()}\n\n${bullet}\n`, "utf8");
+}
+
+function extractMemoryBody(payload: unknown): string | null {
+  if (typeof payload === "object" && payload !== null && "body" in payload && typeof payload.body === "string") {
+    const body = payload.body.trim();
+    return body || null;
+  }
+
+  return null;
 }
 
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {

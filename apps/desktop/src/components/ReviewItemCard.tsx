@@ -18,7 +18,8 @@ export function ReviewItemCard({
   onApprove?(id: string): Promise<void>;
   onReject?(id: string): Promise<void>;
 }) {
-  const canReview = item.state === undefined || item.state === "proposed";
+  const canApprove = item.state === undefined || item.state === "proposed" || item.state === "approved";
+  const canReject = item.state === undefined || item.state === "proposed";
 
   return (
     <article className="review-card">
@@ -35,10 +36,10 @@ export function ReviewItemCard({
       </div>
       {item.failureReason ? <p className="error-text">{item.failureReason}</p> : null}
       <div className="button-row">
-        <button type="button" disabled={!canReview} onClick={() => void onApprove?.(item.id)}>
+        <button type="button" disabled={!canApprove} onClick={() => void onApprove?.(item.id)}>
           Approve
         </button>
-        <button type="button" className="secondary-button" disabled={!canReview} onClick={() => void onReject?.(item.id)}>
+        <button type="button" className="secondary-button" disabled={!canReject} onClick={() => void onReject?.(item.id)}>
           Reject
         </button>
       </div>

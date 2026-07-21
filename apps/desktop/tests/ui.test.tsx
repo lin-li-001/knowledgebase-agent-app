@@ -41,12 +41,12 @@ describe("desktop shell", () => {
     expect(screen.getByText("proposed")).toBeVisible();
   });
 
-  it("disables review actions after a proposal leaves proposed state", () => {
+  it("disables review actions after a proposal is applied", () => {
     render(
       <ReviewItemCard
         item={{
           id: "review-1",
-          state: "approved",
+          state: "applied",
           proposalType: "propose_memory",
           risk: "high",
           reason: "Model proposed a knowledge-base change.",
