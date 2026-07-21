@@ -20,7 +20,18 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
   }
 
   if (extension === ".pdf") {
-    throw new Error("PDF import requires the PDF parser dependency");
+    const { PDFParse } = await import("pdf-parse");
+    const parser = new PDFParse({ data: await readFile(sourcePath) });
+    try {
+      const result = await parser.getText();
+      return {
+        sourcePath,
+        fileName,
+        text: result.text.trim(),
+      };
+    } finally {
+      await parser.destroy();
+    }
   }
 
   if (extension === ".docx") {

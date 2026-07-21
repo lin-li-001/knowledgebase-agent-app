@@ -10,6 +10,7 @@
   "dependencies": {
     "@kb-agent/storage": "workspace:^",
     "gray-matter": "^4.0.3",
+    "pdf-parse": "^2.4.5",
     "zod": "^4.4.3"
   }
 }
