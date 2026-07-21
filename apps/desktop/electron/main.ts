@@ -1,7 +1,8 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, safeStorage } from "electron";
 import { ipcMain } from "electron";
 import path from "node:path";
 import { allowedChannels, handleIpcRequest, type IpcServices } from "./ipc";
+import { createEncryptedFileSecretStore } from "./secureSettings";
 
 const ipcServices: IpcServices = {
   activeTurns: new Set(),
@@ -25,7 +26,9 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(createWindow);
-ipcServices.settingsPath = path.join(app.getPath("userData"), "settings.json");
+const userDataPath = app.getPath("userData");
+ipcServices.settingsPath = path.join(userDataPath, "settings.json");
+ipcServices.secretStore = createEncryptedFileSecretStore(path.join(userDataPath, "secrets.json"), safeStorage);
 
 for (const channel of allowedChannels) {
   ipcMain.handle(channel, async (_event, input) => handleIpcRequest(ipcServices, channel, input));

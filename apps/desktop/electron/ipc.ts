@@ -6,7 +6,7 @@ import { createReviewItem, listActivity, listReviewItems, openAppDatabase, recor
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
-import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings } from "./secureSettings";
+import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
 export { allowedChannels, isAllowedChannel } from "./ipcContract";
 
@@ -16,6 +16,7 @@ export interface IpcServices {
   db?: AppDatabase;
   sessionId?: string;
   settingsPath?: string;
+  secretStore?: SecretStore;
   activeTurns: Set<string>;
   abortControllers?: Map<string, AbortController>;
   modelProvider?: ModelProvider;
@@ -67,12 +68,12 @@ export async function handleIpcRequest(
         };
       case "settings:get": {
         const settings = await readDesktopSettings(requireSettingsPath(services));
-        return { ok: true, data: { ...settings, hasApiKey: Boolean(await loadApiKey(requireSettingsPath(services))) } };
+        return { ok: true, data: { ...settings, hasApiKey: Boolean(await loadApiKey(requireSettingsPath(services), services.secretStore)) } };
       }
       case "settings:update": {
         const settingsPath = requireSettingsPath(services);
         if (typeof payload.apiKey === "string" && payload.apiKey.trim()) {
-          await saveApiKey(settingsPath, payload.apiKey.trim());
+          await saveApiKey(settingsPath, payload.apiKey.trim(), services.secretStore);
         }
         if (typeof payload.modelName === "string") {
           const settings = await readDesktopSettings(settingsPath);
@@ -261,7 +262,7 @@ async function getModelProvider(services: IpcServices): Promise<ModelProvider> {
     return services.modelProvider;
   }
 
-  const apiKey = services.settingsPath ? await loadApiKey(services.settingsPath) : null;
+  const apiKey = services.settingsPath ? await loadApiKey(services.settingsPath, services.secretStore) : null;
   if (apiKey) {
     return new OpenAIProvider({ apiKey });
   }
