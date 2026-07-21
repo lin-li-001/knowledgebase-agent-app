@@ -13,7 +13,7 @@ async function createWindow(): Promise<void> {
     width: 1200,
     height: 800,
     webPreferences: {
-      preload: new URL("./preload.js", import.meta.url).pathname,
+      preload: new URL("../preload/preload.js", import.meta.url).pathname,
     },
   });
 

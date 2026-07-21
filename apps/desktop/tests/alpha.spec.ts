@@ -9,6 +9,12 @@ test("launch desktop app and show v0.1A shell", async () => {
   await expect(window.getByRole("button", { name: "Review" })).toBeVisible();
   await expect(window.getByRole("button", { name: "Settings" })).toBeVisible();
   await expect(window.getByRole("complementary", { name: "Activity" })).toBeVisible();
+  await expect.poll(() => window.evaluate(() => Boolean(window.kbAgent?.invoke))).toBe(true);
+
+  await window.getByRole("button", { name: "Settings" }).click();
+  await expect(window.getByRole("button", { name: "Save Settings" })).toBeEnabled();
+  await expect(window.getByRole("button", { name: "Open Workspace" })).toBeEnabled();
+  await expect(window.getByRole("button", { name: "Create Workspace" })).toBeEnabled();
 
   await app.close();
 });
