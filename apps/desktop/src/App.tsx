@@ -48,9 +48,11 @@ export function App() {
   ]);
   const [turnState, setTurnState] = useState<"idle" | "queued" | "streaming" | "tool-running" | "interrupted" | "failed" | "complete">("idle");
   const [error, setError] = useState<string | null>(null);
+  const desktopBridgeReady = Boolean(api);
 
   async function refreshPanels() {
     if (!api) {
+      setError("Desktop bridge unavailable in browser preview.");
       return;
     }
 
@@ -134,6 +136,7 @@ export function App() {
 
   async function updateSettings(next: { apiKey?: string; modelName?: string }) {
     if (!api) {
+      setError("Desktop bridge unavailable in browser preview.");
       return;
     }
 
@@ -220,6 +223,7 @@ export function App() {
             hasApiKey={settings.hasApiKey}
             modelName={settings.modelName ?? "mock"}
             workspaceRoot={workspace?.rootPath ?? ""}
+            desktopBridgeReady={desktopBridgeReady}
             onSave={updateSettings}
             onOpenWorkspace={(rootPath) => activateWorkspace("workspace:open", rootPath)}
             onCreateWorkspace={(rootPath) => activateWorkspace("workspace:create", rootPath)}

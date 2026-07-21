@@ -4,6 +4,7 @@ export function SettingsRoute({
   hasApiKey,
   modelName,
   workspaceRoot,
+  desktopBridgeReady,
   onSave,
   onOpenWorkspace,
   onCreateWorkspace,
@@ -11,6 +12,7 @@ export function SettingsRoute({
   hasApiKey: boolean;
   modelName: string;
   workspaceRoot: string;
+  desktopBridgeReady: boolean;
   onSave(settings: { apiKey?: string; modelName?: string }): Promise<void>;
   onOpenWorkspace(rootPath: string): Promise<void>;
   onCreateWorkspace(rootPath: string): Promise<void>;
@@ -24,6 +26,7 @@ export function SettingsRoute({
       <div className="route-header">
         <h1 id="settings-heading">Settings</h1>
       </div>
+      {!desktopBridgeReady ? <p className="inline-note">Desktop bridge unavailable in browser preview.</p> : null}
       <div className="settings-grid">
         <label>
           Workspace Root
@@ -57,14 +60,14 @@ export function SettingsRoute({
         </label>
       </div>
       <div className="button-row">
-        <button type="button" onClick={() => void onOpenWorkspace(rootPath)}>
+        <button type="button" disabled={!desktopBridgeReady} onClick={() => void onOpenWorkspace(rootPath)}>
           Open Workspace
         </button>
-        <button type="button" className="secondary-button" onClick={() => void onCreateWorkspace(rootPath)}>
+        <button type="button" className="secondary-button" disabled={!desktopBridgeReady} onClick={() => void onCreateWorkspace(rootPath)}>
           Create Workspace
         </button>
       </div>
-      <button type="button" onClick={() => void onSave({ apiKey, modelName: model })}>
+      <button type="button" disabled={!desktopBridgeReady} onClick={() => void onSave({ apiKey, modelName: model })}>
         Save Settings
       </button>
     </section>
