@@ -3,6 +3,7 @@ import { render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { describe, expect, it } from "vitest";
 import { App } from "../src/App";
+import { ReviewItemCard } from "../src/components/ReviewItemCard";
 
 describe("desktop shell", () => {
   it("renders primary navigation and Activity", () => {
@@ -14,5 +15,25 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
     expect(screen.getByRole("complementary", { name: "Activity" })).toBeVisible();
     expect(screen.getByText("No activity yet")).toBeVisible();
+  });
+
+  it("renders review proposal payload details", () => {
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-1",
+          state: "proposed",
+          proposalType: "propose_memory",
+          risk: "high",
+          reason: "Model proposed a knowledge-base change.",
+          payload: { body: "Lin Li has two kids, Grace and Leo." },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Memory proposal")).toBeVisible();
+    expect(screen.getByText("Memory to save")).toBeVisible();
+    expect(screen.getByText("Lin Li has two kids, Grace and Leo.")).toBeVisible();
+    expect(screen.getByText("proposed")).toBeVisible();
   });
 });

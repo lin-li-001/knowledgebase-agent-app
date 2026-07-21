@@ -196,6 +196,12 @@ select {
   padding: 10px;
 }
 
+.patch-preview pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .error-text {
   color: #9d2b2b;
 }
