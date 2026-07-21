@@ -6,6 +6,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: z.ZodTypeAny;
+  jsonSchema: unknown;
   maxResultSize: number;
   riskCategory: ToolRiskCategory;
 }
@@ -54,6 +55,7 @@ function tool(
     name,
     description,
     parameters,
+    jsonSchema: z.toJSONSchema(parameters),
     maxResultSize: 8_000,
     riskCategory,
   };

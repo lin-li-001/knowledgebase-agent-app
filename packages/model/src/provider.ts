@@ -3,6 +3,7 @@ export type ModelRole = "system" | "user" | "assistant" | "tool";
 export interface ModelMessage {
   role: ModelRole;
   content: string;
+  toolCalls?: ModelToolCall[];
   toolCallId?: string;
 }
 

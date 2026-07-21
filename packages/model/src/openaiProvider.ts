@@ -1,5 +1,6 @@
 import type {
   CostEstimate,
+  ModelMessage,
   ModelProvider,
   ModelRequest,
   ModelResponse,
@@ -24,11 +25,17 @@ interface OpenAIChatCompletion {
 
 interface OpenAIToolCall {
   id: string;
+  type?: "function";
   function?: {
     name?: string;
     arguments?: string;
   };
 }
+
+type OpenAIMessage =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: OpenAIToolCall[] }
+  | { role: "tool"; content: string; tool_call_id: string };
 
 export class OpenAIProvider implements ModelProvider {
   readonly supportsToolCalling = true;
@@ -53,7 +60,7 @@ export class OpenAIProvider implements ModelProvider {
       },
       body: JSON.stringify({
         model: input.model,
-        messages: input.messages,
+        messages: input.messages.map(serializeMessage),
         tools: input.tools?.map((tool) => ({
           type: "function",
           function: {
@@ -103,6 +110,44 @@ export class OpenAIProvider implements ModelProvider {
       estimatedUsd: 0,
     };
   }
+}
+
+function serializeMessage(message: ModelMessage): OpenAIMessage {
+  if (message.role === "tool") {
+    if (!message.toolCallId) {
+      throw new Error("Tool message missing toolCallId");
+    }
+
+    return {
+      role: "tool",
+      content: message.content,
+      tool_call_id: message.toolCallId,
+    };
+  }
+
+  if (message.role === "assistant") {
+    const serialized: OpenAIMessage = {
+      role: "assistant",
+      content: message.content || null,
+    };
+    if (message.toolCalls?.length) {
+      serialized.tool_calls = message.toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        type: "function",
+        function: {
+          name: toolCall.name,
+          arguments: toolCall.argumentsJson,
+        },
+      }));
+    }
+
+    return serialized;
+  }
+
+  return {
+    role: message.role,
+    content: message.content,
+  };
 }
 
 function mapToolCalls(toolCalls: OpenAIToolCall[] | undefined): ModelToolCall[] | undefined {

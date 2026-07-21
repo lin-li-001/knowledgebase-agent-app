@@ -3,6 +3,7 @@ import path from "node:path";
 
 const serviceName = "knowledgebase-agent-app";
 const defaultAccount = "openai:default";
+const defaultSecretStore = createMemorySecretStore();
 
 export interface SecretStore {
   setPassword(service: string, account: string, password: string): Promise<void>;
@@ -17,12 +18,12 @@ export interface DesktopSettings {
 export async function saveApiKey(
   settingsPath: string,
   apiKey: string,
-  store: SecretStore = createMemorySecretStore(),
+  store: SecretStore = defaultSecretStore,
 ): Promise<void> {
   await store.setPassword(serviceName, defaultAccount, apiKey);
 
-  const settings = await readSettings(settingsPath);
-  await writeSettings(settingsPath, {
+  const settings = await readDesktopSettings(settingsPath);
+  await writeDesktopSettings(settingsPath, {
     ...settings,
     providerKeyAlias: defaultAccount,
   });
@@ -30,9 +31,9 @@ export async function saveApiKey(
 
 export async function loadApiKey(
   settingsPath: string,
-  store: SecretStore = createMemorySecretStore(),
+  store: SecretStore = defaultSecretStore,
 ): Promise<string | null> {
-  const settings = await readSettings(settingsPath);
+  const settings = await readDesktopSettings(settingsPath);
   if (!settings.providerKeyAlias) {
     return null;
   }
@@ -53,7 +54,7 @@ export function createMemorySecretStore(): SecretStore {
   };
 }
 
-async function readSettings(settingsPath: string): Promise<DesktopSettings> {
+export async function readDesktopSettings(settingsPath: string): Promise<DesktopSettings> {
   try {
     return JSON.parse(await readFile(settingsPath, "utf8")) as DesktopSettings;
   } catch (error) {
@@ -65,7 +66,7 @@ async function readSettings(settingsPath: string): Promise<DesktopSettings> {
   }
 }
 
-async function writeSettings(settingsPath: string, settings: DesktopSettings): Promise<void> {
+export async function writeDesktopSettings(settingsPath: string, settings: DesktopSettings): Promise<void> {
   await mkdir(path.dirname(settingsPath), { recursive: true });
   await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
 }

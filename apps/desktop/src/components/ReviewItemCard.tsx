@@ -7,7 +7,15 @@ export interface ReviewCardItem {
   failureReason?: string;
 }
 
-export function ReviewItemCard({ item }: { item: ReviewCardItem }) {
+export function ReviewItemCard({
+  item,
+  onApprove,
+  onReject,
+}: {
+  item: ReviewCardItem;
+  onApprove?(id: string): Promise<void>;
+  onReject?(id: string): Promise<void>;
+}) {
   return (
     <article className="review-card">
       <div className="review-meta">
@@ -19,8 +27,10 @@ export function ReviewItemCard({ item }: { item: ReviewCardItem }) {
       <div className="patch-preview">Structured patch preview</div>
       {item.failureReason ? <p className="error-text">{item.failureReason}</p> : null}
       <div className="button-row">
-        <button type="button">Approve</button>
-        <button type="button" className="secondary-button">
+        <button type="button" onClick={() => void onApprove?.(item.id)}>
+          Approve
+        </button>
+        <button type="button" className="secondary-button" onClick={() => void onReject?.(item.id)}>
           Reject
         </button>
       </div>

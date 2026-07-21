@@ -1,6 +1,14 @@
 import { ReviewItemCard, type ReviewCardItem } from "../components/ReviewItemCard";
 
-export function ReviewRoute({ items }: { items: ReviewCardItem[] }) {
+export function ReviewRoute({
+  items,
+  onApprove,
+  onReject,
+}: {
+  items: ReviewCardItem[];
+  onApprove(id: string): Promise<void>;
+  onReject(id: string): Promise<void>;
+}) {
   return (
     <section className="route-panel" aria-labelledby="review-heading">
       <div className="route-header">
@@ -11,7 +19,7 @@ export function ReviewRoute({ items }: { items: ReviewCardItem[] }) {
       ) : (
         <div className="review-list">
           {items.map((item) => (
-            <ReviewItemCard key={item.id} item={item} />
+            <ReviewItemCard key={item.id} item={item} onApprove={onApprove} onReject={onReject} />
           ))}
         </div>
       )}

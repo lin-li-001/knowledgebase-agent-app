@@ -1,9 +1,11 @@
 import { app, BrowserWindow } from "electron";
 import { ipcMain } from "electron";
+import path from "node:path";
 import { allowedChannels, handleIpcRequest, type IpcServices } from "./ipc";
 
 const ipcServices: IpcServices = {
   activeTurns: new Set(),
+  abortControllers: new Map(),
 };
 
 async function createWindow(): Promise<void> {
@@ -23,6 +25,7 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(createWindow);
+ipcServices.settingsPath = path.join(app.getPath("userData"), "settings.json");
 
 for (const channel of allowedChannels) {
   ipcMain.handle(channel, async (_event, input) => handleIpcRequest(ipcServices, channel, input));

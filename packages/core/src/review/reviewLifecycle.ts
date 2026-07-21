@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
+import { assertInsideWorkspace } from "@kb-agent/workspace";
 
 export type ReviewState = "proposed" | "approved" | "applied" | "rejected" | "superseded" | "failed";
 
@@ -41,12 +42,13 @@ export function transitionReviewState(from: ReviewState, to: ReviewState): Revie
   return to;
 }
 
-export async function applyReviewItem(item: ReviewItem): Promise<ReviewItem> {
+export async function applyReviewItem(item: ReviewItem, workspaceRoot: string): Promise<ReviewItem> {
   if (!item.targetPath || !item.patch) {
     return { ...item, state: transitionReviewState(item.state, "failed"), failureReason: "Missing target or patch" };
   }
 
-  const currentBody = await readFile(item.targetPath, "utf8");
+  const targetPath = assertInsideWorkspace(workspaceRoot, item.targetPath);
+  const currentBody = await readFile(targetPath, "utf8");
   const currentHash = createHash("sha256").update(currentBody).digest("hex");
   if (currentHash !== item.patch.baseContentHash) {
     return {
@@ -57,12 +59,12 @@ export async function applyReviewItem(item: ReviewItem): Promise<ReviewItem> {
   }
 
   if (item.patch.kind === "replace_body") {
-    await writeFile(item.targetPath, item.patch.nextBody, "utf8");
+    await writeFile(targetPath, item.patch.nextBody, "utf8");
     return { ...item, state: transitionReviewState(item.state, "applied") };
   }
 
   const nextBody = replaceSection(currentBody, item.patch.headingPath, item.patch.nextSectionBody);
-  await writeFile(item.targetPath, nextBody, "utf8");
+  await writeFile(targetPath, nextBody, "utf8");
   return { ...item, state: transitionReviewState(item.state, "applied") };
 }
 

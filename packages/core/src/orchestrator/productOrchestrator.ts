@@ -71,28 +71,41 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       input.userMessage,
       context.snippets,
     );
+    const transcript: ModelMessage[] = [...messages];
 
     let response = await input.modelProvider.complete({
       model: input.model,
-      messages,
+      messages: transcript,
       tools: [...registry.values()].map((tool) => ({
         name: tool.name,
         description: tool.description,
-        parameters: tool.parameters,
+        parameters: tool.jsonSchema,
       })),
     });
 
     for (let callCount = 0; callCount < 8 && response.toolCalls?.length; callCount += 1) {
+      transcript.push({
+        role: "assistant",
+        content: response.content,
+        toolCalls: response.toolCalls,
+      });
+
       for (const toolCall of response.toolCalls) {
         yield { type: "tool_call", toolCall };
         const args = JSON.parse(toolCall.argumentsJson || "{}") as unknown;
         const result = await executeToolCall(registry, handlers, toolCall.name, args);
+        const content = boundToolResult(result);
         yield { type: "tool_result", toolCallId: toolCall.id, result };
+        transcript.push({
+          role: "tool",
+          content,
+          toolCallId: toolCall.id,
+        });
         await appendMessage(input.db, {
           id: `${input.sessionId}:tool:${toolCall.id}`,
           sessionId: input.sessionId,
           role: "tool",
-          content: boundToolResult(result),
+          content,
           toolResult: result,
           createdAt: now,
         });
@@ -100,7 +113,7 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
 
       response = await input.modelProvider.complete({
         model: input.model,
-        messages: [...messages, { role: "assistant", content: response.content }],
+        messages: transcript,
       });
     }
 

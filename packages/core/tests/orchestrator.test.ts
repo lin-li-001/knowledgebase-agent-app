@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MockProvider } from "@kb-agent/model";
+import { MockProvider, type CostEstimate, type ModelProvider, type ModelRequest, type ModelResponse, type ModelStreamEvent } from "@kb-agent/model";
 import { openAppDatabase, type AppDatabase } from "@kb-agent/storage";
 import { indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
 import { runTurn, type ToolHandler } from "../src/index";
@@ -81,4 +81,99 @@ Graph memory architecture
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM messages").get()).toEqual({ count: 3 });
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM activity_events").get()).toEqual({ count: 1 });
   });
+
+  it("passes tool results into the follow-up model request", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-turn-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.");
+    await writeFile(
+      path.join(root, "03-Knowledge/Graph Memory.md"),
+      `---
+title: Graph Memory
+type: knowledge
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: [graph]
+---
+
+# Graph Memory
+
+Graph memory architecture
+`,
+    );
+
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+    const { workspaceId } = await indexWorkspace(root, db);
+    db.sqlite
+      .prepare("INSERT INTO sessions (id, workspace_id, profile_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("session-1", workspaceIdForRoot(root), "default", "Chat", "2026-07-20", "2026-07-20");
+
+    const provider = new RecordingProvider([
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "call-1", name: "search_notes", argumentsJson: "{\"query\":\"memory\"}" }],
+      },
+      { role: "assistant", content: "Graph memory is indexed." },
+    ]);
+    const handlers = new Map<string, ToolHandler>([
+      ["search_notes", async () => [{ title: "Graph Memory" }]],
+    ]) as Parameters<typeof runTurn>[0]["handlers"];
+
+    for await (const _event of runTurn({
+      db,
+      modelProvider: provider,
+      model: "mock",
+      workspaceId,
+      workspaceRoot: root,
+      sessionId: "session-1",
+      userMessage: "Find memory",
+      handlers,
+      now: "2026-07-20T00:00:00.000Z",
+    })) {
+      // Exhaust the turn.
+    }
+
+    expect(provider.requests[0]?.tools?.[0]?.parameters).toEqual(expect.objectContaining({ type: "object" }));
+    expect(provider.requests[1]?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "assistant",
+          toolCalls: [expect.objectContaining({ id: "call-1", name: "search_notes" })],
+        }),
+        expect.objectContaining({
+          role: "tool",
+          toolCallId: "call-1",
+          content: "[{\"title\":\"Graph Memory\"}]",
+        }),
+      ]),
+    );
+  });
 });
+
+class RecordingProvider implements ModelProvider {
+  readonly supportsToolCalling = true;
+  readonly supportsPromptCache = false;
+  readonly requests: ModelRequest[] = [];
+
+  private cursor = 0;
+
+  constructor(private readonly script: ModelResponse[]) {}
+
+  async complete(input: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(input);
+    return this.script[this.cursor++] ?? { role: "assistant", content: "done" };
+  }
+
+  async *stream(input: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(input) };
+  }
+
+  async estimateCost(): Promise<CostEstimate> {
+    return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
+}

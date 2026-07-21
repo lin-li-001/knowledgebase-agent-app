@@ -61,7 +61,7 @@ describe("LLM and tool-routing evals", () => {
         baseContentHash: hash("old"),
         nextBody: "new",
       },
-    });
+    }, root);
 
     expect(result.state).toBe("failed");
     expect(result.failureReason).toBe("Target changed since proposal");

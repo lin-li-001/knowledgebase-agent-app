@@ -95,6 +95,38 @@ describe("indexWorkspace", () => {
       expect.arrayContaining([expect.objectContaining({ title: "中文搜索" })]),
     );
   });
+
+  it("keeps the previous index when a later parse fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-index-"));
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const first = await indexWorkspace(root, db);
+
+    await writeFile(
+      path.join(root, "03-Knowledge/Broken.md"),
+      `---
+type: knowledge
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+Broken.
+`,
+    );
+
+    await expect(indexWorkspace(root, db)).rejects.toThrow("Missing required frontmatter field: title");
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM notes").get()).toEqual({ count: 1 });
+    await expect(searchNotes(db, "memory", { workspaceId: first.workspaceId })).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ title: "Graph Memory" })]),
+    );
+  });
 });
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {

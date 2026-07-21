@@ -1,8 +1,17 @@
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { allowedChannels, handleIpcRequest, isAllowedChannel, type IpcServices } from "../electron/ipc";
+
+const opened: IpcServices[] = [];
+
+afterEach(() => {
+  for (const service of opened) {
+    service.db?.close();
+  }
+  opened.length = 0;
+});
 
 describe("IPC contract", () => {
   it("does not expose unknown channels", () => {
@@ -32,4 +41,63 @@ describe("IPC contract", () => {
     );
     expect(services.activeTurns.has("session-1")).toBe(false);
   });
+
+  it("opens a workspace, searches notes, and runs a chat turn", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+
+    const openResult = await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    expect(openResult).toEqual(expect.objectContaining({ ok: true }));
+    expect(services.workspaceId).toBeTruthy();
+    expect(services.sessionId).toBeTruthy();
+
+    await expect(handleIpcRequest(services, "notes:search", { query: "memory" })).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.arrayContaining([expect.objectContaining({ title: "Graph Memory" })]),
+      }),
+    );
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "Find memory" }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          events: expect.arrayContaining([expect.objectContaining({ type: "message" })]),
+        }),
+      }),
+    );
+  });
 });
+
+async function writeNote(filePath: string, title: string, body: string): Promise<void> {
+  await writeFile(
+    filePath,
+    `---
+title: ${title}
+type: knowledge
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: [test]
+---
+
+# ${title}
+
+${body}
+`,
+    "utf8",
+  );
+}

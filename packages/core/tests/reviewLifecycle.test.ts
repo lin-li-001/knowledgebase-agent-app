@@ -33,7 +33,7 @@ describe("review lifecycle", () => {
         baseContentHash: hash("old body"),
         nextBody: "new body",
       },
-    });
+    }, root);
 
     expect(applied.state).toBe("applied");
     await expect(readFile(targetPath, "utf8")).resolves.toBe("new body");
@@ -53,11 +53,32 @@ describe("review lifecycle", () => {
         baseContentHash: hash("old body"),
         nextBody: "new body",
       },
-    });
+    }, root);
 
     expect(failed.state).toBe("failed");
     expect(failed.failureReason).toBe("Target changed since proposal");
     await expect(readFile(targetPath, "utf8")).resolves.toBe("changed body");
+  });
+
+  it("rejects patches outside the workspace", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-review-"));
+    const outsideRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-review-outside-"));
+    const targetPath = path.join(outsideRoot, "Note.md");
+    await writeFile(targetPath, "old body", "utf8");
+
+    await expect(
+      applyReviewItem({
+        id: "review-1",
+        state: "approved",
+        targetPath,
+        patch: {
+          kind: "replace_body",
+          baseContentHash: hash("old body"),
+          nextBody: "new body",
+        },
+      }, root),
+    ).rejects.toThrow("Path escapes workspace");
+    await expect(readFile(targetPath, "utf8")).resolves.toBe("old body");
   });
 });
 

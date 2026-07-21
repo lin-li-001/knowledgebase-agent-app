@@ -16,4 +16,14 @@ describe("secure settings", () => {
     await expect(readFile(settingsPath, "utf8")).resolves.toContain("openai:default");
     await expect(readFile(settingsPath, "utf8")).resolves.not.toContain("sk-test-secret");
   });
+
+  it("shares the default in-process secret store between save and load", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-settings-"));
+    const settingsPath = path.join(root, ".app/settings.json");
+
+    await saveApiKey(settingsPath, "sk-default-secret");
+
+    await expect(loadApiKey(settingsPath)).resolves.toBe("sk-default-secret");
+    await expect(readFile(settingsPath, "utf8")).resolves.not.toContain("sk-default-secret");
+  });
 });

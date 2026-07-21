@@ -133,6 +133,21 @@ h2 {
   flex: 1;
 }
 
+.assistant-message,
+.user-message {
+  border-radius: 6px;
+  margin-bottom: 10px;
+  padding: 10px;
+}
+
+.assistant-message {
+  background: #eef4ef;
+}
+
+.user-message {
+  background: #f7f2e7;
+}
+
 input,
 select {
   min-height: 36px;

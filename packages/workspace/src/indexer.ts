@@ -22,13 +22,18 @@ export async function indexWorkspace(rootPath: string, db: AppDatabase): Promise
     )
     .run(workspaceId, normalizedRoot, now, now);
 
-  clearWorkspaceIndex(db, workspaceId);
-
   const markdownPaths = await collectMarkdownFiles(normalizedRoot);
+  const parsedNotes: ParsedMarkdownNote[] = [];
   for (const filePath of markdownPaths) {
-    const parsed = await parseMarkdownNote(filePath);
-    insertParsedNote(db, workspaceId, normalizedRoot, parsed, now);
+    parsedNotes.push(await parseMarkdownNote(filePath));
   }
+
+  db.sqlite.transaction(() => {
+    clearWorkspaceIndex(db, workspaceId);
+    for (const parsed of parsedNotes) {
+      insertParsedNote(db, workspaceId, normalizedRoot, parsed, now);
+    }
+  })();
 
   return {
     workspaceId,

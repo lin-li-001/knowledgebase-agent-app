@@ -37,3 +37,63 @@ export async function transitionReviewItem(
     throw new Error("Invalid review transition");
   }
 }
+
+export async function listReviewItems(
+  db: AppDatabase,
+  workspaceId: string,
+  state: ReviewState | "all" = "all",
+  limit = 50,
+): Promise<ReviewItem[]> {
+  const stateClause = state === "all" ? "" : "AND state = @state";
+  const rows = db.sqlite
+    .prepare(
+      `SELECT
+        id,
+        workspace_id as workspaceId,
+        state,
+        risk,
+        proposal_type as proposalType,
+        target_path as targetPath,
+        payload_json as payloadJson,
+        reason,
+        source_session_id as sourceSessionId,
+        source_turn_id as sourceTurnId,
+        created_at as createdAt,
+        applied_at as appliedAt,
+        superseded_by as supersededBy,
+        failure_reason as failureReason
+      FROM review_items
+      WHERE workspace_id = @workspaceId ${stateClause}
+      ORDER BY created_at DESC
+      LIMIT @limit`,
+    )
+    .all({ workspaceId, state, limit }) as Array<ReviewItem & { payloadJson: string | null }>;
+
+  return rows.map(({ payloadJson, ...row }) => {
+    const item: ReviewItem = {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      state: row.state,
+      risk: row.risk,
+      proposalType: row.proposalType,
+      payload: payloadJson ? JSON.parse(payloadJson) : null,
+      reason: row.reason,
+      sourceSessionId: row.sourceSessionId,
+      sourceTurnId: row.sourceTurnId,
+      createdAt: row.createdAt,
+    };
+    if (row.targetPath) {
+      item.targetPath = row.targetPath;
+    }
+    if (row.appliedAt) {
+      item.appliedAt = row.appliedAt;
+    }
+    if (row.supersededBy) {
+      item.supersededBy = row.supersededBy;
+    }
+    if (row.failureReason) {
+      item.failureReason = row.failureReason;
+    }
+    return item;
+  });
+}

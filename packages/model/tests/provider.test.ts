@@ -47,14 +47,53 @@ describe("OpenAIProvider", () => {
         }),
       }),
     );
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body).toEqual(
       expect.objectContaining({
         model: "gpt-test",
         messages: [{ role: "user", content: "Find memory notes" }],
       }),
     );
+    expect(body.tools[0].function.parameters).toEqual({ type: "object" });
     expect(response.toolCalls).toEqual([
       { id: "call-1", name: "search_notes", argumentsJson: "{\"query\":\"memory\"}" },
+    ]);
+  });
+
+  it("serializes assistant tool calls and tool results for follow-up requests", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200 });
+    });
+
+    const provider = new OpenAIProvider({ apiKey: "test-key", fetchImpl: fetchMock as typeof fetch });
+    await provider.complete({
+      model: "gpt-test",
+      messages: [
+        { role: "user", content: "Find memory notes" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "call-1", name: "search_notes", argumentsJson: "{\"query\":\"memory\"}" }],
+        },
+        { role: "tool", content: "[{\"title\":\"Graph Memory\"}]", toolCallId: "call-1" },
+      ],
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.messages).toEqual([
+      { role: "user", content: "Find memory notes" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "search_notes", arguments: "{\"query\":\"memory\"}" },
+          },
+        ],
+      },
+      { role: "tool", content: "[{\"title\":\"Graph Memory\"}]", tool_call_id: "call-1" },
     ]);
   });
 
