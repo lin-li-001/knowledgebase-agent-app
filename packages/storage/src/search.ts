@@ -13,6 +13,9 @@ export async function searchNotes(
   const limit = filters.limit ?? 20;
   const isCjkQuery = containsCjk(query);
   const normalizedQuery = toFtsQuery(query);
+  if (!isCjkQuery && !normalizedQuery) {
+    return [];
+  }
   const table = isCjkQuery ? "note_fts_trigram" : "note_fts";
   const workspaceClause = filters.workspaceId ? "AND f.workspace_id = @workspaceId" : "";
   const matchExpression = isCjkQuery
@@ -47,6 +50,9 @@ export async function searchSessions(
   const limit = filters.limit ?? 20;
   const isCjkQuery = containsCjk(query);
   const normalizedQuery = toFtsQuery(query);
+  if (!isCjkQuery && !normalizedQuery) {
+    return [];
+  }
   const table = isCjkQuery ? "message_fts_trigram" : "message_fts";
   const sessionClause = filters.workspaceId
     ? "AND f.session_id IN (SELECT id FROM sessions WHERE workspace_id = @workspaceId)"
@@ -79,5 +85,8 @@ function containsCjk(value: string): boolean {
 }
 
 function toFtsQuery(value: string): string {
-  return value.trim().replace(/"/g, "");
+  return value
+    .toLocaleLowerCase()
+    .match(/[\p{L}\p{N}_]+/gu)
+    ?.join(" ") ?? "";
 }

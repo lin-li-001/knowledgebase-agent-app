@@ -158,9 +158,13 @@ describe("search", () => {
     await expect(searchNotes(db, "memory", { workspaceId: "workspace-1" })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ noteId: "note-english" })]),
     );
+    await expect(
+      searchNotes(db, "hello my name is lin li, i have two kids (grace and leo)", { workspaceId: "workspace-1" }),
+    ).resolves.toEqual([]);
     await expect(searchNotes(db, "中文", { workspaceId: "workspace-1" })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ noteId: "note-chinese" })]),
     );
+    await expect(searchSessions(db, "hello, world", { workspaceId: "workspace-1" })).resolves.toEqual([]);
     await expect(searchSessions(db, "中文", { workspaceId: "workspace-1" })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ messageId: "message-1" })]),
     );
