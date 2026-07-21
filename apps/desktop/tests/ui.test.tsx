@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { App } from "../src/App";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
 
 describe("desktop shell", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
   it("renders primary navigation and Activity", () => {
     render(<App />);
 
@@ -35,5 +39,23 @@ describe("desktop shell", () => {
     expect(screen.getByText("Memory to save")).toBeVisible();
     expect(screen.getByText("Lin Li has two kids, Grace and Leo.")).toBeVisible();
     expect(screen.getByText("proposed")).toBeVisible();
+  });
+
+  it("disables review actions after a proposal leaves proposed state", () => {
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-1",
+          state: "approved",
+          proposalType: "propose_memory",
+          risk: "high",
+          reason: "Model proposed a knowledge-base change.",
+          payload: { body: "User's name is Lin Li." },
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
   });
 });

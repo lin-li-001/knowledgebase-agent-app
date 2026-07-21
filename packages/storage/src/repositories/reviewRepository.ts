@@ -38,6 +38,14 @@ export async function transitionReviewItem(
   }
 }
 
+export async function getReviewItemState(db: AppDatabase, id: string): Promise<ReviewState | null> {
+  const row = db.sqlite
+    .prepare("SELECT state FROM review_items WHERE id = ?")
+    .get(id) as { state: ReviewState } | undefined;
+
+  return row?.state ?? null;
+}
+
 export async function listReviewItems(
   db: AppDatabase,
   workspaceId: string,

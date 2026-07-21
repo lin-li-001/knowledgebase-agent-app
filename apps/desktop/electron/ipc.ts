@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { createReviewItem, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
+import { createReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
@@ -121,11 +121,9 @@ export async function handleIpcRequest(
       case "review:list":
         return { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
       case "review:approve":
-        await transitionReviewItem(requireDatabase(services), payload.id as string, "proposed", "approved");
-        return { ok: true, data: { id: payload.id, state: "approved" } };
+        return approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "approved");
       case "review:reject":
-        await transitionReviewItem(requireDatabase(services), payload.id as string, "proposed", "rejected");
-        return { ok: true, data: { id: payload.id, state: "rejected" } };
+        return approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
       case "activity:list":
         return { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
       case "index:rebuild": {
@@ -153,6 +151,22 @@ export async function handleIpcRequest(
       error: error instanceof Error ? error.message : "Unknown error",
     };
   }
+}
+
+async function approveOrRejectReviewItem(db: AppDatabase, id: string, targetState: Extract<ReviewState, "approved" | "rejected">): Promise<IpcResult> {
+  const currentState = await getReviewItemState(db, id);
+  if (!currentState) {
+    return { ok: false, error: "Review item not found" };
+  }
+  if (currentState === targetState) {
+    return { ok: true, data: { id, state: targetState } };
+  }
+  if (currentState !== "proposed") {
+    return { ok: false, error: `Review item is already ${currentState}` };
+  }
+
+  await transitionReviewItem(db, id, "proposed", targetState);
+  return { ok: true, data: { id, state: targetState } };
 }
 
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {

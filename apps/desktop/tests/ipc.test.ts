@@ -107,6 +107,37 @@ describe("IPC contract", () => {
       }),
     );
   });
+
+  it("treats repeated review approvals as idempotent", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    const now = new Date().toISOString();
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-1", services.workspaceId, "proposed", "high", "propose_memory", "{\"body\":\"Remember Lin\"}", "reason", services.sessionId, "turn-1", now);
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-1" })).resolves.toEqual(
+      { ok: true, data: { id: "review-1", state: "approved" } },
+    );
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-1" })).resolves.toEqual(
+      { ok: true, data: { id: "review-1", state: "approved" } },
+    );
+  });
 });
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {
