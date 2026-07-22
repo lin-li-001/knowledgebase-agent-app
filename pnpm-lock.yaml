@@ -50,6 +50,9 @@ importers:
       '@kb-agent/workspace':
         specifier: workspace:^
         version: link:../../packages/workspace
+      '@napi-rs/canvas':
+        specifier: 0.1.80
+        version: 0.1.80
       better-sqlite3:
         specifier: 12.11.1
         version: 12.11.1
@@ -135,6 +138,9 @@ importers:
       '@kb-agent/storage':
         specifier: workspace:^
         version: link:../storage
+      '@napi-rs/canvas':
+        specifier: 0.1.80
+        version: 0.1.80
       gray-matter:
         specifier: ^4.0.3
         version: 4.0.3

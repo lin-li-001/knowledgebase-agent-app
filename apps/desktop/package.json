@@ -16,6 +16,7 @@
     "@kb-agent/model": "workspace:^",
     "@kb-agent/storage": "workspace:^",
     "@kb-agent/workspace": "workspace:^",
+    "@napi-rs/canvas": "0.1.80",
     "better-sqlite3": "12.11.1",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",

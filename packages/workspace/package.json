@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@kb-agent/storage": "workspace:^",
+    "@napi-rs/canvas": "0.1.80",
     "gray-matter": "^4.0.3",
     "pdf-parse": "^2.4.5",
     "zod": "^4.4.3"
