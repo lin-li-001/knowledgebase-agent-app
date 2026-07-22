@@ -6,6 +6,7 @@ import { createReviewItem, getReviewItem, getReviewItemState, listActivity, list
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
+import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
 export { allowedChannels, isAllowedChannel } from "./ipcContract";
@@ -20,6 +21,7 @@ export interface IpcServices {
   activeTurns: Set<string>;
   abortControllers?: Map<string, AbortController>;
   modelProvider?: ModelProvider;
+  debugLogPath?: string;
 }
 
 const schemas: Record<IpcChannel, z.ZodTypeAny> = {
@@ -46,9 +48,12 @@ export async function handleIpcRequest(
   channel: string,
   input: unknown,
 ): Promise<IpcResult> {
+  const startedAt = Date.now();
+  let result: IpcResult | undefined;
   try {
     if (!isAllowedChannel(channel)) {
-      return { ok: false, error: "Unknown IPC channel" };
+      result = { ok: false, error: "Unknown IPC channel" };
+      return result;
     }
 
     const payload = schemas[channel].parse(input) as Record<string, unknown>;
@@ -57,20 +62,24 @@ export async function handleIpcRequest(
       case "workspace:create": {
         const workspace = await createWorkspace(payload.rootPath as string);
         await activateWorkspace(services, workspace.rootPath);
-        return { ok: true, data: { ...workspace, workspaceId: services.workspaceId, sessionId: services.sessionId } };
+        result = { ok: true, data: { ...workspace, workspaceId: services.workspaceId, sessionId: services.sessionId } };
+        return result;
       }
       case "workspace:open": {
         await activateWorkspace(services, path.resolve(payload.rootPath as string));
-        return { ok: true, data: { rootPath: services.workspaceRoot, workspaceId: services.workspaceId, sessionId: services.sessionId } };
+        result = { ok: true, data: { rootPath: services.workspaceRoot, workspaceId: services.workspaceId, sessionId: services.sessionId } };
+        return result;
       }
       case "workspace:get-active":
-        return {
+        result = {
           ok: true,
           data: services.workspaceRoot ? { rootPath: services.workspaceRoot, workspaceId: services.workspaceId, sessionId: services.sessionId } : null,
         };
+        return result;
       case "settings:get": {
         const settings = await readDesktopSettings(requireSettingsPath(services));
-        return { ok: true, data: { ...settings, hasApiKey: Boolean(await loadApiKey(requireSettingsPath(services), services.secretStore)) } };
+        result = { ok: true, data: { ...settings, hasApiKey: Boolean(await loadApiKey(requireSettingsPath(services), services.secretStore)) } };
+        return result;
       }
       case "settings:update": {
         const settingsPath = requireSettingsPath(services);
@@ -81,7 +90,8 @@ export async function handleIpcRequest(
           const settings = await readDesktopSettings(settingsPath);
           await writeDesktopSettings(settingsPath, { ...settings, modelName: payload.modelName.trim() || "mock" });
         }
-        return handleIpcRequest(services, "settings:get", {});
+        result = await handleIpcRequest(services, "settings:get", {});
+        return result;
       }
       case "chat:run-turn": {
         const root = requireWorkspaceRoot(services);
@@ -110,35 +120,43 @@ export async function handleIpcRequest(
           services.activeTurns.delete(sessionId);
           services.abortControllers?.delete(sessionId);
         }
-        return { ok: true, data: { events } };
+        result = { ok: true, data: { events } };
+        return result;
       }
       case "notes:search": {
-        return { ok: true, data: await searchNotes(requireDatabase(services), payload.query as string, { workspaceId: requireWorkspaceId(services) }) };
+        result = { ok: true, data: await searchNotes(requireDatabase(services), payload.query as string, { workspaceId: requireWorkspaceId(services) }) };
+        return result;
       }
       case "notes:read": {
         const root = requireWorkspaceRoot(services);
         const targetPath = assertInsideWorkspace(root, payload.path as string);
-        return { ok: true, data: { path: payload.path, content: await readFile(targetPath, "utf8") } };
+        result = { ok: true, data: { path: payload.path, content: await readFile(targetPath, "utf8") } };
+        return result;
       }
       case "review:list":
-        return { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
+        result = { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
+        return result;
       case "review:approve":
-        return await approveReviewItem(services, payload.id as string);
+        result = await approveReviewItem(services, payload.id as string);
+        return result;
       case "review:reject":
-        return await approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
+        result = await approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
+        return result;
       case "activity:list":
-        return { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
+        result = { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
+        return result;
       case "index:rebuild": {
-        const result = await indexWorkspace(requireWorkspaceRoot(services), requireDatabase(services));
+        const indexResult = await indexWorkspace(requireWorkspaceRoot(services), requireDatabase(services));
         await recordActivity(requireDatabase(services), {
           id: randomUUID(),
-          workspaceId: result.workspaceId,
+          workspaceId: indexResult.workspaceId,
           kind: "index",
           title: "Index rebuilt",
-          message: `${result.noteCount} notes indexed.`,
+          message: `${indexResult.noteCount} notes indexed.`,
           createdAt: new Date().toISOString(),
         });
-        return { ok: true, data: result };
+        result = { ok: true, data: indexResult };
+        return result;
       }
       case "import:start": {
         const job = await startImportBatch({
@@ -148,23 +166,71 @@ export async function handleIpcRequest(
           batchName: payload.batchName as string,
           files: payload.filePaths as string[],
         });
-        return { ok: true, data: job };
+        result = { ok: true, data: job };
+        return result;
       }
       case "import:get-job":
-        return { ok: true, data: getImportJob(requireDatabase(services), payload.id as string) };
+        result = { ok: true, data: getImportJob(requireDatabase(services), payload.id as string) };
+        return result;
       case "chat:cancel-turn": {
         services.activeTurns.delete(payload.sessionId as string);
         services.abortControllers?.get(payload.sessionId as string)?.abort();
         services.abortControllers?.delete(payload.sessionId as string);
-        return { ok: true, data: { interrupted: true } };
+        result = { ok: true, data: { interrupted: true } };
+        return result;
       }
     }
+    const unhandledResult: IpcResult = { ok: false, error: "Unhandled IPC channel" };
+    result = unhandledResult;
+    return unhandledResult;
   } catch (error) {
-    return {
+    result = {
       ok: false,
       error: error instanceof Error ? error.message : "Unknown error",
     };
+    return result;
+  } finally {
+    const debugEvent = {
+      channel,
+      ok: result?.ok ?? false,
+      durationMs: Date.now() - startedAt,
+      ...(services.workspaceRoot ? { workspaceRoot: services.workspaceRoot } : {}),
+      ...(result && !result.ok ? { error: result.error } : {}),
+      ...optionalDebugDetails(channel, input, result),
+    };
+    await appendDebugLog(services.debugLogPath, debugEvent).catch((error: unknown) => {
+      console.warn("Failed to write debug log", error);
+    });
   }
+}
+
+function optionalDebugDetails(channel: string, input: unknown, result: IpcResult | undefined): { details?: Record<string, unknown> } {
+  const details = debugDetailsFor(channel, input, result);
+  return details ? { details } : {};
+}
+
+function debugDetailsFor(channel: string, input: unknown, result: IpcResult | undefined): Record<string, unknown> | undefined {
+  if (channel === "import:start" && typeof input === "object" && input !== null) {
+    const payload = input as { batchName?: unknown; filePaths?: unknown };
+    const job = result?.ok && typeof result.data === "object" && result.data !== null ? result.data as { state?: unknown; failureReason?: unknown; summaryNotePath?: unknown } : {};
+    return {
+      batchName: typeof payload.batchName === "string" ? payload.batchName : undefined,
+      fileCount: Array.isArray(payload.filePaths) ? payload.filePaths.length : undefined,
+      state: job.state,
+      failureReason: job.failureReason,
+      summaryNotePath: job.summaryNotePath,
+    };
+  }
+
+  if (channel === "chat:run-turn" && typeof input === "object" && input !== null) {
+    const payload = input as { sessionId?: unknown; message?: unknown };
+    return {
+      sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
+      messageLength: typeof payload.message === "string" ? payload.message.length : undefined,
+    };
+  }
+
+  return undefined;
 }
 
 function getImportJob(db: AppDatabase, id: string): unknown {

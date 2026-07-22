@@ -44,6 +44,25 @@ describe("IPC contract", () => {
     expect(services.activeTurns.has("session-1")).toBe(false);
   });
 
+  it("writes sanitized IPC debug logs without secrets", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    const settingsPath = path.join(root, ".desktop/settings.json");
+    const debugLogPath = path.join(root, ".desktop/debug.log");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      settingsPath,
+      debugLogPath,
+    };
+
+    await expect(
+      handleIpcRequest(services, "settings:update", { apiKey: "sk-secret-value", modelName: "gpt-test" }),
+    ).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    await expect(readFile(debugLogPath, "utf8")).resolves.toContain("\"channel\":\"settings:update\"");
+    await expect(readFile(debugLogPath, "utf8")).resolves.toContain("\"ok\":true");
+    await expect(readFile(debugLogPath, "utf8")).resolves.not.toContain("sk-secret-value");
+  });
+
   it("opens a workspace, searches notes, and runs a chat turn", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });

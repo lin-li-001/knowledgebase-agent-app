@@ -28,6 +28,7 @@ async function createWindow(): Promise<void> {
 const userDataPath = process.env.KB_AGENT_USER_DATA_PATH ?? app.getPath("userData");
 ipcServices.settingsPath = path.join(userDataPath, "settings.json");
 ipcServices.secretStore = createEncryptedFileSecretStore(path.join(userDataPath, "secrets.json"), safeStorage);
+ipcServices.debugLogPath = path.join(userDataPath, "debug.log");
 
 app.whenReady().then(async () => {
   await restoreWorkspaceFromSettings(ipcServices).catch((error: unknown) => {
