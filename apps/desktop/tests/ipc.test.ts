@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CostEstimate, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent } from "@kb-agent/model";
-import { allowedChannels, handleIpcRequest, isAllowedChannel, type IpcServices } from "../electron/ipc";
+import { allowedChannels, handleIpcRequest, isAllowedChannel, restoreWorkspaceFromSettings, type IpcServices } from "../electron/ipc";
+import { readDesktopSettings } from "../electron/secureSettings";
 
 const opened: IpcServices[] = [];
 
@@ -76,6 +77,41 @@ describe("IPC contract", () => {
         data: expect.objectContaining({
           events: expect.arrayContaining([expect.objectContaining({ type: "message" })]),
         }),
+      }),
+    );
+  });
+
+  it("persists the active workspace and restores it for a fresh app session", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    const settingsPath = path.join(root, ".desktop/settings.json");
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const firstSession: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath,
+    };
+    opened.push(firstSession);
+
+    await expect(handleIpcRequest(firstSession, "workspace:open", { rootPath: root })).resolves.toEqual(
+      expect.objectContaining({ ok: true }),
+    );
+    await expect(readDesktopSettings(settingsPath)).resolves.toEqual(expect.objectContaining({ workspaceRoot: root }));
+
+    const nextSession: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath,
+    };
+    opened.push(nextSession);
+
+    await expect(restoreWorkspaceFromSettings(nextSession)).resolves.toBe(true);
+    await expect(handleIpcRequest(nextSession, "workspace:get-active", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({ rootPath: root }),
       }),
     );
   });

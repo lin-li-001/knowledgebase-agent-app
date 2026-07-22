@@ -19,6 +19,7 @@ export interface SecretCipher {
 export interface DesktopSettings {
   providerKeyAlias?: string;
   modelName?: string;
+  workspaceRoot?: string;
 }
 
 export async function saveApiKey(

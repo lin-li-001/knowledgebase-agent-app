@@ -303,6 +303,10 @@ function extractMemoryBody(payload: unknown): string | null {
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
   services.db?.close();
   services.workspaceRoot = path.resolve(rootPath);
+  if (services.settingsPath) {
+    const settings = await readDesktopSettings(services.settingsPath);
+    await writeDesktopSettings(services.settingsPath, { ...settings, workspaceRoot: services.workspaceRoot });
+  }
   services.db = openAppDatabase(path.join(services.workspaceRoot, ".app/index.sqlite"));
   const result = await indexWorkspace(services.workspaceRoot, services.db);
   services.workspaceId = result.workspaceId;
@@ -315,6 +319,16 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
     message: `${result.noteCount} notes indexed.`,
     createdAt: new Date().toISOString(),
   });
+}
+
+export async function restoreWorkspaceFromSettings(services: IpcServices): Promise<boolean> {
+  const settings = services.settingsPath ? await readDesktopSettings(services.settingsPath) : {};
+  if (!settings.workspaceRoot) {
+    return false;
+  }
+
+  await activateWorkspace(services, settings.workspaceRoot);
+  return true;
 }
 
 function ensureSession(db: AppDatabase, workspaceId: string): string {

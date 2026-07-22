@@ -1,7 +1,7 @@
 import { app, BrowserWindow, safeStorage } from "electron";
 import { ipcMain } from "electron";
 import path from "node:path";
-import { allowedChannels, handleIpcRequest, type IpcServices } from "./ipc";
+import { allowedChannels, handleIpcRequest, restoreWorkspaceFromSettings, type IpcServices } from "./ipc";
 import { createEncryptedFileSecretStore } from "./secureSettings";
 
 const ipcServices: IpcServices = {
@@ -25,10 +25,16 @@ async function createWindow(): Promise<void> {
   }
 }
 
-app.whenReady().then(createWindow);
-const userDataPath = app.getPath("userData");
+const userDataPath = process.env.KB_AGENT_USER_DATA_PATH ?? app.getPath("userData");
 ipcServices.settingsPath = path.join(userDataPath, "settings.json");
 ipcServices.secretStore = createEncryptedFileSecretStore(path.join(userDataPath, "secrets.json"), safeStorage);
+
+app.whenReady().then(async () => {
+  await restoreWorkspaceFromSettings(ipcServices).catch((error: unknown) => {
+    console.warn("Failed to restore workspace from settings", error);
+  });
+  await createWindow();
+});
 
 for (const channel of allowedChannels) {
   ipcMain.handle(channel, async (_event, input) => handleIpcRequest(ipcServices, channel, input));

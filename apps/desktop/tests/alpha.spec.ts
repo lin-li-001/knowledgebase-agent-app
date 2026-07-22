@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 test("launch desktop app and show v0.1A shell", async () => {
-  const app = await electron.launch({ args: ["out/main/main.js"] });
+  const app = await launchTestApp();
   const window = await app.firstWindow();
 
   await expect(window.getByRole("button", { name: "Chat" })).toBeVisible();
@@ -28,7 +28,7 @@ test("launch desktop app and show v0.1A shell", async () => {
 });
 
 test("imports a PDF document through the desktop UI", async () => {
-  const app = await electron.launch({ args: ["out/main/main.js"] });
+  const app = await launchTestApp();
   const window = await app.firstWindow();
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-workspace-"));
   const sourceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-import-"));
@@ -52,6 +52,36 @@ test("imports a PDF document through the desktop UI", async () => {
 
   await app.close();
 });
+
+test("restores the saved workspace on the next desktop launch", async () => {
+  const userDataPath = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-user-data-"));
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-workspace-"));
+
+  const firstApp = await launchTestApp(userDataPath);
+  const firstWindow = await firstApp.firstWindow();
+  await firstWindow.getByRole("button", { name: "Settings" }).click();
+  await firstWindow.getByLabel("Workspace Root").fill(workspaceRoot);
+  await firstWindow.getByRole("button", { name: "Create Workspace" }).click();
+  await expect(firstWindow.getByText("Workspace active")).toBeVisible();
+  await firstApp.close();
+
+  const nextApp = await launchTestApp(userDataPath);
+  const nextWindow = await nextApp.firstWindow();
+  await expect(nextWindow.getByText("Workspace active").first()).toBeVisible();
+  await nextWindow.getByRole("button", { name: "Settings" }).click();
+  await expect(nextWindow.getByLabel("Workspace Root")).toHaveValue(workspaceRoot);
+  await nextApp.close();
+});
+
+async function launchTestApp(userDataPath?: string) {
+  return electron.launch({
+    args: ["out/main/main.js"],
+    env: {
+      ...process.env,
+      KB_AGENT_USER_DATA_PATH: userDataPath ?? (await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-user-data-"))),
+    },
+  });
+}
 
 function minimalPdf(text: string): Buffer {
   const escapedText = text.replace(/\\/gu, "\\\\").replace(/\(/gu, "\\(").replace(/\)/gu, "\\)");
