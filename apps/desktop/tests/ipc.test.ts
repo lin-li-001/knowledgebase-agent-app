@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CostEstimate, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent } from "@kb-agent/model";
+import { appendMessage } from "@kb-agent/storage";
 import { allowedChannels, handleIpcRequest, isAllowedChannel, restoreWorkspaceFromSettings, type IpcServices } from "../electron/ipc";
 import { readDesktopSettings } from "../electron/secureSettings";
 
@@ -158,6 +159,40 @@ describe("IPC contract", () => {
         ok: true,
         data: expect.objectContaining({
           events: expect.arrayContaining([expect.objectContaining({ type: "error", error: "bad model" })]),
+        }),
+      }),
+    );
+  });
+
+  it("handles model session search tool calls", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: new ToolCallingProvider("search_sessions", "{\"query\":\"2018\"}"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    await appendMessage(services.db!, {
+      id: "seed-message-2018",
+      sessionId: services.sessionId!,
+      role: "user",
+      content: "I worked at Acme in 2018",
+      createdAt: new Date().toISOString(),
+    });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "where did I work in 2018" }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          events: expect.not.arrayContaining([expect.objectContaining({ type: "error" })]),
         }),
       }),
     );
@@ -322,6 +357,34 @@ class FailingProvider implements ModelProvider {
 
   async *stream(_input: ModelRequest): AsyncIterable<ModelStreamEvent> {
     throw new Error(this.message);
+  }
+
+  async estimateCost(): Promise<CostEstimate> {
+    return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
+}
+
+class ToolCallingProvider implements ModelProvider {
+  readonly supportsToolCalling = true;
+  readonly supportsPromptCache = false;
+  private callCount = 0;
+
+  constructor(private readonly toolName: string, private readonly argumentsJson: string) {}
+
+  async complete(): Promise<ModelResponse> {
+    this.callCount += 1;
+    if (this.callCount % 2 === 1) {
+      return {
+        content: "",
+        toolCalls: [{ id: `call-${this.callCount}`, name: this.toolName, argumentsJson: this.argumentsJson }],
+      };
+    }
+
+    return { content: "Session search complete." };
+  }
+
+  async *stream(): AsyncIterable<ModelStreamEvent> {
+    yield { type: "message", content: "Session search complete." };
   }
 
   async estimateCost(): Promise<CostEstimate> {
