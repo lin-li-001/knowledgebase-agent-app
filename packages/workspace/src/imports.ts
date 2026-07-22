@@ -118,6 +118,9 @@ function extractKeyFacts(documents: ImportedDocument[]): string[] {
   const datePattern = /\b\d{4}-\d{2}-\d{2}\b/gu;
 
   for (const document of documents) {
+    for (const fact of extractEmploymentFacts(document)) {
+      facts.add(fact);
+    }
     for (const match of document.text.matchAll(moneyPattern)) {
       facts.add(`${document.fileName}: ${match[0]}`);
     }
@@ -127,6 +130,93 @@ function extractKeyFacts(documents: ImportedDocument[]): string[] {
   }
 
   return [...facts].slice(0, 20);
+}
+
+function extractEmploymentFacts(document: ImportedDocument): string[] {
+  const facts: string[] = [];
+  const seen = new Set<string>();
+  const employmentPattern =
+    /^(.{2,120}?)\s+\|\s+([A-Z][a-z]{2,8})\s+(\d{4})\s*[–-]\s*(Present|([A-Z][a-z]{2,8})\s+(\d{4}))$/u;
+
+  for (const rawLine of document.text.split(/\r?\n/u)) {
+    const line = rawLine.replace(/\s+/gu, " ").trim();
+    const match = employmentPattern.exec(line);
+    if (!match) {
+      continue;
+    }
+
+    const organization = match[1]?.trim();
+    const startMonthName = match[2];
+    const startYearText = match[3];
+    const endRange = match[4];
+    if (!organization || !startMonthName || !startYearText || !endRange) {
+      continue;
+    }
+
+    const startMonth = monthNumber(startMonthName);
+    const startYear = Number(startYearText);
+    const endMonth = endRange === "Present" ? new Date().getMonth() + 1 : monthNumber(match[5]);
+    const endYear = endRange === "Present" ? new Date().getFullYear() : Number(match[6]);
+    if (!startMonth || !endMonth || !Number.isFinite(startYear) || !Number.isFinite(endYear)) {
+      continue;
+    }
+
+    const range = `${startMonthName} ${startYear} - ${endRange === "Present" ? "Present" : `${match[5]} ${endYear}`}`;
+    const coveredYears = yearsCovered(startYear, startMonth, endYear, endMonth);
+    const suffix = coveredYears.length ? ` (covers ${coveredYears.join(", ")})` : "";
+    const fact = `${document.fileName}: Employment: ${organization} | ${range}${suffix}`;
+    if (!seen.has(fact)) {
+      seen.add(fact);
+      facts.push(fact);
+    }
+  }
+
+  return facts;
+}
+
+function yearsCovered(startYear: number, startMonth: number, endYear: number, endMonth: number): number[] {
+  const years: number[] = [];
+  for (let year = startYear; year <= endYear; year += 1) {
+    const beginsBeforeYearEnds = startYear < year || startMonth <= 12;
+    const endsAfterYearStarts = endYear > year || endMonth >= 1;
+    if (beginsBeforeYearEnds && endsAfterYearStarts) {
+      years.push(year);
+    }
+  }
+  return years;
+}
+
+function monthNumber(month: string | undefined): number | undefined {
+  if (!month) {
+    return undefined;
+  }
+
+  return {
+    jan: 1,
+    january: 1,
+    feb: 2,
+    february: 2,
+    mar: 3,
+    march: 3,
+    apr: 4,
+    april: 4,
+    may: 5,
+    jun: 6,
+    june: 6,
+    jul: 7,
+    july: 7,
+    aug: 8,
+    august: 8,
+    sep: 9,
+    sept: 9,
+    september: 9,
+    oct: 10,
+    october: 10,
+    nov: 11,
+    november: 11,
+    dec: 12,
+    december: 12,
+  }[month.toLocaleLowerCase()];
 }
 
 function sourceLinkFor(attachmentRelativePath: string): string {

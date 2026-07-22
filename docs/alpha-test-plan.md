@@ -21,3 +21,7 @@
 - Import multiple utility bills.
 - Open generated summary note.
 - Ask about saved/imported content.
+
+## Product TODO
+
+- Study the Hermes memory provider flow and document product pros/cons for this app: provider lifecycle, prefetch timing, tool-based recall, auto-capture, user trust, local-first privacy, debug visibility, and when external semantic memory is worth the added complexity.

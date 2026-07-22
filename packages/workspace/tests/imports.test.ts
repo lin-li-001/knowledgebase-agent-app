@@ -85,6 +85,36 @@ describe("importDocumentBatch", () => {
       "Resume Lin Li PDF Import Test",
     );
   });
+
+  it("extracts employment timeline facts from imported resumes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const resume = path.join(sourceDir, "Resume.txt");
+    await writeFile(
+      resume,
+      [
+        "EXPERIENCE",
+        "Uber Technologies, San Francisco, CA | Mar 2019 - Feb 2021",
+        "Built predictive models.",
+        "LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019",
+        "Implemented experimentation framework.",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "resume",
+      files: [resume],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    const content = await readFile(path.join(root, "04-Resources/Imports/resume.md"), "utf8");
+
+    expect(content).toContain("Employment: Uber Technologies, San Francisco, CA | Mar 2019 - Feb 2021");
+    expect(content).toContain("Employment: LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019");
+    expect(content).toContain("(covers 2017, 2018, 2019)");
+  });
 });
 
 async function writeUtilityBills(sourceDir: string): Promise<string[]> {

@@ -12,7 +12,7 @@ export async function searchNotes(
 ): Promise<NoteSearchResult[]> {
   const limit = filters.limit ?? 20;
   const isCjkQuery = containsCjk(query);
-  const normalizedQuery = toFtsQuery(query);
+  const normalizedQuery = toRecallFtsQuery(query);
   if (!isCjkQuery && !normalizedQuery) {
     return [];
   }
@@ -89,4 +89,101 @@ function toFtsQuery(value: string): string {
     .toLocaleLowerCase()
     .match(/[\p{L}\p{N}_]+/gu)
     ?.join(" ") ?? "";
+}
+
+const ftsStopwords = new Set([
+  "a",
+  "about",
+  "an",
+  "and",
+  "any",
+  "are",
+  "as",
+  "at",
+  "be",
+  "been",
+  "by",
+  "can",
+  "could",
+  "did",
+  "do",
+  "does",
+  "during",
+  "for",
+  "from",
+  "had",
+  "has",
+  "have",
+  "having",
+  "he",
+  "her",
+  "here",
+  "him",
+  "his",
+  "how",
+  "i",
+  "if",
+  "in",
+  "is",
+  "it",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "our",
+  "she",
+  "so",
+  "that",
+  "the",
+  "their",
+  "them",
+  "there",
+  "this",
+  "to",
+  "was",
+  "we",
+  "were",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "will",
+  "with",
+  "would",
+  "you",
+  "your",
+]);
+
+function toRecallFtsQuery(value: string): string {
+  const tokens = expandRecallTokens(value)
+    .toLocaleLowerCase()
+    .match(/[\p{L}\p{N}_]+/gu)
+    ?.filter((token) => token.length > 1 && !ftsStopwords.has(token)) ?? [];
+
+  if (tokens.length === 0) {
+    return toFtsQuery(value);
+  }
+
+  return [...new Set(tokens)].map((token) => `"${token.replace(/"/gu, "\"\"")}"`).join(" OR ");
+}
+
+function expandRecallTokens(value: string): string {
+  const lower = value.toLocaleLowerCase();
+  const years = lower.match(/\b(?:19|20)\d{2}\b/gu)?.map(Number) ?? [];
+  const asksAboutWork =
+    /\b(work|worked|job|company|employer|employment|career|resume|experience)\b/u.test(lower);
+
+  if (!asksAboutWork || years.length === 0) {
+    return value;
+  }
+
+  const nearbyYears = years.flatMap((year) => [year - 1, year, year + 1]);
+  return [
+    value,
+    "work worked job company employer employment career resume experience",
+    ...nearbyYears.map(String),
+  ].join(" ");
 }

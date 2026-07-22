@@ -169,6 +169,28 @@ describe("search", () => {
       expect.arrayContaining([expect.objectContaining({ messageId: "message-1" })]),
     );
   });
+
+  it("recalls notes for natural-language questions without requiring every query word", async () => {
+    const db = await openTempDb();
+    const now = new Date().toISOString();
+
+    db.sqlite
+      .prepare("INSERT INTO workspaces (id, root_path, created_at, updated_at) VALUES (?, ?, ?, ?)")
+      .run("workspace-1", "/tmp/workspace-1", now, now);
+
+    insertSearchableNote(db, {
+      id: "note-resume",
+      workspaceId: "workspace-1",
+      path: "04-Resources/Imports/resume.md",
+      title: "resume",
+      body: "EXPERIENCE\nLQ Digital, San Francisco, CA | Jun 2017 - Mar 2019",
+      now,
+    });
+
+    await expect(searchNotes(db, "where did I work in 2018", { workspaceId: "workspace-1" })).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ noteId: "note-resume" })]),
+    );
+  });
 });
 
 function insertSearchableNote(
