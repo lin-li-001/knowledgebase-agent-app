@@ -448,8 +448,13 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   const workspaceId = requireWorkspaceId(services);
   const db = requireDatabase(services);
   const now = new Date().toISOString();
-  const id = randomUUID();
   const targetPath = typeof payload === "object" && payload && "path" in payload ? String((payload as { path?: string }).path ?? "") : undefined;
+  const existingId = findDuplicateReviewItem(db, workspaceId, proposalType, targetPath, payload);
+  if (existingId) {
+    return { reviewItemId: existingId };
+  }
+
+  const id = randomUUID();
   const reviewItem: ReviewItem = {
     id,
     workspaceId,
@@ -481,6 +486,71 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   }
   await recordActivity(db, activity);
   return { reviewItemId: id };
+}
+
+function findDuplicateReviewItem(
+  db: AppDatabase,
+  workspaceId: string,
+  proposalType: MvpToolName,
+  targetPath: string | undefined,
+  payload: unknown,
+): string | null {
+  const rows = db.sqlite
+    .prepare(
+      `SELECT id, payload_json as payloadJson
+      FROM review_items
+      WHERE workspace_id = ?
+        AND proposal_type = ?
+        AND COALESCE(target_path, '') = COALESCE(?, '')
+        AND state IN ('proposed', 'approved', 'applied')`,
+    )
+    .all(workspaceId, proposalType, targetPath ?? null) as Array<{ id: string; payloadJson: string }>;
+
+  const fingerprint = proposalFingerprint(proposalType, payload);
+  const duplicate = rows.find((row) => proposalFingerprint(proposalType, parsePayload(row.payloadJson)) === fingerprint);
+  return duplicate?.id ?? null;
+}
+
+function proposalFingerprint(proposalType: MvpToolName, payload: unknown): string {
+  return `${proposalType}:${normalizeProposalPayload(payload)}`;
+}
+
+function normalizeProposalPayload(payload: unknown): string {
+  if (typeof payload === "object" && payload !== null) {
+    if ("body" in payload && typeof payload.body === "string") {
+      return normalizeText(payload.body);
+    }
+    if ("patch" in payload) {
+      return stableStringify(payload.patch);
+    }
+  }
+
+  return stableStringify(payload);
+}
+
+function normalizeText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ").trim();
+}
+
+function parsePayload(payloadJson: string): unknown {
+  try {
+    return JSON.parse(payloadJson);
+  } catch {
+    return payloadJson;
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${stableStringify(nested)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 async function getModelProvider(services: IpcServices): Promise<ModelProvider> {

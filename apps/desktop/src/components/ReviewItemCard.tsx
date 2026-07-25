@@ -22,6 +22,7 @@ export function ReviewItemCard({
 }) {
   const canApprove = item.state === undefined || item.state === "proposed" || item.state === "approved";
   const canReject = item.state === undefined || item.state === "proposed";
+  const source = reviewSource(item);
 
   return (
     <article className="review-card">
@@ -39,6 +40,24 @@ export function ReviewItemCard({
         <strong>{previewLabel(item)}</strong>
         <pre>{previewText(item)}</pre>
       </div>
+      {source ? (
+        <div className="review-context">
+          <strong>Why this was proposed</strong>
+          {source.reason ? <p>{source.reason}</p> : null}
+          {source.userMessage ? (
+            <>
+              <span>User message</span>
+              <p>{source.userMessage}</p>
+            </>
+          ) : null}
+          {source.assistantMessage ? (
+            <>
+              <span>Assistant message</span>
+              <p>{source.assistantMessage}</p>
+            </>
+          ) : null}
+        </div>
+      ) : null}
       {item.failureReason ? <p className="error-text">{item.failureReason}</p> : null}
       <div className="button-row">
         <button type="button" disabled={!canApprove} onClick={() => void onApprove?.(item.id)}>
@@ -89,6 +108,39 @@ function previewText(item: ReviewCardItem): string {
   }
 
   return formatPayload(payload);
+}
+
+function reviewSource(item: ReviewCardItem): { reason?: string; userMessage?: string; assistantMessage?: string } | null {
+  const payload = item.payload;
+  if (typeof payload !== "object" || payload === null || !("source" in payload)) {
+    return null;
+  }
+
+  const source = payload.source;
+  if (typeof source !== "object" || source === null) {
+    return null;
+  }
+
+  const result: { reason?: string; userMessage?: string; assistantMessage?: string } = {};
+  const reason = stringField(source, "reason");
+  const userMessage = stringField(source, "userMessage");
+  const assistantMessage = stringField(source, "assistantMessage");
+  if (reason) {
+    result.reason = reason;
+  }
+  if (userMessage) {
+    result.userMessage = userMessage;
+  }
+  if (assistantMessage) {
+    result.assistantMessage = assistantMessage;
+  }
+  return result;
+}
+
+function stringField(source: object, key: string): string | undefined {
+  return key in source && typeof source[key as keyof typeof source] === "string"
+    ? source[key as keyof typeof source]
+    : undefined;
 }
 
 function formatPayload(payload: unknown): string {

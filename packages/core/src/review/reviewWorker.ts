@@ -39,6 +39,10 @@ const allowedWorkerTools = new Set<MvpToolName>([
 const eligibilityPatterns = [
   /\bremember\b/i,
   /\bprefer(?:s|red|ence)?\b/i,
+  /\bmy name is\b/i,
+  /\bi am\b/i,
+  /\bi have\b/i,
+  /\bmy (?:kid|kids|child|children|family|school|education|degree|job|role|company|project)\b/i,
   /\bdecided?\b/i,
   /\bdecision\b/i,
   /\bimport\b/i,

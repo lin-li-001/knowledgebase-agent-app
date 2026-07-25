@@ -34,7 +34,15 @@ describe("desktop shell", () => {
           reason: "Model proposed a knowledge-base change.",
           sourceSessionId: "session-1",
           sourceTurnId: "turn-1",
-          payload: { body: "Lin Li has two kids, Grace and Leo." },
+          payload: {
+            body: "Lin Li has two kids, Grace and Leo.",
+            source: {
+              origin: "turn_reflection",
+              userMessage: "hello my name is lin li, i have two kids grace and leo",
+              assistantMessage: "Nice to meet you, Lin Li.",
+              reason: "Stable personal profile fact.",
+            },
+          },
         }}
       />,
     );
@@ -44,6 +52,12 @@ describe("desktop shell", () => {
     expect(screen.getByText("Lin Li has two kids, Grace and Leo.")).toBeVisible();
     expect(screen.getByText("proposed")).toBeVisible();
     expect(screen.getByText("From session session-1, turn turn-1")).toBeVisible();
+    expect(screen.getByText("Why this was proposed")).toBeVisible();
+    expect(screen.getByText("Stable personal profile fact.")).toBeVisible();
+    expect(screen.getByText("User message")).toBeVisible();
+    expect(screen.getByText("hello my name is lin li, i have two kids grace and leo")).toBeVisible();
+    expect(screen.getByText("Assistant message")).toBeVisible();
+    expect(screen.getByText("Nice to meet you, Lin Li.")).toBeVisible();
   });
 
   it("disables review actions after a proposal is applied", () => {

@@ -25,3 +25,4 @@
 ## Product TODO
 
 - Study the Hermes memory provider flow and document product pros/cons for this app: provider lifecycle, prefetch timing, tool-based recall, auto-capture, user trust, local-first privacy, debug visibility, and when external semantic memory is worth the added complexity.
+- Add a Session Reflection Worker later: when a session is explicitly closed or idle, review the full session transcript and generate review-item candidates for cross-turn decisions, preferences, and durable product insights. Keep the output review-gated; do not sync directly into memory.

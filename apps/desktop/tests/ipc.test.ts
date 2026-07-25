@@ -198,6 +198,107 @@ describe("IPC contract", () => {
     );
   });
 
+  it("stores reflection source context on review proposals", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: new ScriptedProvider([
+        { content: "Nice to meet you, Lin Li." },
+        {
+          content: "",
+          toolCalls: [
+            {
+              id: "review-call-1",
+              name: "propose_memory",
+              argumentsJson: JSON.stringify({
+                body: "User's name is Lin Li.",
+                source: {
+                  origin: "turn_reflection",
+                  userMessage: "hello my name is lin li",
+                  assistantMessage: "Nice to meet you, Lin Li.",
+                  reason: "Stable personal identity fact.",
+                },
+              }),
+            },
+          ],
+        },
+      ]),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "hello my name is lin li" }),
+    ).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    await expect(handleIpcRequest(services, "review:list", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: [
+          expect.objectContaining({
+            proposalType: "propose_memory",
+            payload: expect.objectContaining({
+              body: "User's name is Lin Li.",
+              source: expect.objectContaining({
+                origin: "turn_reflection",
+                userMessage: "hello my name is lin li",
+                assistantMessage: "Nice to meet you, Lin Li.",
+                reason: "Stable personal identity fact.",
+              }),
+            }),
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("deduplicates repeated memory proposals for the same fact", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const duplicateMemory = {
+      body: "User's name is Lin Li.",
+      source: {
+        origin: "turn_reflection",
+        userMessage: "hello my name is lin li",
+        assistantMessage: "Nice to meet you, Lin Li.",
+        reason: "Stable personal identity fact.",
+      },
+    };
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: new ScriptedProvider([
+        {
+          content: "",
+          toolCalls: [{ id: "main-call-1", name: "propose_memory", argumentsJson: JSON.stringify(duplicateMemory) }],
+        },
+        { content: "Nice to meet you, Lin Li." },
+        {
+          content: "",
+          toolCalls: [{ id: "review-call-1", name: "propose_memory", argumentsJson: JSON.stringify(duplicateMemory) }],
+        },
+      ]),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "hello my name is lin li" }),
+    ).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(services.db?.sqlite.prepare("SELECT COUNT(*) as count FROM review_items").get()).toEqual({ count: 1 });
+  });
+
   it("treats repeated review approvals as idempotent", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
@@ -385,6 +486,26 @@ class ToolCallingProvider implements ModelProvider {
 
   async *stream(): AsyncIterable<ModelStreamEvent> {
     yield { type: "message", content: "Session search complete." };
+  }
+
+  async estimateCost(): Promise<CostEstimate> {
+    return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
+}
+
+class ScriptedProvider implements ModelProvider {
+  readonly supportsToolCalling = true;
+  readonly supportsPromptCache = false;
+  private cursor = 0;
+
+  constructor(private readonly responses: ModelResponse[]) {}
+
+  async complete(_input: ModelRequest): Promise<ModelResponse> {
+    return this.responses[this.cursor++] ?? { content: "" };
+  }
+
+  async *stream(input: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(input) };
   }
 
   async estimateCost(): Promise<CostEstimate> {

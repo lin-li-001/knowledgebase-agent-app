@@ -28,6 +28,13 @@ export const mvpToolNames = [
 export type MvpToolName = (typeof mvpToolNames)[number];
 
 export function createToolRegistry(): Map<MvpToolName, ToolDefinition> {
+  const proposalSourceSchema = z.object({
+    origin: z.string().optional(),
+    userMessage: z.string().optional(),
+    assistantMessage: z.string().optional(),
+    reason: z.string().optional(),
+  }).optional();
+
   const definitions = [
     tool("search_notes", "Search indexed Markdown notes.", z.object({ query: z.string() }), "read"),
     tool("read_note", "Read a Markdown note by workspace-relative path.", z.object({ path: z.string() }), "read"),
@@ -35,10 +42,10 @@ export function createToolRegistry(): Map<MvpToolName, ToolDefinition> {
     tool("search_sessions", "Search prior chat session messages.", z.object({ query: z.string() }), "read"),
     tool("get_workspace_rules", "Read workspace AGENTS.md rules.", z.object({}), "read"),
     tool("get_profile", "Read active profile context.", z.object({}), "read"),
-    tool("propose_create_note", "Propose creating a Markdown note.", z.object({ path: z.string(), body: z.string() }), "low"),
-    tool("propose_update_note", "Propose updating an existing Markdown note.", z.object({ path: z.string(), patch: z.unknown() }), "medium"),
-    tool("propose_memory", "Propose durable memory.", z.object({ body: z.string() }), "high"),
-    tool("propose_decision", "Propose a durable decision note.", z.object({ body: z.string() }), "high"),
+    tool("propose_create_note", "Propose creating a Markdown note.", z.object({ path: z.string(), body: z.string(), source: proposalSourceSchema }), "low"),
+    tool("propose_update_note", "Propose updating an existing Markdown note.", z.object({ path: z.string(), patch: z.unknown(), source: proposalSourceSchema }), "medium"),
+    tool("propose_memory", "Propose durable memory.", z.object({ body: z.string(), source: proposalSourceSchema }), "high"),
+    tool("propose_decision", "Propose a durable decision note.", z.object({ body: z.string(), source: proposalSourceSchema }), "high"),
     tool("propose_delete", "Propose deleting a note.", z.object({ path: z.string() }), "explicit"),
   ];
 

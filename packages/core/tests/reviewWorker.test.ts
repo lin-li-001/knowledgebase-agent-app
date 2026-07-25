@@ -18,12 +18,16 @@ describe("review worker", () => {
     expect(isReviewEligible(baseTurn)).toBe(true);
     expect(isReviewEligible({ ...baseTurn, userMessage: "We decided to keep imports in 04-Resources/Imports." })).toBe(true);
     expect(isReviewEligible({ ...baseTurn, userMessage: "Please import these utility bills and summarize them." })).toBe(true);
+    expect(isReviewEligible({ ...baseTurn, userMessage: "hello my name is lin li" })).toBe(true);
+    expect(isReviewEligible({ ...baseTurn, userMessage: "I have two kids, Grace and Leo." })).toBe(true);
   });
 
   it("skips ineligible turns", () => {
     expect(isReviewEligible({ ...baseTurn, state: "interrupted" })).toBe(false);
     expect(isReviewEligible({ ...baseTurn, state: "error" })).toBe(false);
     expect(isReviewEligible({ ...baseTurn, userMessage: "   " })).toBe(false);
+    expect(isReviewEligible({ ...baseTurn, userMessage: "where did I work in 2018?" })).toBe(false);
+    expect(isReviewEligible({ ...baseTurn, userMessage: "thanks" })).toBe(false);
     expect(isReviewEligible({ ...baseTurn, reviewedAt: "2026-07-21T00:00:00.000Z" })).toBe(false);
   });
 
@@ -37,6 +41,9 @@ describe("review worker", () => {
     expect(prompt).toContain("review items");
     expect(prompt).toContain("Do not save task progress");
     expect(prompt).toContain("raw transcript excerpts");
+    expect(prompt).toContain("source");
+    expect(prompt).toContain("turn_reflection");
+    expect(prompt).toContain("Stable personal facts");
   });
 
   it("creates a high-risk memory proposal for stable preferences", async () => {
@@ -55,7 +62,15 @@ describe("review worker", () => {
           {
             id: "call-1",
             name: "propose_memory",
-            argumentsJson: "{\"body\":\"User prefers Activity Feed over toast for auto-save feedback.\"}",
+            argumentsJson: JSON.stringify({
+              body: "User prefers Activity Feed over toast for auto-save feedback.",
+              source: {
+                origin: "turn_reflection",
+                userMessage: baseTurn.userMessage,
+                assistantMessage: baseTurn.assistantMessage,
+                reason: "Stable product preference.",
+              },
+            }),
           },
         ],
       },
@@ -68,7 +83,15 @@ describe("review worker", () => {
     expect(calls).toEqual([
       {
         name: "propose_memory",
-        input: { body: "User prefers Activity Feed over toast for auto-save feedback." },
+        input: {
+          body: "User prefers Activity Feed over toast for auto-save feedback.",
+          source: {
+            origin: "turn_reflection",
+            userMessage: baseTurn.userMessage,
+            assistantMessage: baseTurn.assistantMessage,
+            reason: "Stable product preference.",
+          },
+        },
       },
     ]);
   });
