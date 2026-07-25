@@ -1,6 +1,8 @@
 import type { ModelMessage } from "@kb-agent/model";
 
 export interface RetrievedSnippet {
+  provider?: string;
+  sourceType?: string;
   title: string;
   path: string;
   text: string;

@@ -23,7 +23,7 @@ export async function finalizeTurn(input: {
     workspaceId: input.workspaceId,
     kind: "chat",
     title: "Chat turn completed",
-    message: "Assistant response saved. Review Worker not enabled in v0.1A.",
+    message: "Assistant response saved. Review Worker checked for follow-up proposals.",
     createdAt: input.createdAt,
   });
 }

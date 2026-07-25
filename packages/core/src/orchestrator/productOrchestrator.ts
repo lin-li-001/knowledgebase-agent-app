@@ -2,17 +2,29 @@ import { appendMessage, type AppDatabase } from "@kb-agent/storage";
 import type { ModelMessage, ModelProvider, ModelResponse, ModelToolCall } from "@kb-agent/model";
 import { executeToolCall, type ToolHandler } from "../tools/toolExecutor";
 import { createToolRegistry, type MvpToolName } from "../tools/toolRegistry";
+import { runReviewJob } from "../review/reviewWorker";
 import { buildTurnContext } from "./contextBuilder";
 import { buildRequestMessages } from "./requestMessages";
 import { finalizeTurn } from "./turnFinalizer";
 
 export type TurnEvent =
+  | { type: "sources"; sources: SourceEvent[] }
   | { type: "message"; content: string }
   | { type: "tool_call"; toolCall: ModelToolCall }
   | { type: "tool_result"; toolCallId: string; result: unknown }
   | { type: "done"; response: ModelResponse }
   | { type: "interrupted" }
   | { type: "error"; error: string };
+
+export interface SourceEvent {
+  provider?: string;
+  sourceType?: string;
+  title: string;
+  path: string;
+  text: string;
+  snippet?: string;
+  matchedFields?: string[];
+}
 
 export interface RunTurnInput {
   db: AppDatabase;
@@ -60,6 +72,10 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       workspaceRoot: input.workspaceRoot,
       query: input.userMessage,
     });
+    const sources = sourceEvents(context.snippets);
+    if (sources.length) {
+      yield { type: "sources", sources };
+    }
 
     const messages = buildRequestMessages(
       [
@@ -121,13 +137,28 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       yield { type: "message", content: response.content };
     }
 
+    const assistantMessageId = `${input.sessionId}:assistant:${Date.now()}`;
     await finalizeTurn({
       db: input.db,
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
-      assistantMessageId: `${input.sessionId}:assistant:${Date.now()}`,
+      assistantMessageId,
       response,
       createdAt: now,
+    });
+
+    await runReviewJob({
+      turn: {
+        id: assistantMessageId,
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId,
+        userMessage: input.userMessage,
+        assistantMessage: response.content,
+        state: "completed",
+      },
+      modelProvider: input.modelProvider,
+      model: input.model,
+      handlers,
     });
 
     yield { type: "done", response };
@@ -140,4 +171,27 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
 
 function boundToolResult(result: unknown): string {
   return JSON.stringify(result).slice(0, 8_000);
+}
+
+function sourceEvents(snippets: Awaited<ReturnType<typeof buildTurnContext>>["snippets"]): SourceEvent[] {
+  return snippets.map((snippet) => {
+    const source: SourceEvent = {
+      title: snippet.title,
+      path: snippet.path,
+      text: snippet.text,
+    };
+    if (snippet.provider) {
+      source.provider = snippet.provider;
+    }
+    if (snippet.sourceType) {
+      source.sourceType = snippet.sourceType;
+    }
+    if (snippet.snippet) {
+      source.snippet = snippet.snippet;
+    }
+    if (snippet.matchedFields?.length) {
+      source.matchedFields = snippet.matchedFields;
+    }
+    return source;
+  });
 }

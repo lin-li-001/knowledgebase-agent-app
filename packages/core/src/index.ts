@@ -2,6 +2,7 @@ export { recordActivityEvent, listRecentActivity } from "./activity/activityServ
 export { startImportBatch } from "./imports/importService";
 export { buildTurnContext } from "./orchestrator/contextBuilder";
 export { runTurn } from "./orchestrator/productOrchestrator";
+export { LocalNotesRecallProvider } from "./orchestrator/recallProvider";
 export { buildRequestMessages } from "./orchestrator/requestMessages";
 export { finalizeTurn } from "./orchestrator/turnFinalizer";
 export { classifyProposalRisk } from "./risk/riskPolicy";
@@ -13,7 +14,8 @@ export { createToolRegistry, mvpToolNames } from "./tools/toolRegistry";
 export type { Proposal, ProposalRisk } from "./risk/riskPolicy";
 export type { StartImportBatchInput } from "./imports/importService";
 export type { TurnContext } from "./orchestrator/contextBuilder";
-export type { RunTurnInput, TurnEvent } from "./orchestrator/productOrchestrator";
+export type { RunTurnInput, SourceEvent, TurnEvent } from "./orchestrator/productOrchestrator";
+export type { EvidenceBundle, EvidenceSourceType, RecallProvider, RecallQuery } from "./orchestrator/recallProvider";
 export type { RetrievedSnippet } from "./orchestrator/requestMessages";
 export type { ProposalPatch, ReviewItem, ReviewState } from "./review/reviewLifecycle";
 export type { CompletedTurn, CompletedTurnState, ReviewJobResult, RunReviewJobInput } from "./review/reviewWorker";

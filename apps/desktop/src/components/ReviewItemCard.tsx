@@ -6,6 +6,8 @@ export interface ReviewCardItem {
   targetPath?: string;
   payload?: unknown;
   reason: string;
+  sourceSessionId?: string;
+  sourceTurnId?: string;
   failureReason?: string;
 }
 
@@ -30,6 +32,9 @@ export function ReviewItemCard({
       </div>
       <h3>{reviewTitle(item)}</h3>
       <p>{item.reason}</p>
+      {item.sourceSessionId && item.sourceTurnId ? (
+        <p className="review-source">From session {item.sourceSessionId}, turn {item.sourceTurnId}</p>
+      ) : null}
       <div className="patch-preview">
         <strong>{previewLabel(item)}</strong>
         <pre>{previewText(item)}</pre>

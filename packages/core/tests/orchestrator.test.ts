@@ -80,6 +80,9 @@ Graph memory architecture
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "done" })]));
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM messages").get()).toEqual({ count: 3 });
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM activity_events").get()).toEqual({ count: 1 });
+    expect(db.sqlite.prepare("SELECT message FROM activity_events ORDER BY created_at DESC LIMIT 1").get()).toEqual({
+      message: "Assistant response saved. Review Worker checked for follow-up proposals.",
+    });
   });
 
   it("passes tool results into the follow-up model request", async () => {
@@ -152,6 +155,120 @@ Graph memory architecture
         }),
       ]),
     );
+  });
+
+  it("emits retrieved source evidence before asking the model", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-turn-"));
+    await mkdir(path.join(root, "04-Resources/Imports"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.");
+    await writeFile(
+      path.join(root, "04-Resources/Imports/Resume.md"),
+      `---
+title: Resume
+type: resource
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: [resume]
+summary: Lin worked at LQ Digital from 2017 to 2019.
+---
+
+# Resume
+
+LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019
+`,
+    );
+
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+    const { workspaceId } = await indexWorkspace(root, db);
+    db.sqlite
+      .prepare("INSERT INTO sessions (id, workspace_id, profile_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("session-1", workspaceIdForRoot(root), "default", "Chat", "2026-07-20", "2026-07-20");
+
+    const provider = new MockProvider([{ role: "assistant", content: "You worked at LQ Digital." }]);
+    const events = [];
+    for await (const event of runTurn({
+      db,
+      modelProvider: provider,
+      model: "mock",
+      workspaceId,
+      workspaceRoot: root,
+      sessionId: "session-1",
+      userMessage: "where did I work in 2018",
+      now: "2026-07-20T00:00:00.000Z",
+    })) {
+      events.push(event);
+    }
+
+    expect(events[0]).toEqual({
+      type: "sources",
+      sources: [
+        expect.objectContaining({
+          title: "Resume",
+          path: "04-Resources/Imports/Resume.md",
+          snippet: expect.stringContaining("LQ Digital"),
+        }),
+      ],
+    });
+  });
+
+  it("runs the review worker after eligible completed turns", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-turn-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.");
+
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+    const { workspaceId } = await indexWorkspace(root, db);
+    db.sqlite
+      .prepare("INSERT INTO sessions (id, workspace_id, profile_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("session-1", workspaceIdForRoot(root), "default", "Chat", "2026-07-20", "2026-07-20");
+
+    const provider = new MockProvider([
+      { role: "assistant", content: "I will propose saving that preference for review." },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "review-call-1",
+            name: "propose_memory",
+            argumentsJson: "{\"body\":\"User prefers Activity Feed over toast for auto-save feedback.\"}",
+          },
+        ],
+      },
+    ]);
+    const calls: Array<{ name: string; input: unknown }> = [];
+    const handlers = new Map<string, ToolHandler>([
+      ["propose_memory", async (input) => {
+        calls.push({ name: "propose_memory", input });
+        return { reviewItemId: "review-1" };
+      }],
+    ]) as Parameters<typeof runTurn>[0]["handlers"];
+
+    for await (const _event of runTurn({
+      db,
+      modelProvider: provider,
+      model: "mock",
+      workspaceId,
+      workspaceRoot: root,
+      sessionId: "session-1",
+      userMessage: "Remember that I prefer Activity Feed over toast.",
+      handlers,
+      now: "2026-07-20T00:00:00.000Z",
+    })) {
+      // Exhaust the turn and review pass.
+    }
+
+    expect(calls).toEqual([
+      {
+        name: "propose_memory",
+        input: { body: "User prefers Activity Feed over toast for auto-save feedback." },
+      },
+    ]);
   });
 });
 

@@ -1,12 +1,14 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { searchNotes, type AppDatabase } from "@kb-agent/storage";
+import type { AppDatabase } from "@kb-agent/storage";
+import { LocalNotesRecallProvider, type EvidenceBundle, type RecallProvider } from "./recallProvider";
 import type { RetrievedSnippet } from "./requestMessages";
 
 export interface TurnContext {
   workspaceRules: string;
   profile: string;
   memory: string;
+  evidence: EvidenceBundle[];
   snippets: RetrievedSnippet[];
 }
 
@@ -15,23 +17,29 @@ export async function buildTurnContext(input: {
   workspaceId: string;
   workspaceRoot: string;
   query: string;
+  recallProviders?: RecallProvider[];
 }): Promise<TurnContext> {
-  const [workspaceRules, profile, memory, candidates] = await Promise.all([
+  const recallProviders = input.recallProviders ?? [new LocalNotesRecallProvider()];
+  const [workspaceRules, profile, memory, evidenceGroups] = await Promise.all([
     readOptional(path.join(input.workspaceRoot, "AGENTS.md")),
     readOptional(path.join(input.workspaceRoot, "02-Profiles/default/Profile.md")),
     readOptional(path.join(input.workspaceRoot, "02-Profiles/default/Memory.md")),
-    searchNotes(input.db, input.query, { workspaceId: input.workspaceId, limit: 5 }),
+    Promise.all(recallProviders.map((provider) => provider.prefetch(input))),
   ]);
+  const evidence = evidenceGroups.flat();
 
   return {
     workspaceRules,
     profile,
     memory,
-    snippets: candidates.map((candidate) => {
+    evidence,
+    snippets: evidence.map((candidate) => {
       const snippet: RetrievedSnippet = {
+        provider: candidate.provider,
+        sourceType: candidate.sourceType,
         title: candidate.title,
         path: candidate.path,
-        text: candidate.summary ?? "",
+        text: candidate.text,
       };
       if (candidate.snippet) {
         snippet.snippet = candidate.snippet;

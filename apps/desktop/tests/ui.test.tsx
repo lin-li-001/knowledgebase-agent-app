@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import { ImportDropzone } from "../src/components/ImportDropzone";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
@@ -9,6 +9,7 @@ import { ReviewItemCard } from "../src/components/ReviewItemCard";
 describe("desktop shell", () => {
   afterEach(() => {
     cleanup();
+    window.kbAgent = undefined;
   });
 
   it("renders primary navigation and Activity", () => {
@@ -31,6 +32,8 @@ describe("desktop shell", () => {
           proposalType: "propose_memory",
           risk: "high",
           reason: "Model proposed a knowledge-base change.",
+          sourceSessionId: "session-1",
+          sourceTurnId: "turn-1",
           payload: { body: "Lin Li has two kids, Grace and Leo." },
         }}
       />,
@@ -40,6 +43,7 @@ describe("desktop shell", () => {
     expect(screen.getByText("Memory to save")).toBeVisible();
     expect(screen.getByText("Lin Li has two kids, Grace and Leo.")).toBeVisible();
     expect(screen.getByText("proposed")).toBeVisible();
+    expect(screen.getByText("From session session-1, turn turn-1")).toBeVisible();
   });
 
   it("disables review actions after a proposal is applied", () => {
@@ -66,5 +70,55 @@ describe("desktop shell", () => {
     expect(screen.getByLabelText("Batch name")).toBeVisible();
     expect(screen.getByLabelText("Import files")).toBeVisible();
     expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
+  });
+
+  it("shows source evidence returned by a chat turn", async () => {
+    window.kbAgent = {
+      invoke: vi.fn(async (channel) => {
+        if (channel === "workspace:get-active") {
+          return { ok: true, data: { rootPath: "/tmp/kb", workspaceId: "workspace-1", sessionId: "session-1" } };
+        }
+        if (channel === "settings:get") {
+          return { ok: true, data: { hasApiKey: false, modelName: "mock" } };
+        }
+        if (channel === "activity:list" || channel === "review:list") {
+          return { ok: true, data: [] };
+        }
+        if (channel === "chat:run-turn") {
+          return {
+            ok: true,
+            data: {
+              events: [
+                {
+                  type: "sources",
+                  sources: [
+                    {
+                      title: "Resume",
+                      path: "04-Resources/Imports/Resume.md",
+                      snippet: "LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019",
+                      matchedFields: ["body"],
+                    },
+                  ],
+                },
+                { type: "message", content: "You worked at LQ Digital in 2018." },
+                { type: "done", response: { role: "assistant", content: "You worked at LQ Digital in 2018." } },
+              ],
+            },
+          };
+        }
+        return { ok: true, data: null };
+      }),
+    };
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "where did I work in 2018" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Sources used")).toBeVisible();
+    expect(screen.getByText("Resume")).toBeVisible();
+    expect(screen.getByText("04-Resources/Imports/Resume.md")).toBeVisible();
+    expect(screen.getByText("LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019")).toBeVisible();
+    expect(screen.getByText("You worked at LQ Digital in 2018.")).toBeVisible();
   });
 });

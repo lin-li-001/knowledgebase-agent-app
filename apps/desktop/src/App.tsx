@@ -23,9 +23,23 @@ interface SettingsState {
   modelName?: string;
 }
 
-interface ChatMessage {
-  role: "assistant" | "user" | "error";
-  content: string;
+interface ChatSource {
+  title: string;
+  path: string;
+  text?: string;
+  snippet?: string;
+  matchedFields?: string[];
+}
+
+type ChatMessage =
+  | { role: "assistant" | "user" | "error"; content: string }
+  | { role: "sources"; sources: ChatSource[] };
+
+interface ChatTurnEvent {
+  type: string;
+  content?: string;
+  error?: string;
+  sources?: ChatSource[];
 }
 
 declare global {
@@ -93,7 +107,7 @@ export function App() {
     setError(null);
     setTurnState("queued");
     setChatMessages((messages) => [...messages, { role: "user", content: message }]);
-    const result = await api.invoke<{ events: Array<{ type: string; content?: string; error?: string }> }>("chat:run-turn", {
+    const result = await api.invoke<{ events: ChatTurnEvent[] }>("chat:run-turn", {
       sessionId: workspace.sessionId,
       message,
     });
@@ -103,12 +117,18 @@ export function App() {
       return;
     }
 
-    const assistantMessages = result.data.events
-      .filter((event) => (event.type === "message" && event.content) || (event.type === "error" && event.error))
-      .map((event) => ({
-        role: event.type === "error" ? "error" as const : "assistant" as const,
-        content: event.type === "error" ? `Error: ${event.error ?? "Unknown error"}` : event.content ?? "",
-      }));
+    const assistantMessages = result.data.events.flatMap((event): ChatMessage[] => {
+      if (event.type === "sources" && event.sources?.length) {
+        return [{ role: "sources", sources: event.sources }];
+      }
+      if (event.type === "message" && event.content) {
+        return [{ role: "assistant", content: event.content }];
+      }
+      if (event.type === "error" && event.error) {
+        return [{ role: "error", content: `Error: ${event.error}` }];
+      }
+      return [];
+    });
     setChatMessages((messages) => [...messages, ...assistantMessages]);
     const errorEvent = result.data.events.find((event) => event.type === "error");
     if (errorEvent?.error) {

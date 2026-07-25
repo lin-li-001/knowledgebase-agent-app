@@ -145,6 +145,43 @@ h2 {
   background: #eef4ef;
 }
 
+.source-evidence {
+  margin-bottom: 10px;
+  border-left: 3px solid #c58b28;
+  border-radius: 6px;
+  background: #fff8ea;
+  padding: 10px;
+}
+
+.source-evidence h2 {
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.source-evidence ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source-evidence li {
+  display: grid;
+  gap: 4px;
+}
+
+.source-evidence span,
+.source-evidence small {
+  color: #59665f;
+  word-break: break-word;
+}
+
+.source-evidence p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
 .user-message {
   background: #f7f2e7;
 }
@@ -201,6 +238,11 @@ select {
 .review-meta {
   display: flex;
   gap: 6px;
+}
+
+.review-source {
+  color: #59665f;
+  font-size: 13px;
 }
 
 .patch-preview {
