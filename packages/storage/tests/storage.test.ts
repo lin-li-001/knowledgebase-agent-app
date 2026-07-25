@@ -188,7 +188,13 @@ describe("search", () => {
     });
 
     await expect(searchNotes(db, "where did I work in 2018", { workspaceId: "workspace-1" })).resolves.toEqual(
-      expect.arrayContaining([expect.objectContaining({ noteId: "note-resume" })]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          noteId: "note-resume",
+          snippet: expect.stringContaining("LQ Digital"),
+          matchedFields: expect.arrayContaining(["body"]),
+        }),
+      ]),
     );
   });
 });

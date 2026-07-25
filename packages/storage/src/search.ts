@@ -12,7 +12,8 @@ export async function searchNotes(
 ): Promise<NoteSearchResult[]> {
   const limit = filters.limit ?? 20;
   const isCjkQuery = containsCjk(query);
-  const normalizedQuery = toRecallFtsQuery(query);
+  const recallTokens = toRecallTokens(query);
+  const normalizedQuery = toRecallFtsQuery(query, recallTokens);
   if (!isCjkQuery && !normalizedQuery) {
     return [];
   }
@@ -22,14 +23,17 @@ export async function searchNotes(
     ? "(f.title LIKE @likeQuery OR f.summary LIKE @likeQuery OR f.headings LIKE @likeQuery OR f.body LIKE @likeQuery)"
     : `${table} MATCH @query`;
 
-  return db.sqlite
+  const rows = db.sqlite
     .prepare(
       `SELECT
         f.note_id as noteId,
         f.workspace_id as workspaceId,
         f.path,
         f.title,
-        f.summary
+        f.summary,
+        f.headings,
+        f.body,
+        snippet(${table}, 5, '', '', '...', 18) as snippet
       FROM ${table} f
       WHERE ${matchExpression} ${workspaceClause}
       LIMIT @limit`,
@@ -39,7 +43,33 @@ export async function searchNotes(
       likeQuery: `%${query.trim()}%`,
       workspaceId: filters.workspaceId,
       limit,
-    }) as NoteSearchResult[];
+    }) as NoteSearchRow[];
+
+  return rows.map((row) => {
+    const result: NoteSearchResult = {
+      noteId: row.noteId,
+      workspaceId: row.workspaceId,
+      path: row.path,
+      title: row.title,
+    };
+    const snippet = normalizeSnippet(row.snippet || row.summary || row.body);
+    const fields = matchedFields(row, recallTokens);
+    if (row.summary) {
+      result.summary = row.summary;
+    }
+    if (snippet) {
+      result.snippet = snippet;
+    }
+    if (fields.length) {
+      result.matchedFields = fields;
+    }
+    return result;
+  });
+}
+
+interface NoteSearchRow extends NoteSearchResult {
+  headings?: string;
+  body?: string;
 }
 
 export async function searchSessions(
@@ -157,12 +187,14 @@ const ftsStopwords = new Set([
   "your",
 ]);
 
-function toRecallFtsQuery(value: string): string {
-  const tokens = expandRecallTokens(value)
+function toRecallTokens(value: string): string[] {
+  return expandRecallTokens(value)
     .toLocaleLowerCase()
     .match(/[\p{L}\p{N}_]+/gu)
     ?.filter((token) => token.length > 1 && !ftsStopwords.has(token)) ?? [];
+}
 
+function toRecallFtsQuery(value: string, tokens = toRecallTokens(value)): string {
   if (tokens.length === 0) {
     return toFtsQuery(value);
   }
@@ -186,4 +218,25 @@ function expandRecallTokens(value: string): string {
     "work worked job company employer employment career resume experience",
     ...nearbyYears.map(String),
   ].join(" ");
+}
+
+function normalizeSnippet(value: string | undefined): string {
+  return (value ?? "").replace(/\s+/gu, " ").trim();
+}
+
+function matchedFields(row: NoteSearchRow, tokens: string[]): string[] {
+  const fields = [
+    ["title", row.title],
+    ["summary", row.summary],
+    ["headings", row.headings],
+    ["body", row.body],
+  ] as const;
+  const uniqueTokens = [...new Set(tokens.map((token) => token.toLocaleLowerCase()))];
+
+  return fields
+    .filter(([, value]) => {
+      const lower = (value ?? "").toLocaleLowerCase();
+      return uniqueTokens.some((token) => lower.includes(token));
+    })
+    .map(([field]) => field);
 }

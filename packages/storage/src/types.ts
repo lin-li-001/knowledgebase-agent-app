@@ -58,6 +58,8 @@ export interface NoteSearchResult {
   path: string;
   title: string;
   summary?: string;
+  snippet?: string;
+  matchedFields?: string[];
 }
 
 export interface SessionSearchResult {

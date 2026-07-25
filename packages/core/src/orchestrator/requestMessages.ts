@@ -4,6 +4,8 @@ export interface RetrievedSnippet {
   title: string;
   path: string;
   text: string;
+  snippet?: string;
+  matchedFields?: string[];
 }
 
 export function buildRequestMessages(
@@ -12,7 +14,11 @@ export function buildRequestMessages(
   snippets: RetrievedSnippet[],
 ): ModelMessage[] {
   const retrievalBlock = snippets
-    .map((snippet) => `- ${snippet.title} (${snippet.path}): ${snippet.text}`)
+    .map((snippet) => {
+      const evidence = snippet.snippet || snippet.text;
+      const matchedFields = snippet.matchedFields?.length ? `\n  Matched fields: ${snippet.matchedFields.join(", ")}` : "";
+      return `- ${snippet.title}\n  Source: ${snippet.path}\n  Evidence: ${evidence}${matchedFields}`;
+    })
     .join("\n");
 
   const content = retrievalBlock

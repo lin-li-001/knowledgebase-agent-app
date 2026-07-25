@@ -27,11 +27,20 @@ export async function buildTurnContext(input: {
     workspaceRules,
     profile,
     memory,
-    snippets: candidates.map((candidate) => ({
-      title: candidate.title,
-      path: candidate.path,
-      text: candidate.summary ?? "",
-    })),
+    snippets: candidates.map((candidate) => {
+      const snippet: RetrievedSnippet = {
+        title: candidate.title,
+        path: candidate.path,
+        text: candidate.summary ?? "",
+      };
+      if (candidate.snippet) {
+        snippet.snippet = candidate.snippet;
+      }
+      if (candidate.matchedFields?.length) {
+        snippet.matchedFields = candidate.matchedFields;
+      }
+      return snippet;
+    }),
   };
 }
 
