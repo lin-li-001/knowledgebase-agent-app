@@ -7,6 +7,7 @@ import {
   settingsTemplate,
   workspaceContract,
 } from "./templates";
+import { defaultRoutingPolicy } from "./routingPolicy";
 
 export interface WorkspaceInfo {
   rootPath: string;
@@ -17,11 +18,11 @@ export interface WorkspaceInfo {
 const directories = [
   "00-Inbox",
   "01-Projects",
-  "02-Profiles/default",
+  path.dirname(defaultRoutingPolicy.profileMemoryPath("default")),
   "03-Knowledge",
-  "04-Resources/Imports",
+  defaultRoutingPolicy.importSummaryDir(),
   "05-Templates",
-  "06-Attachments/Imports",
+  defaultRoutingPolicy.importAttachmentRoot(),
   ".vault/decisions",
   ".vault/memory/default",
   ".vault/memory/shared",
@@ -45,7 +46,7 @@ export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> 
     writeFile(path.join(normalizedRoot, "02-Profiles/default/Profile.md"), profileTemplate, {
       flag: "wx",
     }).catch(ignoreExistingFile),
-    writeFile(path.join(normalizedRoot, "02-Profiles/default/Memory.md"), memoryTemplate, {
+    writeFile(path.join(normalizedRoot, defaultRoutingPolicy.profileMemoryPath("default")), memoryTemplate, {
       flag: "wx",
     }).catch(ignoreExistingFile),
     writeFile(path.join(normalizedRoot, ".vault/CHANGES.md"), changesTemplate, {

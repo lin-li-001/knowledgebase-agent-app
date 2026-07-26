@@ -2,6 +2,15 @@ export const workspaceContract = `# Workspace Contract
 
 Markdown files are the source of truth. SQLite files under \`.app/\` are derived runtime state.
 
+## Routing Policy
+
+The app uses a code-enforced routing policy for filesystem writes. This contract explains the default paths so users can inspect and audit where knowledge goes.
+
+- Imported summary notes go to \`04-Resources/Imports/<batch-name>.md\`.
+- Imported original files go to \`06-Attachments/Imports/<batch-name>/\`.
+- Profile memory lives at \`02-Profiles/<profile-id>/Memory.md\`.
+- Runtime exports live under \`.app/exports/\` and are derived, not source-of-truth notes.
+
 Read tools may inspect notes and indexed sessions. Write tools must follow the risk policy:
 - low-risk new notes may auto-save and record activity
 - profile, memory, sensitive, private, formal-note updates require Review

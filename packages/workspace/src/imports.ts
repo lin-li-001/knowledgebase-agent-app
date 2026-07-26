@@ -2,6 +2,7 @@ import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { assertInsideWorkspace } from "./pathGuard";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
+import { defaultRoutingPolicy } from "./routingPolicy";
 
 export interface ImportBatchInput {
   workspaceRoot: string;
@@ -27,8 +28,8 @@ interface ImportedDocument extends ExtractedDocument {
 export async function importDocumentBatch(input: ImportBatchInput): Promise<ImportJob> {
   const batchName = sanitizeBatchName(input.batchName);
   const created = (input.now ?? new Date().toISOString()).slice(0, 10);
-  const attachmentDir = `06-Attachments/Imports/${batchName}`;
-  const summaryNotePath = `04-Resources/Imports/${batchName}.md`;
+  const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
+  const summaryNotePath = defaultRoutingPolicy.importSummaryNotePath(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
   const summaryTargetPath = assertInsideWorkspace(input.workspaceRoot, summaryNotePath);
 

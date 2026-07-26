@@ -49,6 +49,15 @@ describe("createWorkspace", () => {
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Markdown files are the source of truth",
     );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Imported summary notes go to `04-Resources/Imports/<batch-name>.md`",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Imported original files go to `06-Attachments/Imports/<batch-name>/`",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Profile memory lives at `02-Profiles/<profile-id>/Memory.md`",
+    );
     await expect(readFile(path.join(rootPath, ".app/settings.json"), "utf8")).resolves.toContain(
       '"activeProfileId": "default"',
     );
