@@ -19,5 +19,7 @@ describe("buildRequestMessages", () => {
     expect(messages[1]?.content).toContain("Relevant local context");
     expect(messages[1]?.content).toContain("Source: 03-Knowledge/Graph Memory.md");
     expect(messages[1]?.content).toContain("Evidence: Graph memory architecture");
+    expect(messages[1]?.content).toContain("Response style");
+    expect(messages[1]?.content).toContain("Use short Markdown sections");
   });
 });

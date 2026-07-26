@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import { ImportDropzone } from "../src/components/ImportDropzone";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
+import { ChatRoute } from "../src/routes/ChatRoute";
 
 describe("desktop shell", () => {
   afterEach(() => {
@@ -84,6 +85,30 @@ describe("desktop shell", () => {
     expect(screen.getByLabelText("Batch name")).toBeVisible();
     expect(screen.getByLabelText("Import files")).toBeVisible();
     expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
+  });
+
+  it("renders assistant markdown as visual structure", () => {
+    render(
+      <ChatRoute
+        messages={[
+          {
+            role: "assistant",
+            content: "## SQL topics\n\n- Window functions\n- Join optimization\n\n```sql\nSELECT user_id FROM events\n```",
+          },
+        ]}
+        hasWorkspace
+        hasApiKey
+        turnState="complete"
+        onSend={async () => undefined}
+        onCancel={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "SQL topics" })).toBeVisible();
+    expect(screen.getByRole("list")).toBeVisible();
+    expect(screen.getByText("Window functions")).toBeVisible();
+    expect(screen.getByText("Join optimization")).toBeVisible();
+    expect(screen.getByText("SELECT user_id FROM events")).toBeVisible();
   });
 
   it("shows source evidence returned by a chat turn", async () => {

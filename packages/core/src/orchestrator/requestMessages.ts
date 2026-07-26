@@ -24,8 +24,18 @@ export function buildRequestMessages(
     .join("\n");
 
   const content = retrievalBlock
-    ? `${currentUserMessage}\n\nRelevant local context:\n${retrievalBlock}`
-    : currentUserMessage;
+    ? `${currentUserMessage}\n\nRelevant local context:\n${retrievalBlock}\n\n${responseStyleInstruction()}`
+    : `${currentUserMessage}\n\n${responseStyleInstruction()}`;
 
   return [...messages, { role: "user", content }];
+}
+
+function responseStyleInstruction(): string {
+  return [
+    "Response style:",
+    "- Use short Markdown sections with `##` or `###` headings when the answer has multiple parts.",
+    "- Prefer bullets or numbered lists over dense paragraphs.",
+    "- Use fenced code blocks for SQL, commands, or snippets.",
+    "- Keep each paragraph short and scannable.",
+  ].join("\n");
 }

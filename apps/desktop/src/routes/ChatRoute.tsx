@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { Fragment, useState, type FormEvent, type ReactNode } from "react";
 
 export type ChatTurnState = "idle" | "queued" | "streaming" | "tool-running" | "interrupted" | "failed" | "complete";
 
@@ -70,12 +70,7 @@ export function ChatRoute({
                   </ul>
                 </section>
               ) : (
-                <p
-                  key={`${message.role}-${index}`}
-                  className={message.role === "user" ? "user-message" : message.role === "error" ? "error-message" : "assistant-message"}
-                >
-                  {message.content}
-                </p>
+                <MessageBubble key={`${message.role}-${index}`} message={message} />
               ),
             )}
           </div>
@@ -98,4 +93,117 @@ export function ChatRoute({
       )}
     </section>
   );
+}
+
+function MessageBubble({ message }: { message: Exclude<ChatMessage, { role: "sources" }> }) {
+  if (message.role === "assistant") {
+    return (
+      <div className="assistant-message assistant-markdown">
+        <MarkdownBlocks content={message.content} />
+      </div>
+    );
+  }
+
+  return (
+    <p className={message.role === "user" ? "user-message" : "error-message"}>
+      {message.content}
+    </p>
+  );
+}
+
+function MarkdownBlocks({ content }: { content: string }) {
+  const lines = content.split(/\r?\n/);
+  const blocks: ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const codeFence = line.match(/^```(\w+)?\s*$/);
+    if (codeFence) {
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index] ?? "")) {
+        codeLines.push(lines[index] ?? "");
+        index += 1;
+      }
+      index += 1;
+      blocks.push(
+        <pre key={`code-${index}`}>
+          <code>{codeLines.join("\n")}</code>
+        </pre>,
+      );
+      continue;
+    }
+
+    const heading = line.match(/^(#{2,4})\s+(.+)$/);
+    if (heading) {
+      const level = (heading[1] ?? "##").length;
+      const text = heading[2] ?? "";
+      blocks.push(level === 2 ? <h2 key={`heading-${index}`}>{renderInline(text)}</h2> : <h3 key={`heading-${index}`}>{renderInline(text)}</h3>);
+      index += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^[-*]\s+/.test(lines[index] ?? "")) {
+        items.push((lines[index] ?? "").replace(/^[-*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`list-${index}`}>
+          {items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{renderInline(item)}</li>)}
+        </ul>,
+      );
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index] ?? "")) {
+        items.push((lines[index] ?? "").replace(/^\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ol key={`ordered-${index}`}>
+          {items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{renderInline(item)}</li>)}
+        </ol>,
+      );
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      index < lines.length &&
+      lines[index]?.trim() &&
+      !/^```/.test(lines[index] ?? "") &&
+      !/^(#{2,4})\s+/.test(lines[index] ?? "") &&
+      !/^[-*]\s+/.test(lines[index] ?? "") &&
+      !/^\d+\.\s+/.test(lines[index] ?? "")
+    ) {
+      paragraph.push(lines[index] ?? "");
+      index += 1;
+    }
+    blocks.push(<p key={`paragraph-${index}`}>{renderInline(paragraph.join(" "))}</p>);
+  }
+
+  return <>{blocks}</>;
+}
+
+function renderInline(text: string): ReactNode {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return <code key={`${part}-${index}`}>{part.slice(1, -1)}</code>;
+    }
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={`${part}-${index}`}>{part.slice(2, -2)}</strong>;
+    }
+    return <Fragment key={`${part}-${index}`}>{part}</Fragment>;
+  });
 }
