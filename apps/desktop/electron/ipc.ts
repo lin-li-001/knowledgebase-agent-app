@@ -5,7 +5,7 @@ import { z } from "zod";
 import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
-import { assertInsideWorkspace, createWorkspace, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
+import { assertInsideWorkspace, auditWorkspace, createWorkspace, defaultRoutingPolicy, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
 import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
@@ -35,6 +35,7 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "workspace:create": z.object({ rootPath: z.string() }),
   "workspace:open": z.object({ rootPath: z.string() }),
   "workspace:get-active": z.object({}),
+  "workspace:audit": z.object({}),
   "workspace:tree": z.object({}),
   "workspace:read-file": z.object({ path: z.string() }),
   "settings:get": z.object({}),
@@ -85,6 +86,22 @@ export async function handleIpcRequest(
           data: services.workspaceRoot ? { rootPath: services.workspaceRoot, workspaceId: services.workspaceId, sessionId: services.sessionId } : null,
         };
         return result;
+      case "workspace:audit": {
+        const audit = await auditWorkspace({
+          rootPath: requireWorkspaceRoot(services),
+          db: requireDatabase(services),
+        });
+        await recordActivity(requireDatabase(services), {
+          id: randomUUID(),
+          workspaceId: requireWorkspaceId(services),
+          kind: "workspace",
+          title: "Workspace audit complete",
+          message: `${audit.findings.length} findings, status ${audit.status}.`,
+          createdAt: new Date().toISOString(),
+        });
+        result = { ok: true, data: audit };
+        return result;
+      }
       case "workspace:tree":
         result = { ok: true, data: await buildWorkspaceTree(requireWorkspaceRoot(services)) };
         return result;
@@ -125,6 +142,7 @@ export async function handleIpcRequest(
             workspaceId,
             workspaceRoot: root,
             sessionId,
+            activeProfileId: await getActiveProfileId(services),
             userMessage: payload.message as string,
             handlers: createDefaultToolHandlers(services),
             signal: controller.signal,
@@ -355,6 +373,31 @@ async function approveReviewItem(services: IpcServices, id: string): Promise<Ipc
     return { ok: false, error: `Review item is already ${item.state}` };
   }
 
+  if (item.proposalType === "propose_create_note" || item.proposalType === "propose_decision") {
+    if (item.state === "proposed") {
+      await transitionReviewItem(db, id, "proposed", "approved");
+    }
+
+    const entityPath = await applyKnowledgeProposal(services, item);
+    const appliedAt = new Date().toISOString();
+    await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
+    await recordActivity(db, {
+      id: randomUUID(),
+      workspaceId: item.workspaceId,
+      kind: "review",
+      title: item.proposalType === "propose_decision" ? "Decision saved" : "Note created",
+      message: `Approved ${item.proposalType} proposal was saved.`,
+      entityPath,
+      reviewItemId: id,
+      createdAt: appliedAt,
+    });
+    if (item.proposalType === "propose_create_note") {
+      await indexWorkspace(requireWorkspaceRoot(services), db);
+    }
+
+    return { ok: true, data: { id, state: "applied" } };
+  }
+
   if (item.proposalType !== "propose_memory") {
     if (item.state === "approved") {
       return { ok: true, data: { id, state: "approved" } };
@@ -377,7 +420,7 @@ async function approveReviewItem(services: IpcServices, id: string): Promise<Ipc
     kind: "review",
     title: "Memory saved",
     message: "Approved memory proposal was saved.",
-    entityPath: "02-Profiles/default/Memory.md",
+    entityPath: defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services)),
     reviewItemId: id,
     createdAt: appliedAt,
   });
@@ -408,24 +451,25 @@ async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Pro
     throw new Error("Memory proposal is missing body");
   }
 
-  const relativePath = "02-Profiles/default/Memory.md";
+  const activeProfileId = await getActiveProfileId(services);
+  const relativePath = defaultRoutingPolicy.profileMemoryPath(activeProfileId);
   const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
   await mkdir(path.dirname(targetPath), { recursive: true });
   const current = await readFile(targetPath, "utf8").catch((error: unknown) => {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
       const created = new Date().toISOString().slice(0, 10);
       return `---
-title: Default Memory
+title: ${activeProfileId} Memory
 type: memory
 status: active
-owner: default
+owner: ${activeProfileId}
 scope: personal
 sensitivity: normal
 created: ${created}
 tags: []
 ---
 
-# Default Memory
+# ${activeProfileId} Memory
 `;
     }
     throw error;
@@ -436,6 +480,55 @@ tags: []
   }
 
   await writeFile(targetPath, `${current.trimEnd()}\n\n${bullet}\n`, "utf8");
+}
+
+async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem): Promise<string> {
+  if (item.proposalType === "propose_create_note") {
+    const payload = createNotePayload(item.payload);
+    const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), payload.path);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, payload.body, { encoding: "utf8", flag: "wx" });
+    return payload.path;
+  }
+
+  if (item.proposalType === "propose_decision") {
+    const body = extractDecisionBody(item.payload);
+    const relativePath = item.targetPath ?? defaultRoutingPolicy.decisionPath(item.id);
+    const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, `${body.trimEnd()}\n`, { encoding: "utf8", flag: "wx" });
+    return relativePath;
+  }
+
+  throw new Error(`Unsupported proposal apply: ${item.proposalType}`);
+}
+
+function createNotePayload(payload: unknown): { path: string; body: string } {
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    "path" in payload &&
+    typeof payload.path === "string" &&
+    "body" in payload &&
+    typeof payload.body === "string" &&
+    payload.path.trim() &&
+    payload.body.trim()
+  ) {
+    return { path: payload.path.trim(), body: payload.body };
+  }
+
+  throw new Error("Create-note proposal is missing path or body");
+}
+
+function extractDecisionBody(payload: unknown): string {
+  if (typeof payload === "object" && payload !== null && "body" in payload && typeof payload.body === "string") {
+    const body = payload.body.trim();
+    if (body) {
+      return body;
+    }
+  }
+
+  throw new Error("Decision proposal is missing body");
 }
 
 function extractMemoryBody(payload: unknown): string | null {
@@ -504,7 +597,7 @@ function createDefaultToolHandlers(services: IpcServices): Map<MvpToolName, Tool
   });
   handlers.set("list_notes", async (args) => listNotes(requireDatabase(services), requireWorkspaceId(services), Number((args as { limit?: number }).limit ?? 20)));
   handlers.set("get_workspace_rules", async () => ({ content: await readFile(path.join(requireWorkspaceRoot(services), "AGENTS.md"), "utf8") }));
-  handlers.set("get_profile", async () => ({ content: "default" }));
+  handlers.set("get_profile", async () => readActiveProfileContext(services));
 
   for (const name of ["propose_create_note", "propose_update_note", "propose_memory", "propose_decision", "propose_delete"] as MvpToolName[]) {
     handlers.set(name, async (args) => createProposalReviewItem(services, name, args));
@@ -530,7 +623,7 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   const db = requireDatabase(services);
   const now = new Date().toISOString();
   const targetPath = typeof payload === "object" && payload && "path" in payload ? String((payload as { path?: string }).path ?? "") : undefined;
-  if (proposalType === "propose_memory" && await memoryAlreadyExists(requireWorkspaceRoot(services), payload)) {
+  if (proposalType === "propose_memory" && await memoryAlreadyExists(requireWorkspaceRoot(services), await getActiveProfileId(services), payload)) {
     return { reviewItemId: "skipped-existing-memory" };
   }
   const existingId = findDuplicateReviewItem(db, workspaceId, proposalType, targetPath, payload);
@@ -572,17 +665,54 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   return { reviewItemId: id };
 }
 
-async function memoryAlreadyExists(workspaceRoot: string, payload: unknown): Promise<boolean> {
+async function memoryAlreadyExists(workspaceRoot: string, activeProfileId: string, payload: unknown): Promise<boolean> {
   const body = memoryBody(payload);
   if (!body) {
     return false;
   }
 
   try {
-    const memory = await readFile(path.join(workspaceRoot, "02-Profiles/default/Memory.md"), "utf8");
+    const memory = await readFile(path.join(workspaceRoot, defaultRoutingPolicy.profileMemoryPath(activeProfileId)), "utf8");
     return normalizeText(memory).includes(normalizeText(body));
   } catch {
     return false;
+  }
+}
+
+async function readActiveProfileContext(services: IpcServices): Promise<{ content: string }> {
+  const workspaceRoot = requireWorkspaceRoot(services);
+  const activeProfileId = await getActiveProfileId(services);
+  const [profile, memory] = await Promise.all([
+    readOptionalWorkspaceFile(workspaceRoot, defaultRoutingPolicy.profilePath(activeProfileId)),
+    readOptionalWorkspaceFile(workspaceRoot, defaultRoutingPolicy.profileMemoryPath(activeProfileId)),
+  ]);
+
+  return {
+    content: [
+      `Active profile: ${activeProfileId}`,
+      "",
+      "## Profile",
+      profile,
+      "",
+      "## Memory",
+      memory,
+    ].join("\n").trim(),
+  };
+}
+
+async function getActiveProfileId(services: IpcServices): Promise<string> {
+  const settings = services.settingsPath ? await readDesktopSettings(services.settingsPath) : {};
+  return settings.activeProfileId?.trim() || "default";
+}
+
+async function readOptionalWorkspaceFile(workspaceRoot: string, relativePath: string): Promise<string> {
+  try {
+    return await readFile(assertInsideWorkspace(workspaceRoot, relativePath), "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return "";
+    }
+    throw error;
   }
 }
 

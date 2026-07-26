@@ -13,7 +13,7 @@ export interface ProductAuditResult {
   failures: string[];
 }
 
-const routeLiteralPattern = /["'`]((?:04-Resources\/Imports|06-Attachments\/Imports|02-Profiles\/[^"'`]+\/Memory\.md|\.app\/exports)[^"'`]*)["'`]/gu;
+const routeLiteralPattern = /["'`]((?:04-Resources\/Imports|06-Attachments\/Imports|02-Profiles\/[^"'`]+\/(?:Profile|Memory)\.md|\.vault\/decisions|\.app\/exports)[^"'`]*)["'`]/gu;
 
 export async function auditProductContracts(input: ProductAuditInput): Promise<ProductAuditResult> {
   const repoRoot = path.resolve(input.repoRoot);
@@ -22,10 +22,12 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   const importSummaryRoute = `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>.md`;
   const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`;
   const profileMemoryRoute = "02-Profiles/<profile-id>/Memory.md";
+  const decisionRoute = ".vault/decisions/<decision-id>.md";
 
   expectContractText(result, workspaceContractSource, importSummaryRoute, "import summary");
   expectContractText(result, workspaceContractSource, importAttachmentRoute, "import attachment");
   expectContractText(result, workspaceContractSource, profileMemoryRoute, "profile memory");
+  expectContractText(result, workspaceContractSource, decisionRoute, "decision");
   if (!result.failures.some((failure) => failure.startsWith("workspace contract is missing"))) {
     result.passes.push("routing policy paths are documented in the workspace contract");
   }
@@ -70,7 +72,7 @@ async function auditDecisionMirror(repoRoot: string, result: ProductAuditResult)
     await access(path.join(repoRoot, "docs/decisions"));
     result.passes.push("implementation repo has a docs/decisions decision mirror");
   } catch {
-    result.warnings.push("implementation repo has no docs/decisions ADR mirror yet");
+    result.failures.push("implementation repo is missing docs/decisions ADR mirror");
   }
 }
 

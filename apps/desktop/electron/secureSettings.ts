@@ -17,6 +17,7 @@ export interface SecretCipher {
 }
 
 export interface DesktopSettings {
+  activeProfileId?: string;
   providerKeyAlias?: string;
   modelName?: string;
   workspaceRoot?: string;

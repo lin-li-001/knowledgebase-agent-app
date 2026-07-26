@@ -33,6 +33,7 @@ export interface RunTurnInput {
   workspaceId: string;
   workspaceRoot: string;
   sessionId: string;
+  activeProfileId?: string | undefined;
   userMessage: string;
   recentMessages?: ModelMessage[];
   handlers?: Map<MvpToolName, ToolHandler>;
@@ -70,6 +71,7 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       db: input.db,
       workspaceId: input.workspaceId,
       workspaceRoot: input.workspaceRoot,
+      activeProfileId: input.activeProfileId,
       query: input.userMessage,
     });
     const sources = sourceEvents(context.snippets);

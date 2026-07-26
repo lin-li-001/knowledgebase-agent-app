@@ -500,6 +500,222 @@ Existing memory.
     );
   });
 
+  it("applies approved memory proposals to the active profile memory note", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "02-Profiles/lin"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await mkdir(path.join(root, ".app"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(path.join(root, ".app/settings.json"), JSON.stringify({ activeProfileId: "lin" }), "utf8");
+    await writeFile(
+      path.join(root, "02-Profiles/lin/Memory.md"),
+      `---
+title: Lin Memory
+type: memory
+status: active
+owner: lin
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Lin Memory
+`,
+      "utf8",
+    );
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-memory-lin", services.workspaceId, "proposed", "high", "propose_memory", "{\"body\":\"Lin prefers visual structure.\"}", "reason", services.sessionId, "turn-1", new Date().toISOString());
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-memory-lin" })).resolves.toEqual(
+      { ok: true, data: { id: "review-memory-lin", state: "applied" } },
+    );
+
+    await expect(readFile(path.join(root, "02-Profiles/lin/Memory.md"), "utf8")).resolves.toContain(
+      "- Lin prefers visual structure.",
+    );
+  });
+
+  it("returns the active profile and memory through get_profile", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "02-Profiles/lin"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await mkdir(path.join(root, ".app"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(path.join(root, ".app/settings.json"), JSON.stringify({ activeProfileId: "lin" }), "utf8");
+    await writeFile(
+      path.join(root, "02-Profiles/lin/Profile.md"),
+      `---
+title: Lin Profile
+type: profile
+status: active
+owner: lin
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Lin Profile
+
+Product builder.
+`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(root, "02-Profiles/lin/Memory.md"),
+      `---
+title: Lin Memory
+type: memory
+status: active
+owner: lin
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Lin Memory
+
+- Prefers auditable memory.
+`,
+      "utf8",
+    );
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const provider = new CaptureToolResultProvider("get_profile", "{}");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: provider,
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "load my profile" }),
+    ).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(provider.secondRequestContent()).toContain("Product builder.");
+    expect(provider.secondRequestContent()).toContain("Prefers auditable memory.");
+  });
+
+  it("applies approved create-note proposals to the requested note path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    const body = `---
+title: Agent Contract
+type: knowledge
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-26
+tags: []
+---
+
+# Agent Contract
+
+Review can create notes.
+`;
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          target_path, source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-create-note", services.workspaceId, "proposed", "medium", "propose_create_note", JSON.stringify({ path: "03-Knowledge/Agent Contract.md", body }), "reason", "03-Knowledge/Agent Contract.md", services.sessionId, "turn-1", new Date().toISOString());
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-create-note" })).resolves.toEqual(
+      { ok: true, data: { id: "review-create-note", state: "applied" } },
+    );
+    await expect(readFile(path.join(root, "03-Knowledge/Agent Contract.md"), "utf8")).resolves.toContain(
+      "Review can create notes.",
+    );
+  });
+
+  it("applies approved decision proposals to the workspace decision folder", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-decision-1", services.workspaceId, "proposed", "high", "propose_decision", JSON.stringify({ body: "# Decision\n\nUse report-only workspace audit first." }), "reason", services.sessionId, "turn-1", new Date().toISOString());
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-decision-1" })).resolves.toEqual(
+      { ok: true, data: { id: "review-decision-1", state: "applied" } },
+    );
+    await expect(readFile(path.join(root, ".vault/decisions/review-decision-1.md"), "utf8")).resolves.toContain(
+      "Use report-only workspace audit first.",
+    );
+  });
+
+  it("runs a report-only workspace audit through IPC", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nOutdated contract.", "utf8");
+    await writeFile(path.join(root, "03-Knowledge/Broken.md"), "# Broken\n\nMissing frontmatter.", "utf8");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(handleIpcRequest(services, "workspace:audit", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          status: "fail",
+          findings: expect.arrayContaining([
+            expect.objectContaining({ code: "missing_frontmatter", path: "03-Knowledge/Broken.md" }),
+          ]),
+        }),
+      }),
+    );
+  });
+
   it("imports local documents into attachments and a summary note", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-import-sources-"));
@@ -605,6 +821,38 @@ class ToolCallingProvider implements ModelProvider {
 
   async estimateCost(): Promise<CostEstimate> {
     return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
+}
+
+class CaptureToolResultProvider implements ModelProvider {
+  readonly supportsToolCalling = true;
+  readonly supportsPromptCache = false;
+  private requests: ModelRequest[] = [];
+
+  constructor(private readonly toolName: string, private readonly argumentsJson: string) {}
+
+  async complete(input: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(input);
+    if (this.requests.length === 1) {
+      return {
+        content: "",
+        toolCalls: [{ id: "capture-call-1", name: this.toolName, argumentsJson: this.argumentsJson }],
+      };
+    }
+
+    return { content: "Profile loaded." };
+  }
+
+  async *stream(input: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "done", response: await this.complete(input) };
+  }
+
+  async estimateCost(): Promise<CostEstimate> {
+    return { inputTokens: 0, outputTokens: 0, estimatedUsd: 0 };
+  }
+
+  secondRequestContent(): string {
+    return JSON.stringify(this.requests[1]?.messages ?? []);
   }
 }
 

@@ -401,6 +401,45 @@ select {
   gap: 6px;
 }
 
+.audit-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+  border: 1px solid #d7ddd7;
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.audit-panel h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.audit-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.audit-list li {
+  display: grid;
+  gap: 4px;
+  border-left: 3px solid #c58b28;
+  background: #fbfbf8;
+  padding: 10px;
+}
+
+.audit-list span,
+.audit-list code {
+  color: #59665f;
+}
+
+.audit-list p {
+  margin: 0;
+}
+
 .review-meta {
   display: flex;
   gap: 6px;

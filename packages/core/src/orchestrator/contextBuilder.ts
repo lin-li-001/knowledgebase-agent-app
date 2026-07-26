@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppDatabase } from "@kb-agent/storage";
+import { defaultRoutingPolicy } from "@kb-agent/workspace";
 import { LocalNotesRecallProvider, type EvidenceBundle, type RecallProvider } from "./recallProvider";
 import type { RetrievedSnippet } from "./requestMessages";
 
@@ -16,14 +17,16 @@ export async function buildTurnContext(input: {
   db: AppDatabase;
   workspaceId: string;
   workspaceRoot: string;
+  activeProfileId?: string | undefined;
   query: string;
   recallProviders?: RecallProvider[];
 }): Promise<TurnContext> {
   const recallProviders = input.recallProviders ?? [new LocalNotesRecallProvider()];
+  const activeProfileId = input.activeProfileId ?? "default";
   const [workspaceRules, profile, memory, evidenceGroups] = await Promise.all([
     readOptional(path.join(input.workspaceRoot, "AGENTS.md")),
-    readOptional(path.join(input.workspaceRoot, "02-Profiles/default/Profile.md")),
-    readOptional(path.join(input.workspaceRoot, "02-Profiles/default/Memory.md")),
+    readOptional(path.join(input.workspaceRoot, defaultRoutingPolicy.profilePath(activeProfileId))),
+    readOptional(path.join(input.workspaceRoot, defaultRoutingPolicy.profileMemoryPath(activeProfileId))),
     Promise.all(recallProviders.map((provider) => provider.prefetch(input))),
   ]);
   const evidence = evidenceGroups.flat();

@@ -23,7 +23,7 @@ const directories = [
   defaultRoutingPolicy.importSummaryDir(),
   "05-Templates",
   defaultRoutingPolicy.importAttachmentRoot(),
-  ".vault/decisions",
+  path.dirname(defaultRoutingPolicy.decisionPath("default")),
   ".vault/memory/default",
   ".vault/memory/shared",
   defaultRoutingPolicy.exportDir(),
@@ -43,7 +43,7 @@ export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> 
     writeFile(path.join(normalizedRoot, "AGENTS.md"), workspaceContract, { flag: "wx" }).catch(
       ignoreExistingFile,
     ),
-    writeFile(path.join(normalizedRoot, "02-Profiles/default/Profile.md"), profileTemplate, {
+    writeFile(path.join(normalizedRoot, defaultRoutingPolicy.profilePath("default")), profileTemplate, {
       flag: "wx",
     }).catch(ignoreExistingFile),
     writeFile(path.join(normalizedRoot, defaultRoutingPolicy.profileMemoryPath("default")), memoryTemplate, {

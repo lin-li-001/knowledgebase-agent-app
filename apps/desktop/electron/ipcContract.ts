@@ -2,6 +2,7 @@ export const allowedChannels = [
   "workspace:create",
   "workspace:open",
   "workspace:get-active",
+  "workspace:audit",
   "workspace:tree",
   "workspace:read-file",
   "settings:get",

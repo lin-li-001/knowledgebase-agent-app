@@ -6,6 +6,7 @@ import { App } from "../src/App";
 import { ImportDropzone } from "../src/components/ImportDropzone";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
 import { ChatRoute } from "../src/routes/ChatRoute";
+import { KnowledgeRoute } from "../src/routes/KnowledgeRoute";
 
 describe("desktop shell", () => {
   afterEach(() => {
@@ -85,6 +86,35 @@ describe("desktop shell", () => {
     expect(screen.getByLabelText("Batch name")).toBeVisible();
     expect(screen.getByLabelText("Import files")).toBeVisible();
     expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
+  });
+
+  it("renders workspace audit findings in the Knowledge route", () => {
+    render(
+      <KnowledgeRoute
+        rebuilding={false}
+        auditing={false}
+        importDisabled={false}
+        auditResult={{
+          status: "fail",
+          findings: [
+            {
+              code: "missing_frontmatter",
+              severity: "error",
+              path: "03-Knowledge/Broken.md",
+              message: "Invalid frontmatter field title",
+            },
+          ],
+        }}
+        onRebuild={async () => undefined}
+        onAudit={async () => undefined}
+        onImport={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Run Audit" })).toBeVisible();
+    expect(screen.getByText("Workspace audit: fail")).toBeVisible();
+    expect(screen.getByText("missing_frontmatter")).toBeVisible();
+    expect(screen.getByText("03-Knowledge/Broken.md")).toBeVisible();
   });
 
   it("renders assistant markdown as visual structure", () => {

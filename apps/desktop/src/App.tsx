@@ -3,7 +3,7 @@ import type { ActivityItem } from "./components/ActivityFeed";
 import type { ReviewCardItem } from "./components/ReviewItemCard";
 import { WorkspacePanel, type WorkspaceFilePreview, type WorkspaceTreeNode } from "./components/WorkspacePanel";
 import { ChatRoute } from "./routes/ChatRoute";
-import { KnowledgeRoute } from "./routes/KnowledgeRoute";
+import { KnowledgeRoute, type WorkspaceAuditResult } from "./routes/KnowledgeRoute";
 import { ReviewRoute } from "./routes/ReviewRoute";
 import { SettingsRoute } from "./routes/SettingsRoute";
 import { createRendererApi, type RendererApi } from "./state/api";
@@ -60,6 +60,8 @@ export function App() {
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null);
   const [filePreview, setFilePreview] = useState<WorkspaceFilePreview | null>(null);
+  const [auditResult, setAuditResult] = useState<WorkspaceAuditResult | null>(null);
+  const [auditing, setAuditing] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "Ask about your notes or propose a safe knowledge update." },
   ]);
@@ -168,6 +170,23 @@ export function App() {
       setError(result.error);
       return;
     }
+    await refreshPanels();
+  }
+
+  async function runWorkspaceAudit() {
+    if (!api || !workspace) {
+      return;
+    }
+
+    setError(null);
+    setAuditing(true);
+    const result = await api.invoke<WorkspaceAuditResult>("workspace:audit", {});
+    setAuditing(false);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setAuditResult(result.data);
     await refreshPanels();
   }
 
@@ -282,8 +301,11 @@ export function App() {
         {activeRoute === "Knowledge" ? (
           <KnowledgeRoute
             rebuilding={false}
+            auditing={auditing}
             importDisabled={!workspace}
+            auditResult={auditResult}
             onRebuild={rebuildIndex}
+            onAudit={runWorkspaceAudit}
             onImport={runImportBatch}
           />
         ) : null}

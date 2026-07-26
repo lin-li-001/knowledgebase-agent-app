@@ -17,7 +17,12 @@ describe("defaultRoutingPolicy", () => {
     );
   });
 
-  it("routes profile memory to the active profile memory note", () => {
+  it("routes profile files to the active profile folder", () => {
+    expect(defaultRoutingPolicy.profilePath("default")).toBe("02-Profiles/default/Profile.md");
     expect(defaultRoutingPolicy.profileMemoryPath("default")).toBe("02-Profiles/default/Memory.md");
+  });
+
+  it("routes workspace decision records to the governance folder", () => {
+    expect(defaultRoutingPolicy.decisionPath("review-123")).toBe(".vault/decisions/review-123.md");
   });
 });
