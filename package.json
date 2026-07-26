@@ -8,6 +8,7 @@
     "test:e2e": "pnpm --filter @kb-agent/desktop test:e2e",
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
+    "audit:product": "pnpm --filter @kb-agent/workspace exec vitest run tests/productAudit.test.ts",
     "qa": "pnpm typecheck && pnpm test && pnpm --filter @kb-agent/desktop test:e2e"
   },
   "devDependencies": {

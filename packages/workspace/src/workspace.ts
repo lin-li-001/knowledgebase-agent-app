@@ -26,7 +26,7 @@ const directories = [
   ".vault/decisions",
   ".vault/memory/default",
   ".vault/memory/shared",
-  ".app/exports",
+  defaultRoutingPolicy.exportDir(),
 ];
 
 export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> {
