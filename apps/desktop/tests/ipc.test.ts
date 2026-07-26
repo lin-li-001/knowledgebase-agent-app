@@ -299,6 +299,68 @@ describe("IPC contract", () => {
     expect(services.db?.sqlite.prepare("SELECT COUNT(*) as count FROM review_items").get()).toEqual({ count: 1 });
   });
 
+  it("skips memory proposals that already exist in durable memory", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "02-Profiles/default"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(
+      path.join(root, "02-Profiles/default/Memory.md"),
+      `---
+title: Default Memory
+type: memory
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: []
+---
+
+# Default Memory
+
+- User's name is Lin Li.
+`,
+      "utf8",
+    );
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+      modelProvider: new ScriptedProvider([
+        { content: "Nice to meet you, Lin Li." },
+        {
+          content: "",
+          toolCalls: [
+            {
+              id: "review-call-1",
+              name: "propose_memory",
+              argumentsJson: JSON.stringify({
+                body: "User's name is Lin Li.",
+                source: {
+                  origin: "turn_reflection",
+                  userMessage: "hello my name is lin li",
+                  assistantMessage: "Nice to meet you, Lin Li.",
+                  reason: "Stable personal identity fact.",
+                },
+              }),
+            },
+          ],
+        },
+      ]),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(
+      handleIpcRequest(services, "chat:run-turn", { sessionId: services.sessionId, message: "hello my name is lin li" }),
+    ).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(services.db?.sqlite.prepare("SELECT COUNT(*) as count FROM review_items").get()).toEqual({ count: 0 });
+  });
+
   it("treats repeated review approvals as idempotent", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });

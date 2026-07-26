@@ -449,6 +449,9 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   const db = requireDatabase(services);
   const now = new Date().toISOString();
   const targetPath = typeof payload === "object" && payload && "path" in payload ? String((payload as { path?: string }).path ?? "") : undefined;
+  if (proposalType === "propose_memory" && await memoryAlreadyExists(requireWorkspaceRoot(services), payload)) {
+    return { reviewItemId: "skipped-existing-memory" };
+  }
   const existingId = findDuplicateReviewItem(db, workspaceId, proposalType, targetPath, payload);
   if (existingId) {
     return { reviewItemId: existingId };
@@ -486,6 +489,28 @@ async function createProposalReviewItem(services: IpcServices, proposalType: Mvp
   }
   await recordActivity(db, activity);
   return { reviewItemId: id };
+}
+
+async function memoryAlreadyExists(workspaceRoot: string, payload: unknown): Promise<boolean> {
+  const body = memoryBody(payload);
+  if (!body) {
+    return false;
+  }
+
+  try {
+    const memory = await readFile(path.join(workspaceRoot, "02-Profiles/default/Memory.md"), "utf8");
+    return normalizeText(memory).includes(normalizeText(body));
+  } catch {
+    return false;
+  }
+}
+
+function memoryBody(payload: unknown): string | null {
+  if (typeof payload === "object" && payload !== null && "body" in payload && typeof payload.body === "string") {
+    return payload.body;
+  }
+
+  return null;
 }
 
 function findDuplicateReviewItem(
