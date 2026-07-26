@@ -5,9 +5,9 @@ export interface ActivityItem {
   kind: string;
 }
 
-export function ActivityFeed({ items }: { items: ActivityItem[] }) {
-  return (
-    <aside className="activity-panel" aria-label="Activity">
+export function ActivityFeed({ items, compact = false }: { items: ActivityItem[]; compact?: boolean }) {
+  const content = (
+    <>
       <div className="panel-header">
         <h2>Activity</h2>
       </div>
@@ -24,6 +24,16 @@ export function ActivityFeed({ items }: { items: ActivityItem[] }) {
           ))}
         </ol>
       )}
+    </>
+  );
+
+  if (compact) {
+    return <div className="activity-feed-compact">{content}</div>;
+  }
+
+  return (
+    <aside className="activity-panel" aria-label="Activity">
+      {content}
     </aside>
   );
 }

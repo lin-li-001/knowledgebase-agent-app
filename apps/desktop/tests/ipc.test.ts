@@ -101,6 +101,59 @@ describe("IPC contract", () => {
     );
   });
 
+  it("lists workspace files and reads previewable files through guarded IPC", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "01-Projects/Shared"), { recursive: true });
+    await mkdir(path.join(root, ".app"), { recursive: true });
+    await mkdir(path.join(root, ".git"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeFile(path.join(root, "01-Projects/Shared/Plan.md"), "# Plan\n\nBuild a workspace explorer.", "utf8");
+    await writeFile(path.join(root, ".app/index.sqlite"), "runtime", "utf8");
+    await writeFile(path.join(root, ".git/config"), "runtime", "utf8");
+
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    await expect(handleIpcRequest(services, "workspace:tree", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          name: path.basename(root),
+          type: "directory",
+          children: expect.arrayContaining([
+            expect.objectContaining({
+              name: "01-Projects",
+              children: expect.arrayContaining([
+                expect.objectContaining({
+                  name: "Shared",
+                  children: expect.arrayContaining([
+                    expect.objectContaining({ name: "Plan.md", path: "01-Projects/Shared/Plan.md", type: "file" }),
+                  ]),
+                }),
+              ]),
+            }),
+            expect.objectContaining({ name: "AGENTS.md", path: "AGENTS.md", type: "file" }),
+          ]),
+        }),
+      }),
+    );
+    const treeResult = await handleIpcRequest(services, "workspace:tree", {});
+    expect(JSON.stringify(treeResult)).not.toContain(".app");
+    expect(JSON.stringify(treeResult)).not.toContain(".git");
+
+    await expect(handleIpcRequest(services, "workspace:read-file", { path: "01-Projects/Shared/Plan.md" })).resolves.toEqual(
+      { ok: true, data: { path: "01-Projects/Shared/Plan.md", content: "# Plan\n\nBuild a workspace explorer.", previewType: "text" } },
+    );
+    await expect(handleIpcRequest(services, "workspace:read-file", { path: "../outside.md" })).resolves.toEqual(
+      { ok: false, error: "Path escapes workspace" },
+    );
+  });
+
   it("persists the active workspace and restores it for a fresh app session", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     const settingsPath = path.join(root, ".desktop/settings.json");

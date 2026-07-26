@@ -1,4 +1,4 @@
-import { test, expect, _electron as electron } from "@playwright/test";
+import { test, expect, _electron as electron, type Locator } from "@playwright/test";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ test("launch desktop app and show v0.1A shell", async () => {
   await expect(window.getByRole("button", { name: "Open Workspace" })).toBeEnabled();
   await expect(window.getByRole("button", { name: "Create Workspace" })).toBeEnabled();
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-workspace-"));
-  await window.getByLabel("Workspace Root").fill(workspaceRoot);
+  await setInputValue(window.getByLabel("Workspace Root"), workspaceRoot);
   await window.getByRole("button", { name: "Create Workspace" }).click();
   await expect(window.getByText(/Could not dynamically require/u)).not.toBeVisible();
   await expect(window.getByText("Workspace active")).toBeVisible();
@@ -36,7 +36,7 @@ test("imports a PDF document through the desktop UI", async () => {
   await writeFile(pdfPath, minimalPdf("Resume Lin Li PDF Import Test"));
 
   await window.getByRole("button", { name: "Settings" }).click();
-  await window.getByLabel("Workspace Root").fill(workspaceRoot);
+  await setInputValue(window.getByLabel("Workspace Root"), workspaceRoot);
   await window.getByRole("button", { name: "Create Workspace" }).click();
   await expect(window.getByText("Workspace active")).toBeVisible();
 
@@ -60,7 +60,7 @@ test("restores the saved workspace on the next desktop launch", async () => {
   const firstApp = await launchTestApp(userDataPath);
   const firstWindow = await firstApp.firstWindow();
   await firstWindow.getByRole("button", { name: "Settings" }).click();
-  await firstWindow.getByLabel("Workspace Root").fill(workspaceRoot);
+  await setInputValue(firstWindow.getByLabel("Workspace Root"), workspaceRoot);
   await firstWindow.getByRole("button", { name: "Create Workspace" }).click();
   await expect(firstWindow.getByText("Workspace active")).toBeVisible();
   await firstApp.close();
@@ -81,6 +81,15 @@ async function launchTestApp(userDataPath?: string) {
       KB_AGENT_USER_DATA_PATH: userDataPath ?? (await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-user-data-"))),
     },
   });
+}
+
+async function setInputValue(locator: Locator, value: string) {
+  await locator.evaluate((element, nextValue) => {
+    const input = element as HTMLInputElement;
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    valueSetter?.call(input, nextValue);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }, value);
 }
 
 function minimalPdf(text: string): Buffer {

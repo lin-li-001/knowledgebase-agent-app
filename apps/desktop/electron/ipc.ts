@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
@@ -24,10 +24,19 @@ export interface IpcServices {
   debugLogPath?: string;
 }
 
+interface WorkspaceTreeNode {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  children?: WorkspaceTreeNode[];
+}
+
 const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "workspace:create": z.object({ rootPath: z.string() }),
   "workspace:open": z.object({ rootPath: z.string() }),
   "workspace:get-active": z.object({}),
+  "workspace:tree": z.object({}),
+  "workspace:read-file": z.object({ path: z.string() }),
   "settings:get": z.object({}),
   "settings:update": z.object({ apiKey: z.string().optional(), modelName: z.string().optional() }),
   "chat:run-turn": z.object({ sessionId: z.string(), message: z.string() }),
@@ -75,6 +84,12 @@ export async function handleIpcRequest(
           ok: true,
           data: services.workspaceRoot ? { rootPath: services.workspaceRoot, workspaceId: services.workspaceId, sessionId: services.sessionId } : null,
         };
+        return result;
+      case "workspace:tree":
+        result = { ok: true, data: await buildWorkspaceTree(requireWorkspaceRoot(services)) };
+        return result;
+      case "workspace:read-file":
+        result = await readWorkspaceFile(requireWorkspaceRoot(services), payload.path as string);
         return result;
       case "settings:get": {
         const settings = await readDesktopSettings(requireSettingsPath(services));
@@ -202,6 +217,72 @@ export async function handleIpcRequest(
       console.warn("Failed to write debug log", error);
     });
   }
+}
+
+async function buildWorkspaceTree(root: string): Promise<WorkspaceTreeNode> {
+  return {
+    name: path.basename(root),
+    path: "",
+    type: "directory",
+    children: await readTreeChildren(root, ""),
+  };
+}
+
+async function readTreeChildren(root: string, relativeDir: string): Promise<WorkspaceTreeNode[]> {
+  const absoluteDir = path.join(root, relativeDir);
+  const entries = await readdir(absoluteDir, { withFileTypes: true });
+  const nodes = await Promise.all(
+    entries
+      .filter((entry) => shouldShowWorkspaceEntry(entry.name))
+      .map(async (entry) => {
+        const relativePath = joinWorkspacePath(relativeDir, entry.name);
+        if (entry.isDirectory()) {
+          return {
+            name: entry.name,
+            path: relativePath,
+            type: "directory" as const,
+            children: await readTreeChildren(root, relativePath),
+          };
+        }
+        return {
+          name: entry.name,
+          path: relativePath,
+          type: "file" as const,
+        };
+      }),
+  );
+
+  return nodes.sort((left, right) => {
+    if (left.type !== right.type) {
+      return left.type === "directory" ? -1 : 1;
+    }
+    return left.name.localeCompare(right.name);
+  });
+}
+
+function shouldShowWorkspaceEntry(name: string): boolean {
+  return name !== ".app" && name !== ".git" && name !== "node_modules" && name !== ".DS_Store";
+}
+
+function joinWorkspacePath(parent: string, name: string): string {
+  return parent ? `${parent}/${name}` : name;
+}
+
+async function readWorkspaceFile(root: string, relativePath: string): Promise<IpcResult> {
+  const targetPath = assertInsideWorkspace(root, relativePath);
+  const extension = path.extname(relativePath).toLowerCase();
+  if (![".md", ".txt"].includes(extension)) {
+    return { ok: true, data: { path: relativePath, content: "Preview is available for Markdown and TXT files in this version.", previewType: "unsupported" } };
+  }
+
+  return {
+    ok: true,
+    data: {
+      path: relativePath,
+      content: await readFile(targetPath, "utf8"),
+      previewType: "text",
+    },
+  };
 }
 
 function optionalDebugDetails(channel: string, input: unknown, result: IpcResult | undefined): { details?: Record<string, unknown> } {

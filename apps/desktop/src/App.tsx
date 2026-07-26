@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { ActivityFeed, type ActivityItem } from "./components/ActivityFeed";
+import type { ActivityItem } from "./components/ActivityFeed";
 import type { ReviewCardItem } from "./components/ReviewItemCard";
+import { WorkspacePanel, type WorkspaceFilePreview, type WorkspaceTreeNode } from "./components/WorkspacePanel";
 import { ChatRoute } from "./routes/ChatRoute";
 import { KnowledgeRoute } from "./routes/KnowledgeRoute";
 import { ReviewRoute } from "./routes/ReviewRoute";
@@ -57,6 +58,8 @@ export function App() {
   const [settings, setSettings] = useState<SettingsState>({ hasApiKey: false, modelName: "mock" });
   const [reviewItems, setReviewItems] = useState<ReviewCardItem[]>([]);
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
+  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null);
+  const [filePreview, setFilePreview] = useState<WorkspaceFilePreview | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "Ask about your notes or propose a safe knowledge update." },
   ]);
@@ -82,9 +85,10 @@ export function App() {
     }
 
     if (workspaceResult.ok && workspaceResult.data) {
-      const [activityResult, reviewResult] = await Promise.all([
+      const [activityResult, reviewResult, treeResult] = await Promise.all([
         api.invoke<ActivityItem[]>("activity:list", {}),
         api.invoke<ReviewCardItem[]>("review:list", {}),
+        api.invoke<WorkspaceTreeNode>("workspace:tree", {}),
       ]);
       if (activityResult.ok) {
         setActivityItems(activityResult.data);
@@ -92,6 +96,12 @@ export function App() {
       if (reviewResult.ok) {
         setReviewItems(reviewResult.data);
       }
+      if (treeResult.ok) {
+        setWorkspaceTree(treeResult.data);
+      }
+    } else {
+      setWorkspaceTree(null);
+      setFilePreview(null);
     }
   }
 
@@ -228,6 +238,20 @@ export function App() {
     await refreshPanels();
   }
 
+  async function readWorkspaceFile(filePath: string) {
+    if (!api || !workspace) {
+      return;
+    }
+
+    setError(null);
+    const result = await api.invoke<WorkspaceFilePreview>("workspace:read-file", { path: filePath });
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setFilePreview(result.data);
+  }
+
   return (
     <main className="app-shell">
       <nav className="sidebar" aria-label="Primary">
@@ -282,7 +306,13 @@ export function App() {
           />
         ) : null}
       </div>
-      <ActivityFeed items={activityItems} />
+      <WorkspacePanel
+        activityItems={activityItems}
+        tree={workspaceTree}
+        preview={filePreview}
+        hasWorkspace={Boolean(workspace)}
+        onReadFile={readWorkspaceFile}
+      />
     </main>
   );
 }

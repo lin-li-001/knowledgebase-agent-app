@@ -2,6 +2,8 @@ export const allowedChannels = [
   "workspace:create",
   "workspace:open",
   "workspace:get-active",
+  "workspace:tree",
+  "workspace:read-file",
   "settings:get",
   "settings:update",
   "chat:run-turn",

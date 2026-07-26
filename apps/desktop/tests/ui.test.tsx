@@ -160,4 +160,56 @@ describe("desktop shell", () => {
     expect(screen.getByText("LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019")).toBeVisible();
     expect(screen.getByText("You worked at LQ Digital in 2018.")).toBeVisible();
   });
+
+  it("shows a workspace file tree and previews selected files", async () => {
+    window.kbAgent = {
+      invoke: vi.fn(async (channel, input) => {
+        if (channel === "workspace:get-active") {
+          return { ok: true, data: { rootPath: "/tmp/kb", workspaceId: "workspace-1", sessionId: "session-1" } };
+        }
+        if (channel === "settings:get") {
+          return { ok: true, data: { hasApiKey: false, modelName: "mock" } };
+        }
+        if (channel === "activity:list" || channel === "review:list") {
+          return { ok: true, data: [] };
+        }
+        if (channel === "workspace:tree") {
+          return {
+            ok: true,
+            data: {
+              name: "kb",
+              path: "",
+              type: "directory",
+              children: [
+                {
+                  name: "01-Projects",
+                  path: "01-Projects",
+                  type: "directory",
+                  children: [
+                    { name: "Plan.md", path: "01-Projects/Plan.md", type: "file" },
+                  ],
+                },
+              ],
+            },
+          };
+        }
+        if (channel === "workspace:read-file") {
+          expect(input).toEqual({ path: "01-Projects/Plan.md" });
+          return { ok: true, data: { path: "01-Projects/Plan.md", content: "# Plan\n\nBuild the explorer.", previewType: "text" } };
+        }
+        return { ok: true, data: null };
+      }),
+    };
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Files" }));
+    expect(await screen.findByText("01-Projects")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Plan.md" }));
+
+    expect(await screen.findByText("01-Projects/Plan.md")).toBeVisible();
+    const preview = screen.getByLabelText("File preview");
+    expect(preview).toHaveTextContent("# Plan");
+    expect(preview).toHaveTextContent("Build the explorer.");
+  });
 });
