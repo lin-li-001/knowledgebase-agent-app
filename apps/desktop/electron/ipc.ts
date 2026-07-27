@@ -44,7 +44,12 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "notes:search": z.object({ query: z.string() }),
   "notes:read": z.object({ path: z.string() }),
   "review:list": z.object({}),
-  "review:approve": z.object({ id: z.string() }),
+  "review:approve": z.object({
+    id: z.string(),
+    targetPathOverride: z.string().optional(),
+    saveAsRoutingRule: z.boolean().optional(),
+    routingRulePattern: z.string().optional(),
+  }),
   "review:reject": z.object({ id: z.string() }),
   "activity:list": z.object({}),
   "index:rebuild": z.object({}),
@@ -170,7 +175,11 @@ export async function handleIpcRequest(
         result = { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
         return result;
       case "review:approve":
-        result = await approveReviewItem(services, payload.id as string);
+        result = await approveReviewItem(services, payload.id as string, {
+          targetPathOverride: typeof payload.targetPathOverride === "string" ? payload.targetPathOverride : undefined,
+          saveAsRoutingRule: payload.saveAsRoutingRule === true,
+          routingRulePattern: typeof payload.routingRulePattern === "string" ? payload.routingRulePattern : undefined,
+        });
         return result;
       case "review:reject":
         result = await approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
@@ -360,7 +369,13 @@ function getImportJob(db: AppDatabase, id: string): unknown {
   };
 }
 
-async function approveReviewItem(services: IpcServices, id: string): Promise<IpcResult> {
+interface ReviewApproveOptions {
+  targetPathOverride?: string | undefined;
+  saveAsRoutingRule?: boolean | undefined;
+  routingRulePattern?: string | undefined;
+}
+
+async function approveReviewItem(services: IpcServices, id: string, options: ReviewApproveOptions = {}): Promise<IpcResult> {
   const db = requireDatabase(services);
   const item = await getReviewItem(db, id);
   if (!item) {
@@ -378,7 +393,7 @@ async function approveReviewItem(services: IpcServices, id: string): Promise<Ipc
       await transitionReviewItem(db, id, "proposed", "approved");
     }
 
-    const entityPath = await applyKnowledgeProposal(services, item);
+    const entityPath = await applyKnowledgeProposal(services, item, options);
     const appliedAt = new Date().toISOString();
     await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
     await recordActivity(db, {
@@ -391,6 +406,13 @@ async function approveReviewItem(services: IpcServices, id: string): Promise<Ipc
       reviewItemId: id,
       createdAt: appliedAt,
     });
+    if (options.saveAsRoutingRule && options.targetPathOverride?.trim()) {
+      await saveUserRoutingRule(services, item, {
+        destination: options.targetPathOverride.trim(),
+        pattern: options.routingRulePattern?.trim() || routingPatternFor(item),
+        createdAt: appliedAt,
+      });
+    }
     if (item.proposalType === "propose_create_note") {
       await indexWorkspace(requireWorkspaceRoot(services), db);
     }
@@ -482,18 +504,19 @@ tags: []
   await writeFile(targetPath, `${current.trimEnd()}\n\n${bullet}\n`, "utf8");
 }
 
-async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem): Promise<string> {
+async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, options: ReviewApproveOptions = {}): Promise<string> {
   if (item.proposalType === "propose_create_note") {
     const payload = createNotePayload(item.payload);
-    const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), payload.path);
+    const relativePath = options.targetPathOverride?.trim() || payload.path;
+    const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
     await mkdir(path.dirname(targetPath), { recursive: true });
     await writeFile(targetPath, payload.body, { encoding: "utf8", flag: "wx" });
-    return payload.path;
+    return relativePath;
   }
 
   if (item.proposalType === "propose_decision") {
     const body = extractDecisionBody(item.payload);
-    const relativePath = item.targetPath ?? defaultRoutingPolicy.decisionPath(item.id);
+    const relativePath = options.targetPathOverride?.trim() || item.targetPath || defaultRoutingPolicy.decisionPath(item.id);
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
     await mkdir(path.dirname(targetPath), { recursive: true });
     await writeFile(targetPath, `${body.trimEnd()}\n`, { encoding: "utf8", flag: "wx" });
@@ -501,6 +524,119 @@ async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem): 
   }
 
   throw new Error(`Unsupported proposal apply: ${item.proposalType}`);
+}
+
+interface UserRoutingRule {
+  id: string;
+  pattern: string;
+  destination: string;
+  sourceReviewItemId: string;
+  createdAt: string;
+}
+
+async function saveUserRoutingRule(
+  services: IpcServices,
+  item: ReviewItem,
+  input: { pattern: string; destination: string; createdAt: string },
+): Promise<void> {
+  const workspaceRoot = requireWorkspaceRoot(services);
+  const rule: UserRoutingRule = {
+    id: `routing-rule-${item.id}`,
+    pattern: input.pattern,
+    destination: input.destination,
+    sourceReviewItemId: item.id,
+    createdAt: input.createdAt,
+  };
+
+  await appendRoutingPolicyRule(workspaceRoot, rule);
+  await appendAgentsRoutingRule(workspaceRoot, rule);
+  await writeRoutingRuleAdr(workspaceRoot, rule);
+}
+
+async function appendRoutingPolicyRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
+  const policyPath = assertInsideWorkspace(workspaceRoot, ".vault/routing-policy.json");
+  await mkdir(path.dirname(policyPath), { recursive: true });
+  const existing = await readFile(policyPath, "utf8")
+    .then((content) => JSON.parse(content) as { version?: number; rules?: UserRoutingRule[] })
+    .catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return { version: 1, rules: [] };
+      }
+      throw error;
+    });
+  const rules = existing.rules ?? [];
+  if (!rules.some((existingRule) => existingRule.id === rule.id)) {
+    rules.push(rule);
+  }
+  await writeFile(policyPath, `${JSON.stringify({ version: 1, rules }, null, 2)}\n`, "utf8");
+}
+
+async function appendAgentsRoutingRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
+  const agentsPath = assertInsideWorkspace(workspaceRoot, "AGENTS.md");
+  const current = await readFile(agentsPath, "utf8").catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return "# Workspace Contract\n";
+    }
+    throw error;
+  });
+  const ruleLine = `- ${rule.pattern} -> ${rule.destination}`;
+  if (current.includes(ruleLine)) {
+    return;
+  }
+  const heading = "## User Routing Rules";
+  const next = current.includes(heading)
+    ? current.replace(heading, `${heading}\n${ruleLine}`)
+    : `${current.trimEnd()}\n\n${heading}\n\n${ruleLine}\n`;
+  await writeFile(agentsPath, next, "utf8");
+}
+
+async function writeRoutingRuleAdr(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
+  const adrPath = assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.decisionPath(rule.id));
+  await mkdir(path.dirname(adrPath), { recursive: true });
+  await writeFile(
+    adrPath,
+    `# User-defined routing rule
+
+**Date:** ${rule.createdAt.slice(0, 10)}
+**Status:** Accepted
+
+## Context
+
+During Review, the user chose a different destination for a proposed knowledge write and saved that choice as a future routing rule.
+
+## Decision
+
+Route imports or proposals matching:
+
+\`\`\`text
+${rule.pattern}
+\`\`\`
+
+to:
+
+\`\`\`text
+${rule.destination}
+\`\`\`
+
+## Consequences
+
+- The workspace routing policy records this rule in \`.vault/routing-policy.json\`.
+- The workspace contract records the user-readable rule in \`AGENTS.md\`.
+- The source Review item is \`${rule.sourceReviewItemId}\`.
+`,
+    { encoding: "utf8", flag: "wx" },
+  );
+}
+
+function routingPatternFor(item: ReviewItem): string {
+  if (item.targetPath) {
+    return path.basename(item.targetPath, path.extname(item.targetPath));
+  }
+  const payload = item.payload;
+  if (typeof payload === "object" && payload !== null && "path" in payload && typeof payload.path === "string") {
+    return path.basename(payload.path, path.extname(payload.path));
+  }
+  return item.proposalType;
 }
 
 function createNotePayload(payload: unknown): { path: string; body: string } {

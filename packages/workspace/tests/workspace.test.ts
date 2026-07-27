@@ -58,6 +58,9 @@ describe("createWorkspace", () => {
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Profile memory lives at `02-Profiles/<profile-id>/Memory.md`",
     );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "User-defined durable routing rules are recorded in `.vault/routing-policy.json`",
+    );
     await expect(readFile(path.join(rootPath, ".app/settings.json"), "utf8")).resolves.toContain(
       '"activeProfileId": "default"',
     );

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ActivityItem } from "./components/ActivityFeed";
-import type { ReviewCardItem } from "./components/ReviewItemCard";
+import type { ReviewApprovalOptions, ReviewCardItem } from "./components/ReviewItemCard";
 import { WorkspacePanel, type WorkspaceFilePreview, type WorkspaceTreeNode } from "./components/WorkspacePanel";
 import { ChatRoute } from "./routes/ChatRoute";
 import { KnowledgeRoute, type WorkspaceAuditResult } from "./routes/KnowledgeRoute";
@@ -244,12 +244,12 @@ export function App() {
     await refreshPanels();
   }
 
-  async function updateReviewState(channel: "review:approve" | "review:reject", id: string) {
+  async function updateReviewState(channel: "review:approve" | "review:reject", id: string, options?: ReviewApprovalOptions) {
     if (!api) {
       return;
     }
 
-    const result = await api.invoke(channel, { id });
+    const result = await api.invoke(channel, { id, ...(options ?? {}) });
     if (!result.ok) {
       setError(result.error);
       return;
@@ -312,7 +312,7 @@ export function App() {
         {activeRoute === "Review" ? (
           <ReviewRoute
             items={reviewItems}
-            onApprove={(id) => updateReviewState("review:approve", id)}
+            onApprove={(id, options) => updateReviewState("review:approve", id, options)}
             onReject={(id) => updateReviewState("review:reject", id)}
           />
         ) : null}

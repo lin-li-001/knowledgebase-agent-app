@@ -1,4 +1,4 @@
-import { ReviewItemCard, type ReviewCardItem } from "../components/ReviewItemCard";
+import { ReviewItemCard, type ReviewApprovalOptions, type ReviewCardItem } from "../components/ReviewItemCard";
 
 export function ReviewRoute({
   items,
@@ -6,7 +6,7 @@ export function ReviewRoute({
   onReject,
 }: {
   items: ReviewCardItem[];
-  onApprove(id: string): Promise<void>;
+  onApprove(id: string, options?: ReviewApprovalOptions): Promise<void>;
   onReject(id: string): Promise<void>;
 }) {
   return (

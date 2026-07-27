@@ -660,6 +660,66 @@ Review can create notes.
     );
   });
 
+  it("applies user routing overrides and records durable routing rules during review", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+
+    const body = `---
+title: Utility Bills
+type: resource
+status: active
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-26
+tags: []
+---
+
+# Utility Bills
+
+January bill.
+`;
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          target_path, source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("review-routed-note", services.workspaceId, "proposed", "medium", "propose_create_note", JSON.stringify({ path: "04-Resources/Imports/Utility Bills.md", body }), "reason", "04-Resources/Imports/Utility Bills.md", services.sessionId, "turn-1", new Date().toISOString());
+
+    await expect(
+      handleIpcRequest(services, "review:approve", {
+        id: "review-routed-note",
+        targetPathOverride: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+        saveAsRoutingRule: true,
+        routingRulePattern: "utility bills",
+      }),
+    ).resolves.toEqual({ ok: true, data: { id: "review-routed-note", state: "applied" } });
+
+    await expect(readFile(path.join(root, "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md"), "utf8")).resolves.toContain(
+      "January bill.",
+    );
+    await expect(readFile(path.join(root, ".vault/routing-policy.json"), "utf8")).resolves.toContain(
+      "02-Personal/Shared/Finance/Utilities/2026",
+    );
+    await expect(readFile(path.join(root, "AGENTS.md"), "utf8")).resolves.toContain(
+      "utility bills -> 02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+    );
+    await expect(readFile(path.join(root, ".vault/decisions/routing-rule-review-routed-note.md"), "utf8")).resolves.toContain(
+      "User-defined routing rule",
+    );
+  });
+
   it("applies approved decision proposals to the workspace decision folder", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });

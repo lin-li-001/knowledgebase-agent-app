@@ -80,6 +80,39 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
   });
 
+  it("lets users override review destination and save it as a future routing rule", () => {
+    const approve = vi.fn(async () => undefined);
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-1",
+          state: "proposed",
+          proposalType: "propose_create_note",
+          risk: "medium",
+          targetPath: "04-Resources/Imports/Utility Bills.md",
+          reason: "Model proposed a knowledge-base change.",
+          payload: { path: "04-Resources/Imports/Utility Bills.md", body: "# Utility Bills" },
+        }}
+        onApprove={approve}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Destination"), {
+      target: { value: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md" },
+    });
+    fireEvent.click(screen.getByLabelText("Save as future routing rule"));
+    fireEvent.change(screen.getByLabelText("Routing rule pattern"), {
+      target: { value: "utility bills" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    expect(approve).toHaveBeenCalledWith("review-1", {
+      targetPathOverride: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+      saveAsRoutingRule: true,
+      routingRulePattern: "utility bills",
+    });
+  });
+
   it("renders import controls for document batches", () => {
     render(<ImportDropzone disabled={false} onImport={async () => undefined} />);
 
