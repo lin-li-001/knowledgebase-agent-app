@@ -33,6 +33,7 @@ export interface ImportJob {
 
 interface ImportedDocument extends ExtractedDocument {
   attachmentRelativePath: string;
+  sourceStem: string;
 }
 
 interface WorkspaceRoutingPolicyFile {
@@ -69,12 +70,15 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
 
   try {
     const documents: ImportedDocument[] = [];
+    const attachmentNames = new Set<string>();
+    const sourceStems = new Set<string>();
     for (const file of input.files) {
       const extracted = await extractDocumentText(file);
-      const targetFileName = sanitizeFileName(extracted.fileName);
+      const targetFileName = uniqueFileName(sanitizeFileName(extracted.fileName), attachmentNames);
+      const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
       const attachmentRelativePath = `${attachmentDir}/${targetFileName}`;
       await copyFile(file, assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath));
-      documents.push({ ...extracted, attachmentRelativePath });
+      documents.push({ ...extracted, attachmentRelativePath, sourceStem });
     }
 
     const policy = await readWorkspaceRoutingPolicy(input.workspaceRoot);
@@ -111,7 +115,7 @@ async function persistSourceNote(
   policy: WorkspaceRoutingPolicyFile,
   sourceCount: number,
 ): Promise<ImportSourceNote> {
-  const title = sourceTitle(document.fileName);
+  const title = document.sourceStem;
   const routed = routeDocument(batchName, title, document, policy);
   const notePath = routed.routeStatus === "inbox"
     ? sourceCount === 1
@@ -220,7 +224,16 @@ function summaryFor(document: ImportedDocument): string {
     return "No text was extracted from this PDF. OCR is required before its contents can be summarized.";
   }
 
-  return firstMeaningfulParagraphs(document.text, 3).join(" ") || "Imported source document.";
+  const blocks = documentBlocks(document.markdownBody);
+  if (blocks.length === 0) {
+    return "Imported source document with no extractable content.";
+  }
+
+  const metadata = `${sourceTitle(document.fileName)} contains ${blocks.length} document block${blocks.length === 1 ? "" : "s"} and ${blocks.join(" ").length} extracted characters${document.pageCount ? ` across ${document.pageCount} page${document.pageCount === 1 ? "" : "s"}` : ""}.`;
+  const representativeContent = blocks.slice(1).find(Boolean);
+  return representativeContent
+    ? `${metadata} Representative later content: ${truncate(representativeContent, 240)}`
+    : metadata;
 }
 
 function ocrMessage(document: ImportedDocument): string {
@@ -247,12 +260,11 @@ function extractEmploymentFacts(document: ImportedDocument): string[] {
   return document.text.split(/\r?\n/u).filter((line) => employmentPattern.test(line.replace(/\s+/gu, " ").trim()));
 }
 
-function firstMeaningfulParagraphs(text: string, limit: number): string[] {
-  return text
+function documentBlocks(markdownBody: string): string[] {
+  return markdownBody
     .split(/\n\s*\n/u)
     .map((paragraph) => paragraph.replace(/^#{1,6}\s+/u, "").trim())
-    .filter(Boolean)
-    .slice(0, limit);
+    .filter((paragraph) => Boolean(paragraph) && !/^<!-- Page \d+ -->$/u.test(paragraph));
 }
 
 function firstYear(value: string): number | undefined {
@@ -266,6 +278,31 @@ function sourceLinkFor(notePath: string, attachmentPath: string): string {
 
 function sourceTitle(fileName: string): string {
   return sanitizeFileName(path.basename(fileName, path.extname(fileName)));
+}
+
+function uniqueFileName(fileName: string, usedNames: Set<string>): string {
+  const extension = path.extname(fileName);
+  const stem = path.basename(fileName, extension);
+  return uniqueName(stem, extension, usedNames);
+}
+
+function uniqueSourceStem(sourceStem: string, usedStems: Set<string>): string {
+  return uniqueName(sourceStem, "", usedStems);
+}
+
+function uniqueName(stem: string, extension: string, usedNames: Set<string>): string {
+  for (let suffix = 1; ; suffix += 1) {
+    const candidate = suffix === 1 ? `${stem}${extension}` : `${stem}-${suffix}${extension}`;
+    const normalizedCandidate = candidate.toLocaleLowerCase();
+    if (!usedNames.has(normalizedCandidate)) {
+      usedNames.add(normalizedCandidate);
+      return candidate;
+    }
+  }
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
 function sanitizeBatchName(batchName: string): string {

@@ -112,6 +112,32 @@ describe("importDocumentBatch", () => {
     await expect(readFile(path.join(root, "00-Inbox/Imports/Loose Notes.md"), "utf8")).resolves.toContain("## Routing");
   });
 
+  it("derives the summary from whole-document metadata and later content instead of repeating the opening paragraph", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    await writeFile(
+      source,
+      ["Opening policy paragraph that must remain only in the document body.", "Later implementation detail used for the summary."].join("\n\n"),
+      "utf8",
+    );
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Handbook",
+      files: [source],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
+    const summary = markdownSection(note, "Summary");
+    const document = markdownSection(note, "Document");
+
+    expect(document).toContain("Opening policy paragraph that must remain only in the document body.");
+    expect(summary).not.toContain("Opening policy paragraph that must remain only in the document body.");
+    expect(summary).toContain("Later implementation detail used for the summary.");
+  });
+
   it("keeps one Inbox note per source when a batch has multiple unclassified files", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
@@ -131,6 +157,38 @@ describe("importDocumentBatch", () => {
       "00-Inbox/Imports/Loose Notes/First.md",
       "00-Inbox/Imports/Loose Notes/Second.md",
     ]);
+  });
+
+  it("adds deterministic suffixes when attachment names or source-note stems collide", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const firstDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const secondDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const thirdDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const pdf = path.join(firstDir, "report.pdf");
+    const text = path.join(secondDir, "report.txt");
+    const duplicateText = path.join(thirdDir, "report.txt");
+    await writeFile(pdf, minimalPdf("PDF report content"), "binary");
+    await writeFile(text, "Text report content", "utf8");
+    await writeFile(duplicateText, "Second text report content", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Reports",
+      files: [pdf, text, duplicateText],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job.notes.map((note) => note.attachmentPath)).toEqual([
+      "06-Attachments/Imports/Reports/report.pdf",
+      "06-Attachments/Imports/Reports/report.txt",
+      "06-Attachments/Imports/Reports/report-2.txt",
+    ]);
+    expect(job.notes.map((note) => note.notePath)).toEqual([
+      "00-Inbox/Imports/Reports/report.md",
+      "00-Inbox/Imports/Reports/report-2.md",
+      "00-Inbox/Imports/Reports/report-3.md",
+    ]);
+    await expect(readFile(path.join(root, job.notes[2]!.attachmentPath), "utf8")).resolves.toBe("Second text report content");
   });
 
   it("keeps a finance source note pending review at its staging path", async () => {
@@ -154,6 +212,11 @@ describe("importDocumentBatch", () => {
     });
   });
 });
+
+function markdownSection(note: string, heading: string): string {
+  const match = new RegExp(`## ${heading}\\n\\n([\\s\\S]*?)(?=\\n## |$)`, "u").exec(note);
+  return match?.[1] ?? "";
+}
 
 async function writeUtilityBills(sourceDir: string): Promise<string[]> {
   await mkdir(sourceDir, { recursive: true });
