@@ -1,7 +1,8 @@
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { assertInsideWorkspace } from "./pathGuard";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
+import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
+import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
 export interface ImportBatchInput {
@@ -11,13 +12,22 @@ export interface ImportBatchInput {
   now?: string;
 }
 
+export interface ImportSourceNote {
+  sourceFile: string;
+  attachmentPath: string;
+  notePath: string;
+  routeStatus: "inbox" | "pending_review";
+  destination: string;
+  risk: "low" | "high";
+}
+
 export interface ImportJob {
   id: string;
   batchName: string;
   state: "completed" | "failed";
   attachmentDir: string;
-  summaryNotePath: string;
   sourceFiles: string[];
+  notes: ImportSourceNote[];
   failureReason?: string;
 }
 
@@ -25,16 +35,37 @@ interface ImportedDocument extends ExtractedDocument {
   attachmentRelativePath: string;
 }
 
+interface WorkspaceRoutingPolicyFile {
+  rules?: Array<{
+    pattern?: string;
+    destination?: string;
+  }>;
+}
+
+interface RoutedDocument {
+  destination: string;
+  risk: ImportSourceNote["risk"];
+  routeStatus: ImportSourceNote["routeStatus"];
+}
+
+interface RenderSourceNoteInput {
+  attachmentPath: string;
+  created: string;
+  destination: string;
+  document: ImportedDocument;
+  notePath: string;
+  routeStatus: ImportSourceNote["routeStatus"];
+  summary: string;
+  title: string;
+}
+
 export async function importDocumentBatch(input: ImportBatchInput): Promise<ImportJob> {
   const batchName = sanitizeBatchName(input.batchName);
   const created = (input.now ?? new Date().toISOString()).slice(0, 10);
   const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
-  const summaryNotePath = defaultRoutingPolicy.importSummaryNotePath(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
-  const summaryTargetPath = assertInsideWorkspace(input.workspaceRoot, summaryNotePath);
 
   await mkdir(attachmentTargetDir, { recursive: true });
-  await mkdir(path.dirname(summaryTargetPath), { recursive: true });
 
   try {
     const documents: ImportedDocument[] = [];
@@ -46,15 +77,18 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
       documents.push({ ...extracted, attachmentRelativePath });
     }
 
-    await writeFile(summaryTargetPath, renderSummaryNote(batchName, documents, created), "utf8");
+    const policy = await readWorkspaceRoutingPolicy(input.workspaceRoot);
+    const notes = await Promise.all(
+      documents.map((document) => persistSourceNote(input.workspaceRoot, batchName, created, document, policy, documents.length)),
+    );
 
     return {
       id: importJobId(batchName, input.now),
       batchName,
       state: "completed",
       attachmentDir,
-      summaryNotePath,
       sourceFiles: documents.map((document) => document.attachmentRelativePath),
+      notes,
     };
   } catch (error) {
     return {
@@ -62,166 +96,176 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
       batchName,
       state: "failed",
       attachmentDir,
-      summaryNotePath,
       sourceFiles: [],
+      notes: [],
       failureReason: error instanceof Error ? error.message : "Unknown import failure",
     };
   }
 }
 
-function renderSummaryNote(batchName: string, documents: ImportedDocument[], created: string): string {
-  const sourceLinks = documents.map((document) => sourceLinkFor(document.attachmentRelativePath));
-  const summary = firstMeaningfulParagraphs(documents, 3).join(" ");
-  const keyFacts = extractKeyFacts(documents);
+async function persistSourceNote(
+  workspaceRoot: string,
+  batchName: string,
+  created: string,
+  document: ImportedDocument,
+  policy: WorkspaceRoutingPolicyFile,
+  sourceCount: number,
+): Promise<ImportSourceNote> {
+  const title = sourceTitle(document.fileName);
+  const routed = routeDocument(batchName, title, document, policy);
+  const notePath = routed.routeStatus === "inbox"
+    ? sourceCount === 1
+      ? defaultRoutingPolicy.importInboxNotePath(batchName)
+      : defaultRoutingPolicy.importInboxSourceNotePath(batchName, title)
+    : defaultRoutingPolicy.importSourceNotePath(batchName, title);
+  const targetPath = assertInsideWorkspace(workspaceRoot, notePath);
+
+  await mkdir(path.dirname(targetPath), { recursive: true });
+  await writeFile(
+    targetPath,
+    renderImportedSourceNote({
+      attachmentPath: document.attachmentRelativePath,
+      created,
+      destination: routed.destination,
+      document,
+      notePath,
+      routeStatus: routed.routeStatus,
+      summary: summaryFor(document),
+      title,
+    }),
+    "utf8",
+  );
+
+  return {
+    sourceFile: document.fileName,
+    attachmentPath: document.attachmentRelativePath,
+    notePath,
+    routeStatus: routed.routeStatus,
+    destination: routed.destination,
+    risk: routed.risk,
+  };
+}
+
+function routeDocument(
+  batchName: string,
+  title: string,
+  document: ImportedDocument,
+  policy: WorkspaceRoutingPolicyFile,
+): RoutedDocument {
+  const isFinance = /\b(bill|utility|utilities|electric|water|gas|amount|due)\b/iu.test(`${batchName}\n${document.text}`)
+    && /\$\d|\bamount\b|\bdue\b/iu.test(document.text);
+  const hasPersonalFacts = extractEmploymentFacts(document).length > 0;
+  const year = firstYear(document.text) ?? firstYear(batchName);
+  const defaultDestination = isFinance
+    ? importCandidateRoutingPolicy.financeUtilitiesDestination(
+      year === undefined ? { batchName: title } : { batchName: title, year },
+    )
+    : hasPersonalFacts
+      ? importCandidateRoutingPolicy.profileMemoryDestination("default")
+      : importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
+  const destination = routingRuleDestination(policy, `${title}\n${document.fileName}\n${document.text}`) ?? defaultDestination;
+  const risk: ImportSourceNote["risk"] = isFinance || hasPersonalFacts ? "high" : "low";
+
+  return {
+    destination,
+    risk,
+    routeStatus: risk === "high" ? "pending_review" : "inbox",
+  };
+}
+
+function renderImportedSourceNote(input: RenderSourceNoteInput): string {
+  const sourceLink = sourceLinkFor(input.notePath, input.attachmentPath);
+  const documentBody = input.document.markdownBody || ocrMessage(input.document);
+  const tags = input.routeStatus === "inbox" ? "[imported, inbox]" : "[imported, pending-review]";
 
   return `---
-title: ${escapeYamlString(batchName)}
+title: ${escapeYamlString(input.title)}
 type: resource
-status: imported
+status: ${input.routeStatus}
 owner: default
 scope: personal
 sensitivity: normal
-created: ${created}
-tags: [imported]
-source_type: import_batch
-source_files:
-${sourceLinks.map((link) => `  - ${escapeYamlString(link)}`).join("\n")}
-summary: ${escapeYamlString(summary)}
----
+created: ${input.created}
+tags: ${tags}
+source_type: import
+source_file: ${escapeYamlString(sourceLink)}
+summary: ${escapeYamlString(input.summary)}
+route_status: ${input.routeStatus}
+route_destination: ${escapeYamlString(input.destination)}
+${input.document.pageCount ? `page_count: ${input.document.pageCount}\n` : ""}${input.document.requiresOcr ? "requires_ocr: true\n" : ""}---
 
-# ${batchName}
+# ${input.title}
 
 ## Summary
 
-${summary || "Imported documents were copied into the workspace."}
+${input.summary}
 
-## Key Facts
+## Document
 
-${keyFacts.length ? keyFacts.map((fact) => `- ${fact}`).join("\n") : "- No dates or money amounts were detected."}
+${documentBody}
 
-## Source Files
+## Source
 
-${documents.map((document) => `- [${document.fileName}](${sourceLinkFor(document.attachmentRelativePath)})`).join("\n")}
+- [Original file](${sourceLink})
+
+## Routing
+
+- Status: ${input.routeStatus}
+- Destination: ${input.destination}
 `;
 }
 
-function firstMeaningfulParagraphs(documents: ImportedDocument[], limit: number): string[] {
-  return documents
-    .flatMap((document) => document.text.split(/\n\s*\n/u))
+function summaryFor(document: ImportedDocument): string {
+  if (document.requiresOcr) {
+    return "No text was extracted from this PDF. OCR is required before its contents can be summarized.";
+  }
+
+  return firstMeaningfulParagraphs(document.text, 3).join(" ") || "Imported source document.";
+}
+
+function ocrMessage(document: ImportedDocument): string {
+  return document.requiresOcr
+    ? "This PDF has no extractable text and requires OCR."
+    : "No extractable document content was found.";
+}
+
+function routingRuleDestination(policy: WorkspaceRoutingPolicyFile, haystack: string): string | undefined {
+  const normalizedHaystack = haystack.toLocaleLowerCase();
+  return policy.rules?.find((rule) => rule.pattern && rule.destination && normalizedHaystack.includes(rule.pattern.toLocaleLowerCase()))?.destination;
+}
+
+async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<WorkspaceRoutingPolicyFile> {
+  try {
+    return JSON.parse(await readFile(assertInsideWorkspace(workspaceRoot, ".vault/routing-policy.json"), "utf8")) as WorkspaceRoutingPolicyFile;
+  } catch {
+    return {};
+  }
+}
+
+function extractEmploymentFacts(document: ImportedDocument): string[] {
+  const employmentPattern = /^.{2,120}?\s+\|\s+[A-Z][a-z]{2,8}\s+\d{4}\s*[–-]\s*(Present|[A-Z][a-z]{2,8}\s+\d{4})$/u;
+  return document.text.split(/\r?\n/u).filter((line) => employmentPattern.test(line.replace(/\s+/gu, " ").trim()));
+}
+
+function firstMeaningfulParagraphs(text: string, limit: number): string[] {
+  return text
+    .split(/\n\s*\n/u)
     .map((paragraph) => paragraph.replace(/^#{1,6}\s+/u, "").trim())
     .filter(Boolean)
     .slice(0, limit);
 }
 
-function extractKeyFacts(documents: ImportedDocument[]): string[] {
-  const facts = new Set<string>();
-  const moneyPattern = /\$\d[\d,]*(?:\.\d{2})?/gu;
-  const datePattern = /\b\d{4}-\d{2}-\d{2}\b/gu;
-
-  for (const document of documents) {
-    for (const fact of extractEmploymentFacts(document)) {
-      facts.add(fact);
-    }
-    for (const match of document.text.matchAll(moneyPattern)) {
-      facts.add(`${document.fileName}: ${match[0]}`);
-    }
-    for (const match of document.text.matchAll(datePattern)) {
-      facts.add(`${document.fileName}: ${match[0]}`);
-    }
-  }
-
-  return [...facts].slice(0, 20);
+function firstYear(value: string): number | undefined {
+  const match = /\b(20\d{2}|19\d{2})\b/u.exec(value);
+  return match ? Number(match[1]) : undefined;
 }
 
-function extractEmploymentFacts(document: ImportedDocument): string[] {
-  const facts: string[] = [];
-  const seen = new Set<string>();
-  const employmentPattern =
-    /^(.{2,120}?)\s+\|\s+([A-Z][a-z]{2,8})\s+(\d{4})\s*[–-]\s*(Present|([A-Z][a-z]{2,8})\s+(\d{4}))$/u;
-
-  for (const rawLine of document.text.split(/\r?\n/u)) {
-    const line = rawLine.replace(/\s+/gu, " ").trim();
-    const match = employmentPattern.exec(line);
-    if (!match) {
-      continue;
-    }
-
-    const organization = match[1]?.trim();
-    const startMonthName = match[2];
-    const startYearText = match[3];
-    const endRange = match[4];
-    if (!organization || !startMonthName || !startYearText || !endRange) {
-      continue;
-    }
-
-    const startMonth = monthNumber(startMonthName);
-    const startYear = Number(startYearText);
-    const endMonth = endRange === "Present" ? new Date().getMonth() + 1 : monthNumber(match[5]);
-    const endYear = endRange === "Present" ? new Date().getFullYear() : Number(match[6]);
-    if (!startMonth || !endMonth || !Number.isFinite(startYear) || !Number.isFinite(endYear)) {
-      continue;
-    }
-
-    const range = `${startMonthName} ${startYear} - ${endRange === "Present" ? "Present" : `${match[5]} ${endYear}`}`;
-    const coveredYears = yearsCovered(startYear, startMonth, endYear, endMonth);
-    const suffix = coveredYears.length ? ` (covers ${coveredYears.join(", ")})` : "";
-    const fact = `${document.fileName}: Employment: ${organization} | ${range}${suffix}`;
-    if (!seen.has(fact)) {
-      seen.add(fact);
-      facts.push(fact);
-    }
-  }
-
-  return facts;
+function sourceLinkFor(notePath: string, attachmentPath: string): string {
+  return path.posix.relative(path.posix.dirname(notePath), attachmentPath);
 }
 
-function yearsCovered(startYear: number, startMonth: number, endYear: number, endMonth: number): number[] {
-  const years: number[] = [];
-  for (let year = startYear; year <= endYear; year += 1) {
-    const beginsBeforeYearEnds = startYear < year || startMonth <= 12;
-    const endsAfterYearStarts = endYear > year || endMonth >= 1;
-    if (beginsBeforeYearEnds && endsAfterYearStarts) {
-      years.push(year);
-    }
-  }
-  return years;
-}
-
-function monthNumber(month: string | undefined): number | undefined {
-  if (!month) {
-    return undefined;
-  }
-
-  return {
-    jan: 1,
-    january: 1,
-    feb: 2,
-    february: 2,
-    mar: 3,
-    march: 3,
-    apr: 4,
-    april: 4,
-    may: 5,
-    jun: 6,
-    june: 6,
-    jul: 7,
-    july: 7,
-    aug: 8,
-    august: 8,
-    sep: 9,
-    sept: 9,
-    september: 9,
-    oct: 10,
-    october: 10,
-    nov: 11,
-    november: 11,
-    dec: 12,
-    december: 12,
-  }[month.toLocaleLowerCase()];
-}
-
-function sourceLinkFor(attachmentRelativePath: string): string {
-  return `../../${attachmentRelativePath}`;
+function sourceTitle(fileName: string): string {
+  return sanitizeFileName(path.basename(fileName, path.extname(fileName)));
 }
 
 function sanitizeBatchName(batchName: string): string {

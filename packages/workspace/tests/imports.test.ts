@@ -3,69 +3,31 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { extractDocumentText } from "../src/importExtractors";
-import { importDocumentBatch, parseMarkdownNote } from "../src/index";
+import { importDocumentBatch } from "../src/index";
 
 describe("importDocumentBatch", () => {
-  it("copies original files into a batch attachment folder and writes a summary note", async () => {
+  it("creates one Markdown note with derived summary, body, source, and route metadata for one PDF", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
-    const files = await writeUtilityBills(sourceDir);
+    const pdfPath = path.join(sourceDir, "Handbook.pdf");
+    await writeFile(pdfPath, minimalPdf("Handbook import test\nProduct usage policy"), "binary");
 
     const job = await importDocumentBatch({
       workspaceRoot: root,
-      batchName: "2026 Utility Bills",
-      files,
+      batchName: "Handbook",
+      files: [pdfPath],
       now: "2026-07-21T00:00:00.000Z",
     });
 
     expect(job.state).toBe("completed");
-    expect(job.attachmentDir).toBe("06-Attachments/Imports/2026 Utility Bills");
-    expect(job.summaryNotePath).toBe("04-Resources/Imports/2026 Utility Bills.md");
-
-    await expect(readFile(path.join(root, "06-Attachments/Imports/2026 Utility Bills/2026-01 Electric.txt"), "utf8")).resolves.toContain(
-      "Electric bill January 2026",
-    );
-    await expect(readFile(path.join(root, "06-Attachments/Imports/2026 Utility Bills/2026-02 Water.md"), "utf8")).resolves.toContain(
-      "Water bill February 2026",
-    );
-  });
-
-  it("generates a searchable imported summary note with key facts and source links", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
-    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
-    const files = await writeUtilityBills(sourceDir);
-
-    await importDocumentBatch({
-      workspaceRoot: root,
-      batchName: "2026 Utility Bills",
-      files,
-      now: "2026-07-21T00:00:00.000Z",
-    });
-
-    const summaryPath = path.join(root, "04-Resources/Imports/2026 Utility Bills.md");
-    const content = await readFile(summaryPath, "utf8");
-
-    expect(content).toContain("source_files:");
-    expect(content).toContain("## Summary");
-    expect(content).toContain("Electric bill January 2026");
-    expect(content).toContain("## Key Facts");
-    expect(content).toContain("$123.45");
-    expect(content).toContain("2026-02-14");
-    expect(content).toContain("## Source Files");
-    expect(content).toContain("[2026-01 Electric.txt](../../06-Attachments/Imports/2026 Utility Bills/2026-01 Electric.txt)");
-
-    await expect(parseMarkdownNote(summaryPath)).resolves.toEqual(
-      expect.objectContaining({
-        frontmatter: expect.objectContaining({
-          title: "2026 Utility Bills",
-          type: "resource",
-          status: "imported",
-          source_files: expect.arrayContaining([
-            "../../06-Attachments/Imports/2026 Utility Bills/2026-01 Electric.txt",
-          ]),
-        }),
-      }),
-    );
+    expect(job.notes).toHaveLength(1);
+    await expect(readFile(path.join(root, job.notes[0]!.attachmentPath), "utf8")).resolves.toContain("Handbook import test");
+    const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
+    expect(note).toContain("summary:");
+    expect(note).toContain("<!-- Page 1 -->");
+    expect(note).toContain("## Source");
+    expect(note).toContain("## Routing");
+    expect(note).not.toContain("## Route Candidates");
   });
 
   it("extracts text from imported PDF files", async () => {
@@ -82,7 +44,7 @@ describe("importDocumentBatch", () => {
     });
 
     expect(job.state).toBe("completed");
-    await expect(readFile(path.join(root, "04-Resources/Imports/resume.md"), "utf8")).resolves.toContain(
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain(
       "Resume Lin Li PDF Import Test",
     );
   });
@@ -129,87 +91,7 @@ describe("importDocumentBatch", () => {
     expect(document.requiresOcr).toBe(true);
   });
 
-  it("extracts employment timeline facts from imported resumes", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
-    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
-    const resume = path.join(sourceDir, "Resume.txt");
-    await writeFile(
-      resume,
-      [
-        "EXPERIENCE",
-        "Uber Technologies, San Francisco, CA | Mar 2019 - Feb 2021",
-        "Built predictive models.",
-        "LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019",
-        "Implemented experimentation framework.",
-      ].join("\n"),
-      "utf8",
-    );
-
-    await importDocumentBatch({
-      workspaceRoot: root,
-      batchName: "resume",
-      files: [resume],
-      now: "2026-07-21T00:00:00.000Z",
-    });
-
-    const content = await readFile(path.join(root, "04-Resources/Imports/resume.md"), "utf8");
-
-    expect(content).toContain("Employment: Uber Technologies, San Francisco, CA | Mar 2019 - Feb 2021");
-    expect(content).toContain("Employment: LQ Digital, San Francisco, CA | Jun 2017 - Mar 2019");
-    expect(content).toContain("(covers 2017, 2018, 2019)");
-  });
-
-  it("creates an import digest with routed high-risk finance candidates", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
-    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
-    const files = await writeUtilityBills(sourceDir);
-
-    const job = await importDocumentBatch({
-      workspaceRoot: root,
-      batchName: "2026 Utility Bills",
-      files,
-      now: "2026-07-21T00:00:00.000Z",
-    });
-
-    expect(job.digest.candidates).toContainEqual(
-      expect.objectContaining({
-        kind: "finance",
-        risk: "high",
-        proposalType: "propose_create_note",
-        suggestedDestination: "02-Personal/default/Finance/Utilities/2026/2026 Utility Bills.md",
-      }),
-    );
-
-    const content = await readFile(path.join(root, "04-Resources/Imports/2026 Utility Bills.md"), "utf8");
-    expect(content).toContain("## Route Candidates");
-    expect(content).toContain("02-Personal/default/Finance/Utilities/2026/2026 Utility Bills.md");
-  });
-
-  it("uses saved workspace routing rules when suggesting candidate destinations", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
-    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
-    const files = await writeUtilityBills(sourceDir);
-    await mkdir(path.join(root, ".vault"), { recursive: true });
-    await writeFile(
-      path.join(root, ".vault/routing-policy.json"),
-      JSON.stringify({
-        version: 1,
-        rules: [{ pattern: "utility bills", destination: "02-Personal/default/Finance/Utilities/2026 Bills.md" }],
-      }),
-      "utf8",
-    );
-
-    const job = await importDocumentBatch({
-      workspaceRoot: root,
-      batchName: "2026 Utility Bills",
-      files,
-      now: "2026-07-21T00:00:00.000Z",
-    });
-
-    expect(job.digest.candidates[0]?.suggestedDestination).toBe("02-Personal/default/Finance/Utilities/2026 Bills.md");
-  });
-
-  it("uses the inbox fallback when imported content cannot be classified", async () => {
+  it("moves an unclassified import note to Inbox immediately", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     await mkdir(sourceDir, { recursive: true });
@@ -223,16 +105,53 @@ describe("importDocumentBatch", () => {
       now: "2026-07-21T00:00:00.000Z",
     });
 
-    expect(job.digest.candidates).toContainEqual(
-      expect.objectContaining({
-        kind: "resource",
-        risk: "low",
-        suggestedDestination: "00-Inbox/Imports/Loose Notes.md",
-      }),
-    );
-    await expect(readFile(path.join(root, "04-Resources/Imports/Loose Notes.md"), "utf8")).resolves.toContain(
-      "00-Inbox/Imports/Loose Notes.md",
-    );
+    expect(job.notes[0]).toMatchObject({
+      routeStatus: "inbox",
+      notePath: "00-Inbox/Imports/Loose Notes.md",
+    });
+    await expect(readFile(path.join(root, "00-Inbox/Imports/Loose Notes.md"), "utf8")).resolves.toContain("## Routing");
+  });
+
+  it("keeps one Inbox note per source when a batch has multiple unclassified files", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const first = path.join(sourceDir, "First.txt");
+    const second = path.join(sourceDir, "Second.txt");
+    await writeFile(first, "First loose note.", "utf8");
+    await writeFile(second, "Second loose note.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Loose Notes",
+      files: [first, second],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job.notes.map((note) => note.notePath)).toEqual([
+      "00-Inbox/Imports/Loose Notes/First.md",
+      "00-Inbox/Imports/Loose Notes/Second.md",
+    ]);
+  });
+
+  it("keeps a finance source note pending review at its staging path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const bill = path.join(sourceDir, "Electric Bill.txt");
+    await writeFile(bill, "Electric bill\nDue: 2026-01-15\nAmount: $123.45", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "2026 Utility Bills",
+      files: [bill],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      routeStatus: "pending_review",
+      risk: "high",
+      notePath: "04-Resources/Imports/2026 Utility Bills/Electric Bill.md",
+      destination: "02-Personal/default/Finance/Utilities/2026/Electric Bill.md",
+    });
   });
 });
 
