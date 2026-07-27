@@ -5,6 +5,9 @@ export interface ExtractedDocument {
   sourcePath: string;
   fileName: string;
   text: string;
+  markdownBody: string;
+  pageCount?: number;
+  requiresOcr?: boolean;
 }
 
 export async function extractDocumentText(sourcePath: string): Promise<ExtractedDocument> {
@@ -12,10 +15,12 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
   const fileName = path.basename(sourcePath);
 
   if (extension === ".md" || extension === ".markdown" || extension === ".txt") {
+    const text = await readFile(sourcePath, "utf8");
     return {
       sourcePath,
       fileName,
-      text: await readFile(sourcePath, "utf8"),
+      text,
+      markdownBody: text,
     };
   }
 
@@ -26,10 +31,16 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
     const parser = new PDFParse({ data: await readFile(sourcePath) });
     try {
       const result = await parser.getText();
+      const pages = result.pages.map((page) => page.text.trim()).filter(Boolean);
       return {
         sourcePath,
         fileName,
         text: result.text.trim(),
+        markdownBody: pages
+          .map((text, index) => `<!-- Page ${index + 1} -->\n\n${text}`)
+          .join("\n\n"),
+        pageCount: result.total,
+        requiresOcr: result.total > 0 && pages.length === 0,
       };
     } finally {
       await parser.destroy();
