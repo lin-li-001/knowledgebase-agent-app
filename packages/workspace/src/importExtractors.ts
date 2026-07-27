@@ -31,7 +31,7 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
     const parser = new PDFParse({ data: await readFile(sourcePath) });
     try {
       const result = await parser.getText();
-      const pages = result.pages.map((page) => page.text.trim()).filter(Boolean);
+      const pages = result.pages.map((page) => page.text.trim());
       return {
         sourcePath,
         fileName,
@@ -40,7 +40,7 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
           .map((text, index) => `<!-- Page ${index + 1} -->\n\n${text}`)
           .join("\n\n"),
         pageCount: result.total,
-        requiresOcr: result.total > 0 && pages.length === 0,
+        requiresOcr: result.total > 0 && pages.every((text) => text.length === 0),
       };
     } finally {
       await parser.destroy();

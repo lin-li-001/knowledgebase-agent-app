@@ -99,6 +99,26 @@ describe("importDocumentBatch", () => {
     expect(document.pageCount).toBe(1);
   });
 
+  it("preserves page boundaries when a PDF contains a blank middle page", async () => {
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const pdfPath = path.join(sourceDir, "three-pages.pdf");
+    await writeFile(pdfPath, multiPagePdf(), "binary");
+
+    const document = await extractDocumentText(pdfPath);
+
+    expect(document.pageCount).toBe(3);
+    expect(document.markdownBody).toContain("<!-- Page 1 -->");
+    expect(document.markdownBody).toContain("<!-- Page 2 -->");
+    expect(document.markdownBody).toContain("<!-- Page 3 -->");
+    expect(document.markdownBody.indexOf("<!-- Page 1 -->")).toBeLessThan(
+      document.markdownBody.indexOf("<!-- Page 2 -->"),
+    );
+    expect(document.markdownBody.indexOf("<!-- Page 2 -->")).toBeLessThan(
+      document.markdownBody.indexOf("<!-- Page 3 -->"),
+    );
+    expect(document.markdownBody).toContain("<!-- Page 2 -->\n\n\n\n<!-- Page 3 -->");
+  });
+
   it("marks image-only PDFs as requiring OCR", async () => {
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const imageOnlyPdfPath = path.join(sourceDir, "scan.pdf");
@@ -238,6 +258,39 @@ function minimalPdf(text: string): Buffer {
     "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
     "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
     `5 0 obj\n<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream\nendobj\n`,
+  ];
+
+  let body = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const object of objects) {
+    offsets.push(Buffer.byteLength(body));
+    body += object;
+  }
+
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets.slice(1)) {
+    body += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  }
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+
+  return Buffer.from(body);
+}
+
+function multiPagePdf(): Buffer {
+  const pageOne = "BT\n/F1 18 Tf\n72 720 Td\n(Page one) Tj\nET";
+  const pageTwo = "";
+  const pageThree = "BT\n/F1 18 Tf\n72 720 Td\n(Page three) Tj\nET";
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 7 0 R >>\nendobj\n",
+    "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>\nendobj\n",
+    "5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 9 0 R >>\nendobj\n",
+    "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    `7 0 obj\n<< /Length ${Buffer.byteLength(pageOne)} >>\nstream\n${pageOne}\nendstream\nendobj\n`,
+    `8 0 obj\n<< /Length ${Buffer.byteLength(pageTwo)} >>\nstream\n${pageTwo}\nendstream\nendobj\n`,
+    `9 0 obj\n<< /Length ${Buffer.byteLength(pageThree)} >>\nstream\n${pageThree}\nendstream\nendobj\n`,
   ];
 
   let body = "%PDF-1.4\n";
