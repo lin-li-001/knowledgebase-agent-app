@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { exportLlmsFlat, importDocumentBatch, indexWorkspace, type ImportJob } from "@kb-agent/workspace";
-import { recordActivity, type AppDatabase } from "@kb-agent/storage";
+import { exportLlmsFlat, importDocumentBatch, indexWorkspace, type ImportJob, type ImportSourceNote } from "@kb-agent/workspace";
+import { createReviewItem, recordActivity, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
 
 export interface StartImportBatchInput {
   db: AppDatabase;
@@ -25,6 +25,7 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
   await recordImportJob(input.db, workspaceId, job, createdAt);
 
   if (job.state === "completed") {
+    await enqueueHighRiskImportCandidates(input.db, workspaceId, job, createdAt);
     await exportLlmsFlat(input.workspaceRoot, input.db);
   }
 
@@ -34,13 +35,55 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
     kind: "import",
     title: job.state === "completed" ? "Import completed" : "Import failed",
     message: job.state === "completed"
-      ? `${job.sourceFiles.length} files imported into ${job.summaryNotePath}.`
+      ? `${job.notes.length} files imported.`
       : job.failureReason ?? "Import failed.",
     createdAt,
   };
-  await recordActivity(input.db, job.state === "completed" ? { ...activity, entityPath: job.summaryNotePath } : activity);
+  const primaryNotePath = job.notes[0]?.notePath;
+  await recordActivity(
+    input.db,
+    job.state === "completed" && primaryNotePath
+      ? { ...activity, entityPath: primaryNotePath }
+      : activity,
+  );
 
   return job;
+}
+
+async function enqueueHighRiskImportCandidates(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
+  for (const note of job.notes.filter((item) => item.risk === "high" && item.routeStatus === "pending_review")) {
+    const reviewItem = reviewItemForImportSourceNote(workspaceId, job, note, createdAt);
+    await createReviewItem(db, reviewItem);
+    await recordActivity(db, {
+      id: randomUUID(),
+      workspaceId,
+      kind: "review",
+      title: "Import candidate requires review",
+      message: `${note.sourceFile} requires review before moving to ${note.destination}.`,
+      entityPath: note.notePath,
+      reviewItemId: reviewItem.id,
+      createdAt,
+    });
+  }
+}
+
+function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note: ImportSourceNote, createdAt: string): ReviewItem {
+  return {
+    id: `import-source-note:${job.id}:${note.notePath}`,
+    workspaceId,
+    state: "proposed",
+    risk: note.risk,
+    proposalType: "propose_create_note",
+    targetPath: note.destination,
+    payload: {
+      sourceNotePath: note.notePath,
+      destination: note.destination,
+    },
+    reason: `Imported ${note.sourceFile} is pending review before it moves to ${note.destination}.`,
+    sourceSessionId: `import:${job.id}`,
+    sourceTurnId: note.notePath,
+    createdAt,
+  };
 }
 
 async function recordImportJob(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
@@ -57,7 +100,7 @@ async function recordImportJob(db: AppDatabase, workspaceId: string, job: Import
       job.batchName,
       job.state,
       job.attachmentDir,
-      job.summaryNotePath,
+      job.notes[0]?.notePath ?? null,
       JSON.stringify(job.sourceFiles),
       createdAt,
       job.state === "completed" ? createdAt : null,

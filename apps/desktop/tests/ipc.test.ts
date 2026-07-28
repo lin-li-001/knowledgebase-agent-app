@@ -103,11 +103,11 @@ describe("IPC contract", () => {
 
   it("lists workspace files and reads previewable files through guarded IPC", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
-    await mkdir(path.join(root, "01-Projects/Shared"), { recursive: true });
+    await mkdir(path.join(root, "01-Projects/Demo"), { recursive: true });
     await mkdir(path.join(root, ".app"), { recursive: true });
     await mkdir(path.join(root, ".git"), { recursive: true });
     await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
-    await writeFile(path.join(root, "01-Projects/Shared/Plan.md"), "# Plan\n\nBuild a workspace explorer.", "utf8");
+    await writeFile(path.join(root, "01-Projects/Demo/Plan.md"), "# Plan\n\nBuild a workspace explorer.", "utf8");
     await writeFile(path.join(root, ".app/index.sqlite"), "runtime", "utf8");
     await writeFile(path.join(root, ".git/config"), "runtime", "utf8");
 
@@ -130,9 +130,9 @@ describe("IPC contract", () => {
               name: "01-Projects",
               children: expect.arrayContaining([
                 expect.objectContaining({
-                  name: "Shared",
+                  name: "Demo",
                   children: expect.arrayContaining([
-                    expect.objectContaining({ name: "Plan.md", path: "01-Projects/Shared/Plan.md", type: "file" }),
+                    expect.objectContaining({ name: "Plan.md", path: "01-Projects/Demo/Plan.md", type: "file" }),
                   ]),
                 }),
               ]),
@@ -146,8 +146,8 @@ describe("IPC contract", () => {
     expect(JSON.stringify(treeResult)).not.toContain(".app");
     expect(JSON.stringify(treeResult)).not.toContain(".git");
 
-    await expect(handleIpcRequest(services, "workspace:read-file", { path: "01-Projects/Shared/Plan.md" })).resolves.toEqual(
-      { ok: true, data: { path: "01-Projects/Shared/Plan.md", content: "# Plan\n\nBuild a workspace explorer.", previewType: "text" } },
+    await expect(handleIpcRequest(services, "workspace:read-file", { path: "01-Projects/Demo/Plan.md" })).resolves.toEqual(
+      { ok: true, data: { path: "01-Projects/Demo/Plan.md", content: "# Plan\n\nBuild a workspace explorer.", previewType: "text" } },
     );
     await expect(handleIpcRequest(services, "workspace:read-file", { path: "../outside.md" })).resolves.toEqual(
       { ok: false, error: "Path escapes workspace" },
@@ -700,24 +700,164 @@ January bill.
     await expect(
       handleIpcRequest(services, "review:approve", {
         id: "review-routed-note",
-        targetPathOverride: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+        targetPathOverride: "02-Personal/default/Finance/Utilities/2026/Utility Bills.md",
         saveAsRoutingRule: true,
         routingRulePattern: "utility bills",
       }),
     ).resolves.toEqual({ ok: true, data: { id: "review-routed-note", state: "applied" } });
 
-    await expect(readFile(path.join(root, "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md"), "utf8")).resolves.toContain(
+    await expect(readFile(path.join(root, "02-Personal/default/Finance/Utilities/2026/Utility Bills.md"), "utf8")).resolves.toContain(
       "January bill.",
     );
     await expect(readFile(path.join(root, ".vault/routing-policy.json"), "utf8")).resolves.toContain(
-      "02-Personal/Shared/Finance/Utilities/2026",
+      "02-Personal/default/Finance/Utilities/2026",
     );
     await expect(readFile(path.join(root, "AGENTS.md"), "utf8")).resolves.toContain(
-      "utility bills -> 02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+      "utility bills -> 02-Personal/default/Finance/Utilities/2026/Utility Bills.md",
     );
     await expect(readFile(path.join(root, ".vault/decisions/routing-rule-review-routed-note.md"), "utf8")).resolves.toContain(
       "User-defined routing rule",
     );
+  });
+
+  it("moves a reviewed import source note to an override destination and preserves its document body", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "04-Resources/Imports/Utility Bill"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const sourceNotePath = "04-Resources/Imports/Utility Bill/Utility Bill.md";
+    const sourceBody = `---
+title: Utility Bill
+type: resource
+status: pending_review
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-26
+tags: [imported, pending-review]
+source_type: import
+source_file: ../../../06-Attachments/Imports/Utility Bill/Utility Bill.pdf
+summary: Utility bill.
+route_status: pending_review
+route_destination: 02-Personal/default/Finance/Utilities/2026/Utility Bill.md
+---
+
+# Utility Bill
+
+## Document
+
+Electric bill January 2026.
+
+## Routing
+
+- Status: pending_review
+- Destination: 02-Personal/default/Finance/Utilities/2026/Utility Bill.md
+`;
+    await writeFile(path.join(root, sourceNotePath), sourceBody, "utf8");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          target_path, source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "review-import-source-note",
+        services.workspaceId,
+        "proposed",
+        "high",
+        "propose_create_note",
+        JSON.stringify({
+          sourceNotePath,
+          destination: "02-Personal/default/Finance/Utilities/2026/Utility Bill.md",
+        }),
+        "Utility bill needs review.",
+        "02-Personal/default/Finance/Utilities/2026/Utility Bill.md",
+        services.sessionId,
+        "turn-1",
+        new Date().toISOString(),
+      );
+
+    const destination = "02-Personal/default/Finance/Insurance/Utility Bill.md";
+    await expect(
+      handleIpcRequest(services, "review:approve", {
+        id: "review-import-source-note",
+        targetPathOverride: destination,
+      }),
+    ).resolves.toEqual({ ok: true, data: { id: "review-import-source-note", state: "applied" } });
+
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toEqual(
+      expect.stringContaining("## Document\n\nElectric bill January 2026."),
+    );
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toEqual(expect.stringContaining("route_status: approved"));
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toEqual(expect.stringContaining(`route_destination: ${destination}`));
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toThrow();
+  });
+
+  it("keeps a reviewed import source note when its destination already exists", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    await mkdir(path.join(root, "04-Resources/Imports/Utility Bill"), { recursive: true });
+    await mkdir(path.join(root, "02-Personal/default/Finance/Utilities/2026"), { recursive: true });
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    const sourceNotePath = "04-Resources/Imports/Utility Bill/Utility Bill.md";
+    const destination = "02-Personal/default/Finance/Utilities/2026/Utility Bill.md";
+    await writeFile(path.join(root, sourceNotePath), "---\nroute_status: pending_review\nroute_destination: placeholder\n---\n\n# Utility Bill\n\n## Document\n\nElectric bill.\n", "utf8");
+    await writeFile(path.join(root, destination), "already exists", "utf8");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          target_path, source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "review-import-destination-exists",
+        services.workspaceId,
+        "proposed",
+        "high",
+        "propose_create_note",
+        JSON.stringify({ sourceNotePath, destination }),
+        "Utility bill needs review.",
+        destination,
+        services.sessionId,
+        "turn-1",
+        new Date().toISOString(),
+      );
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-import-destination-exists" })).resolves.toEqual(
+      expect.objectContaining({ ok: false }),
+    );
+    await expect(handleIpcRequest(services, "review:list", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.arrayContaining([
+          expect.objectContaining({
+            id: "review-import-destination-exists",
+            state: "failed",
+            failureReason: expect.stringContaining("EEXIST"),
+          }),
+        ]),
+      }),
+    );
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).resolves.toContain("Electric bill.");
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe("already exists");
   });
 
   it("applies approved decision proposals to the workspace decision folder", async () => {

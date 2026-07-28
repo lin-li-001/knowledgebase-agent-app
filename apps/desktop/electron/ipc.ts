@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
-import { assertInsideWorkspace, auditWorkspace, createWorkspace, defaultRoutingPolicy, indexWorkspace, workspaceIdForRoot } from "@kb-agent/workspace";
+import { assertInsideWorkspace, auditWorkspace, createWorkspace, defaultRoutingPolicy, indexWorkspace, syncWorkspaceContract, workspaceIdForRoot } from "@kb-agent/workspace";
 import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
@@ -393,7 +393,17 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
       await transitionReviewItem(db, id, "proposed", "approved");
     }
 
-    const entityPath = await applyKnowledgeProposal(services, item, options);
+    let entityPath: string;
+    try {
+      entityPath = await applyKnowledgeProposal(services, item, options);
+    } catch (error) {
+      if (isImportedSourceNotePayload(item.payload)) {
+        await transitionReviewItem(db, id, "approved", "failed", {
+          failureReason: error instanceof Error ? error.message : "Failed to move imported source note",
+        });
+      }
+      throw error;
+    }
     const appliedAt = new Date().toISOString();
     await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
     await recordActivity(db, {
@@ -506,6 +516,10 @@ tags: []
 
 async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, options: ReviewApproveOptions = {}): Promise<string> {
   if (item.proposalType === "propose_create_note") {
+    if (isImportedSourceNotePayload(item.payload)) {
+      const destination = options.targetPathOverride?.trim() || item.payload.destination;
+      return moveImportedSourceNote(requireWorkspaceRoot(services), item.payload.sourceNotePath, destination);
+    }
     const payload = createNotePayload(item.payload);
     const relativePath = options.targetPathOverride?.trim() || payload.path;
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
@@ -524,6 +538,57 @@ async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, o
   }
 
   throw new Error(`Unsupported proposal apply: ${item.proposalType}`);
+}
+
+interface ImportedSourceNotePayload {
+  sourceNotePath: string;
+  destination: string;
+}
+
+function isImportedSourceNotePayload(payload: unknown): payload is ImportedSourceNotePayload {
+  return typeof payload === "object"
+    && payload !== null
+    && typeof (payload as Record<string, unknown>).sourceNotePath === "string"
+    && typeof (payload as Record<string, unknown>).destination === "string";
+}
+
+async function moveImportedSourceNote(workspaceRoot: string, sourceNotePath: string, destination: string): Promise<string> {
+  const sourcePath = assertInsideWorkspace(workspaceRoot, sourceNotePath);
+  const destinationPath = assertInsideWorkspace(workspaceRoot, destination);
+  const body = await readFile(sourcePath, "utf8");
+  const updatedBody = updateImportedSourceNoteRoute(body, sourcePath, destinationPath, destination);
+
+  await mkdir(path.dirname(destinationPath), { recursive: true });
+  await writeFile(destinationPath, updatedBody, { encoding: "utf8", flag: "wx" });
+  await unlink(sourcePath);
+  return destination;
+}
+
+function updateImportedSourceNoteRoute(body: string, sourcePath: string, destinationPath: string, destination: string): string {
+  const currentSourceLink = yamlField(body, "source_file");
+  const nextSourceLink = currentSourceLink
+    ? path.relative(path.dirname(destinationPath), path.resolve(path.dirname(sourcePath), currentSourceLink)).split(path.sep).join("/")
+    : undefined;
+  let updated = body
+    .replace(/^status: .+$/mu, "status: active")
+    .replace(/^tags: \[imported, pending-review\]$/mu, "tags: [imported, approved]")
+    .replace(/^route_status: .+$/mu, "route_status: approved")
+    .replace(/^route_destination: .+$/mu, `route_destination: ${destination}`)
+    .replace(/^- Status: .+$/mu, "- Status: approved")
+    .replace(/^- Destination: .+$/mu, `- Destination: ${destination}`);
+
+  if (nextSourceLink) {
+    updated = updated
+      .replace(/^source_file: .+$/mu, `source_file: ${nextSourceLink}`)
+      .replace(/(- \[Original file\]\()[^)]+(\))/u, `$1${nextSourceLink}$2`);
+  }
+
+  return updated;
+}
+
+function yamlField(body: string, key: string): string | undefined {
+  const match = new RegExp(`^${key}:\\s*(.+)$`, "mu").exec(body);
+  return match?.[1]?.trim().replace(/^(["'])(.*)\1$/u, "$2");
 }
 
 interface UserRoutingRule {
@@ -679,6 +744,7 @@ function extractMemoryBody(payload: unknown): string | null {
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
   services.db?.close();
   services.workspaceRoot = path.resolve(rootPath);
+  await syncWorkspaceContract(services.workspaceRoot);
   if (services.settingsPath) {
     const settings = await readDesktopSettings(services.settingsPath);
     await writeDesktopSettings(services.settingsPath, { ...settings, workspaceRoot: services.workspaceRoot });
