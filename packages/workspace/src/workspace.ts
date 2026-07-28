@@ -103,7 +103,10 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     const contractTail = workspaceRoutingPolicyContract
       .replace(`${sourceNoteRouteLine}\n`, "")
       .replace(`${sourceNoteRouteStatusLine}\n`, "");
-    next = `${next.trimEnd()}\n\n${contractTail}`;
+    const routingPrecedence = contractTail.replace(/^## Routing Policy\n\n/, "");
+    next = current.includes("## Routing Policy")
+      ? `${next.trimEnd()}\n\n${routingPrecedence}`
+      : `${next.trimEnd()}\n\n${contractTail}`;
   }
 
   await writeFile(contractPath, next, "utf8");

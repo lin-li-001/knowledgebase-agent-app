@@ -89,6 +89,21 @@ describe("createWorkspace", () => {
     );
   });
 
+  it("upgrades a legacy routing section without duplicating its heading", async () => {
+    const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
+    await writeFile(
+      path.join(rootPath, "AGENTS.md"),
+      "# Workspace Contract\n\n## Routing Policy\n\n- Imported summary notes go to `04-Resources/Imports/<batch-name>.md`.\n",
+    );
+
+    await createWorkspace(rootPath);
+    await createWorkspace(rootPath);
+
+    const contract = await readFile(path.join(rootPath, "AGENTS.md"), "utf8");
+    expect(contract.match(/^## Routing Policy$/gm)).toHaveLength(1);
+    expect(contract).toContain("Import candidate routing precedence:");
+  });
+
   it("adds source note routing state to an existing source-first workspace contract", async () => {
     const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
     await writeFile(

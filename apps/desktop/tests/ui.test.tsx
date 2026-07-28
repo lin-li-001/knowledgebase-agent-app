@@ -117,7 +117,7 @@ describe("desktop shell", () => {
     render(<ImportDropzone disabled={false} onImport={async () => undefined} />);
 
     expect(screen.getByLabelText("Batch name")).toBeVisible();
-    expect(screen.getByLabelText("Import files")).toBeVisible();
+    expect(screen.getByLabelText("Import files")).toHaveAttribute("accept", ".pdf,.md,.markdown,.txt");
     expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
   });
 
