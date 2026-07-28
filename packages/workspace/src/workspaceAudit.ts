@@ -1,4 +1,4 @@
-import { access, readdir, readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppDatabase } from "@kb-agent/storage";
 import { parseMarkdownNote } from "./markdown";
@@ -16,8 +16,8 @@ export interface WorkspaceAuditInput {
 export interface WorkspaceAuditFinding {
   code:
     | "missing_frontmatter"
-    | "attachment_without_summary"
-    | "import_summary_not_indexed"
+    | "attachment_without_source_note"
+    | "import_source_note_not_indexed"
     | "note_not_indexed"
     | "note_index_stale"
     | "agents_drift"
@@ -105,15 +105,17 @@ async function auditMarkdownFrontmatter(rootPath: string, findings: WorkspaceAud
 
 async function auditImportBatches(rootPath: string, db: AppDatabase | undefined, findings: WorkspaceAuditFinding[]): Promise<void> {
   const attachmentRoot = path.join(rootPath, defaultRoutingPolicy.importAttachmentRoot());
-  const batchNames = await directoryNames(attachmentRoot);
-  for (const batchName of batchNames) {
-    const summaryPath = defaultRoutingPolicy.importSummaryNotePath(batchName);
-    if (!await exists(path.join(rootPath, summaryPath))) {
+  const attachments = await collectFiles(attachmentRoot);
+  const sourceNotes = await collectImportedSourceNotes(rootPath, attachmentRoot);
+  const sourceAttachmentPaths = new Set(sourceNotes.map((note) => note.attachmentPath));
+
+  for (const attachmentPath of attachments) {
+    if (!sourceAttachmentPaths.has(attachmentPath)) {
       findings.push({
-        code: "attachment_without_summary",
+        code: "attachment_without_source_note",
         severity: "warning",
-        path: defaultRoutingPolicy.importAttachmentDir(batchName),
-        message: `Import batch has attachments but no summary note at ${summaryPath}.`,
+        path: path.relative(rootPath, attachmentPath),
+        message: "Imported attachment has no authoritative source Markdown note.",
       });
     }
   }
@@ -122,19 +124,18 @@ async function auditImportBatches(rootPath: string, db: AppDatabase | undefined,
     return;
   }
 
-  const summaryRoot = path.join(rootPath, defaultRoutingPolicy.importSummaryDir());
-  const summaryPaths = (await collectMarkdownFiles(summaryRoot)).map((filePath) => path.relative(rootPath, filePath));
   const workspaceId = workspaceIdForRoot(rootPath);
-  for (const summaryPath of summaryPaths) {
+  for (const sourceNote of sourceNotes) {
+    const sourceNotePath = path.relative(rootPath, sourceNote.notePath);
     const indexed = db.sqlite
       .prepare("SELECT 1 FROM notes WHERE workspace_id = ? AND path = ? LIMIT 1")
-      .get(workspaceId, summaryPath);
+      .get(workspaceId, sourceNotePath);
     if (!indexed) {
       findings.push({
-        code: "import_summary_not_indexed",
+        code: "import_source_note_not_indexed",
         severity: "warning",
-        path: summaryPath,
-        message: "Import summary note exists on disk but is not present in the SQLite index.",
+        path: sourceNotePath,
+        message: "Imported source note exists on disk but is not present in the SQLite index.",
       });
     }
   }
@@ -144,13 +145,17 @@ async function auditWorkspaceContract(rootPath: string, findings: WorkspaceAudit
   const contractPath = path.join(rootPath, "AGENTS.md");
   const contract = await readFile(contractPath, "utf8").catch(() => "");
   const requiredRoutes = [
-    `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>.md`,
+    `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>/<source-stem>.md`,
     `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`,
+    `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`,
   ];
   const governanceRoutes = [
     "02-Profiles/<profile-id>/Memory.md",
+    "02-Personal/<profile-id>/Finance/",
     ".vault/decisions/<decision-id>.md",
+    "Import candidate routing precedence",
   ];
+  const importedSourceNoteRouteStatusFields = ["route_status", "route_destination"];
 
   for (const route of requiredRoutes) {
     if (!contract.includes(route)) {
@@ -173,15 +178,30 @@ async function auditWorkspaceContract(rootPath: string, findings: WorkspaceAudit
       });
     }
   }
+
+  for (const field of importedSourceNoteRouteStatusFields) {
+    if (!contract.includes(field)) {
+      findings.push({
+        code: "routing_drift",
+        severity: "warning",
+        path: "AGENTS.md",
+        message: `Workspace contract is missing imported source note route field ${field}.`,
+      });
+    }
+  }
 }
 
 async function collectAuditableMarkdownFiles(rootPath: string): Promise<string[]> {
-  const noteRoots = ["00-Inbox", "01-Projects", "02-Profiles", "03-Knowledge", "04-Resources", "05-Templates", "07-Private", "08-Archive"];
+  const noteRoots = ["00-Inbox", "01-Projects", "02-Personal", "02-Profiles", "03-Knowledge", "04-Resources", "05-Templates", "07-Private", "08-Archive"];
   const groups = await Promise.all(noteRoots.map((noteRoot) => collectMarkdownFiles(path.join(rootPath, noteRoot))));
   return groups.flat().sort();
 }
 
 async function collectMarkdownFiles(rootPath: string): Promise<string[]> {
+  return collectFiles(rootPath, (name) => name.endsWith(".md") && name !== "AGENTS.md");
+}
+
+async function collectFiles(rootPath: string, include: (name: string) => boolean = () => true): Promise<string[]> {
   let entries;
   try {
     entries = await readdir(rootPath, { withFileTypes: true });
@@ -193,30 +213,38 @@ async function collectMarkdownFiles(rootPath: string): Promise<string[]> {
   for (const entry of entries) {
     const absolutePath = path.join(rootPath, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await collectMarkdownFiles(absolutePath)));
-    } else if (entry.isFile() && entry.name.endsWith(".md") && entry.name !== "AGENTS.md") {
+      files.push(...(await collectFiles(absolutePath, include)));
+    } else if (entry.isFile() && include(entry.name)) {
       files.push(absolutePath);
     }
   }
   return files;
 }
 
-async function directoryNames(rootPath: string): Promise<string[]> {
-  try {
-    const entries = await readdir(rootPath, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-  } catch {
-    return [];
-  }
+interface ImportedSourceNote {
+  notePath: string;
+  attachmentPath: string;
 }
 
-async function exists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+async function collectImportedSourceNotes(rootPath: string, attachmentRoot: string): Promise<ImportedSourceNote[]> {
+  const markdownPaths = await collectAuditableMarkdownFiles(rootPath);
+  const notes = await Promise.all(markdownPaths.map(async (notePath) => {
+    const raw = await readFile(notePath, "utf8");
+    if (!/^source_type:\s*import\s*$/mu.test(raw)) {
+      return undefined;
+    }
+    const sourceFile = /^source_file:\s*(.+)$/mu.exec(raw)?.[1]?.trim().replace(/^(?:"|')(.*)(?:"|')$/u, "$1");
+    if (!sourceFile) {
+      return undefined;
+    }
+    const attachmentPath = path.resolve(path.dirname(notePath), sourceFile);
+    const relativeAttachment = path.relative(attachmentRoot, attachmentPath);
+    if (relativeAttachment.startsWith("..") || path.isAbsolute(relativeAttachment)) {
+      return undefined;
+    }
+    return { notePath, attachmentPath };
+  }));
+  return notes.filter((note): note is ImportedSourceNote => Boolean(note));
 }
 
 function auditStatus(findings: WorkspaceAuditFinding[]): WorkspaceAuditStatus {

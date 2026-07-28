@@ -19,22 +19,75 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   const repoRoot = path.resolve(input.repoRoot);
   const result: ProductAuditResult = { passes: [], warnings: [], failures: [] };
   const workspaceContractSource = await readSource(repoRoot, "packages/workspace/src/templates.ts", input.sourceOverrides);
-  const importSummaryRoute = `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>.md`;
+  const importSourceNoteRoute = `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>/<source-stem>.md`;
   const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`;
+  const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`;
   const profileMemoryRoute = "02-Profiles/<profile-id>/Memory.md";
+  const profileFinanceRoute = "02-Personal/<profile-id>/Finance/";
   const decisionRoute = ".vault/decisions/<decision-id>.md";
 
-  expectContractText(result, workspaceContractSource, importSummaryRoute, "import summary");
+  expectContractText(result, workspaceContractSource, importSourceNoteRoute, "per-source import note");
   expectContractText(result, workspaceContractSource, importAttachmentRoute, "import attachment");
+  expectContractText(result, workspaceContractSource, inboxFallbackRoute, "import inbox fallback");
   expectContractText(result, workspaceContractSource, profileMemoryRoute, "profile memory");
+  expectContractText(result, workspaceContractSource, profileFinanceRoute, "profile finance");
   expectContractText(result, workspaceContractSource, decisionRoute, "decision");
+  auditImportedSourceNoteRouteStatus(workspaceContractSource, result);
+  auditImportRoutingPrecedence(workspaceContractSource, result);
   if (!result.failures.some((failure) => failure.startsWith("workspace contract is missing"))) {
     result.passes.push("routing policy paths are documented in the workspace contract");
   }
 
+  await auditImportRoutingPolicy(repoRoot, input.sourceOverrides, result);
   await auditFilesystemWriters(repoRoot, input.sourceOverrides, result);
   await auditDecisionMirror(repoRoot, result);
   return result;
+}
+
+const importRoutingContractTerms = [
+  "Review target override",
+  ".vault/routing-policy.json",
+  "Semantic import candidate policy",
+  "defaultRoutingPolicy",
+  "00-Inbox/Imports/",
+];
+
+const importRoutingPolicyTokens = [
+  "review_target_override",
+  "saved_workspace_routing_rule",
+  "semantic_import_candidate_policy",
+  "default_routing_policy",
+  "inbox_import_fallback",
+];
+
+const importedSourceNoteRouteStatusFields = ["route_status", "route_destination"];
+
+function auditImportedSourceNoteRouteStatus(source: string, result: ProductAuditResult): void {
+  const missingFields = importedSourceNoteRouteStatusFields.filter((field) => !source.includes(field));
+  if (missingFields.length) {
+    result.failures.push("workspace contract is missing imported source note route status fields");
+    return;
+  }
+  result.passes.push("imported source note route status is documented in the workspace contract");
+}
+
+function auditImportRoutingPrecedence(source: string, result: ProductAuditResult): void {
+  const missingTerms = importRoutingContractTerms.filter((term) => !source.includes(term));
+  if (missingTerms.length) {
+    result.failures.push(`workspace contract is missing import routing precedence terms: ${missingTerms.join(", ")}`);
+    return;
+  }
+  result.passes.push("import routing precedence is documented in the workspace contract");
+}
+
+async function auditImportRoutingPolicy(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
+  const source = await readSource(repoRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts", sourceOverrides);
+  const missingTokens = importRoutingPolicyTokens.filter((token) => !source.includes(token));
+  if (missingTokens.length) {
+    result.failures.push(`import candidate routing policy is missing precedence tokens: ${missingTokens.join(", ")}`);
+    return;
+  }
+  result.passes.push("import candidate routing precedence is implemented");
 }
 
 function expectContractText(result: ProductAuditResult, source: string, expectedRoute: string, label: string): void {

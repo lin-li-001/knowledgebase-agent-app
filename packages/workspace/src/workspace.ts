@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   changesTemplate,
@@ -6,6 +6,7 @@ import {
   profileTemplate,
   settingsTemplate,
   workspaceContract,
+  workspaceRoutingPolicyContract,
 } from "./templates";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
@@ -17,6 +18,7 @@ export interface WorkspaceInfo {
 
 const directories = [
   "00-Inbox",
+  defaultRoutingPolicy.importInboxDir(),
   "01-Projects",
   path.dirname(defaultRoutingPolicy.profileMemoryPath("default")),
   "03-Knowledge",
@@ -25,7 +27,6 @@ const directories = [
   defaultRoutingPolicy.importAttachmentRoot(),
   path.dirname(defaultRoutingPolicy.decisionPath("default")),
   ".vault/memory/default",
-  ".vault/memory/shared",
   defaultRoutingPolicy.exportDir(),
 ];
 
@@ -59,11 +60,53 @@ export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> 
     ).catch(ignoreExistingFile),
   ]);
 
+  await syncWorkspaceContract(normalizedRoot);
+
   return {
     rootPath: normalizedRoot,
     profileId: "default",
     settingsPath: path.join(normalizedRoot, ".app/settings.json"),
   };
+}
+
+export async function syncWorkspaceContract(rootPath: string): Promise<void> {
+  const contractPath = path.join(path.resolve(rootPath), "AGENTS.md");
+  const current = await readFile(contractPath, "utf8").catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return "# Workspace Contract\n";
+    }
+    throw error;
+  });
+
+  const sourceNoteRoute = "04-Resources/Imports/<batch-name>/<source-stem>.md";
+  const sourceNoteRouteLine = "- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
+  const sourceNoteRouteStatusLine = "- Each imported source note records `route_status` and `route_destination`; a Review approval moves that same note to its final destination.";
+  const hasSourceNoteRoute = current.includes(sourceNoteRoute);
+  const hasSourceNoteRouteStatus = current.includes("route_status") && current.includes("route_destination");
+  const hasRoutingPrecedence = current.includes("Import candidate routing precedence:");
+  if (hasSourceNoteRoute && hasSourceNoteRouteStatus && hasRoutingPrecedence) {
+    return;
+  }
+
+  const legacyRoute = "- Imported summary notes go to `04-Resources/Imports/<batch-name>.md`.";
+  let next = hasSourceNoteRoute
+    ? current
+    : current.includes(legacyRoute)
+      ? current.replace(legacyRoute, sourceNoteRouteLine)
+      : `${current.trimEnd()}\n\n${sourceNoteRouteLine}\n`;
+
+  if (!hasSourceNoteRouteStatus) {
+    next = `${next.trimEnd()}\n${sourceNoteRouteStatusLine}\n`;
+  }
+
+  if (!hasRoutingPrecedence) {
+    const contractTail = workspaceRoutingPolicyContract
+      .replace(`${sourceNoteRouteLine}\n`, "")
+      .replace(`${sourceNoteRouteStatusLine}\n`, "");
+    next = `${next.trimEnd()}\n\n${contractTail}`;
+  }
+
+  await writeFile(contractPath, next, "utf8");
 }
 
 function ignoreExistingFile(error: unknown): void {

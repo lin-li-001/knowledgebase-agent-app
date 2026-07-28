@@ -17,6 +17,7 @@ export function KnowledgeRoute({
   auditing,
   importDisabled,
   auditResult,
+  importNotices,
   onRebuild,
   onAudit,
   onImport,
@@ -25,6 +26,7 @@ export function KnowledgeRoute({
   auditing: boolean;
   importDisabled: boolean;
   auditResult?: WorkspaceAuditResult | null;
+  importNotices: string[];
   onRebuild(): Promise<void>;
   onAudit(): Promise<void>;
   onImport(input: { batchName: string; filePaths: string[] }): Promise<void>;
@@ -60,6 +62,11 @@ export function KnowledgeRoute({
             <p>No findings.</p>
           )}
         </section>
+      ) : null}
+      {importNotices.length ? (
+        <ul className="import-results" aria-label="Import results">
+          {importNotices.map((notice) => <li key={notice}>{notice}</li>)}
+        </ul>
       ) : null}
       <ImportDropzone disabled={importDisabled} onImport={onImport} />
     </section>

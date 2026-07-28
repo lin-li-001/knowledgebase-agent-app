@@ -61,6 +61,7 @@ export function App() {
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null);
   const [filePreview, setFilePreview] = useState<WorkspaceFilePreview | null>(null);
   const [auditResult, setAuditResult] = useState<WorkspaceAuditResult | null>(null);
+  const [importNotices, setImportNotices] = useState<string[]>([]);
   const [auditing, setAuditing] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "Ask about your notes or propose a safe knowledge update." },
@@ -197,13 +198,21 @@ export function App() {
     }
 
     setError(null);
-    const result = await api.invoke<{ state: string; summaryNotePath?: string; failureReason?: string }>("import:start", input);
+    const result = await api.invoke<{
+      state: string;
+      notes?: Array<{ notePath: string; routeStatus: string }>;
+      failureReason?: string;
+    }>("import:start", input);
     if (!result.ok) {
       setError(result.error);
       return;
     }
     if (result.data.state === "failed") {
       setError(result.data.failureReason ?? "Import failed.");
+    } else {
+      setImportNotices(
+        (result.data.notes ?? []).map((note) => `Imported note: ${note.notePath} (${note.routeStatus})`),
+      );
     }
     await refreshPanels();
   }
@@ -304,6 +313,7 @@ export function App() {
             auditing={auditing}
             importDisabled={!workspace}
             auditResult={auditResult}
+            importNotices={importNotices}
             onRebuild={rebuildIndex}
             onAudit={runWorkspaceAudit}
             onImport={runImportBatch}

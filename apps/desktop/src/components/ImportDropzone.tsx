@@ -26,6 +26,7 @@ export function ImportDropzone({ disabled, onImport }: ImportDropzoneProps) {
         <input
           type="file"
           multiple
+          accept=".pdf,.md,.markdown,.txt"
           disabled={disabled}
           onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? []);

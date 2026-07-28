@@ -98,7 +98,7 @@ describe("desktop shell", () => {
     );
 
     fireEvent.change(screen.getByLabelText("Destination"), {
-      target: { value: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md" },
+      target: { value: "02-Personal/default/Finance/Utilities/2026/Utility Bills.md" },
     });
     fireEvent.click(screen.getByLabelText("Save as future routing rule"));
     fireEvent.change(screen.getByLabelText("Routing rule pattern"), {
@@ -107,7 +107,7 @@ describe("desktop shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     expect(approve).toHaveBeenCalledWith("review-1", {
-      targetPathOverride: "02-Personal/Shared/Finance/Utilities/2026/Utility Bills.md",
+      targetPathOverride: "02-Personal/default/Finance/Utilities/2026/Utility Bills.md",
       saveAsRoutingRule: true,
       routingRulePattern: "utility bills",
     });
@@ -121,12 +121,55 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Import Documents" })).toBeDisabled();
   });
 
+  it("shows each imported source note path and route status after import", async () => {
+    window.kbAgent = {
+      invoke: vi.fn(async (channel) => {
+        if (channel === "workspace:get-active") {
+          return { ok: true, data: { rootPath: "/tmp/kb", workspaceId: "workspace-1", sessionId: "session-1" } };
+        }
+        if (channel === "settings:get") {
+          return { ok: true, data: { hasApiKey: false, modelName: "mock" } };
+        }
+        if (channel === "activity:list" || channel === "review:list") {
+          return { ok: true, data: [] };
+        }
+        if (channel === "workspace:tree") {
+          return { ok: true, data: { name: "kb", path: "", type: "directory", children: [] } };
+        }
+        if (channel === "import:start") {
+          return {
+            ok: true,
+            data: {
+              state: "completed",
+              notes: [
+                { notePath: "00-Inbox/Imports/Handbook.md", routeStatus: "inbox" },
+                { notePath: "04-Resources/Imports/Bills/Electric.md", routeStatus: "pending_review" },
+              ],
+            },
+          };
+        }
+        return { ok: true, data: null };
+      }),
+    };
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Knowledge" }));
+    fireEvent.change(await screen.findByLabelText("Batch name"), { target: { value: "Handbook" } });
+    fireEvent.change(screen.getByLabelText("Import files"), { target: { files: [new File(["body"], "Handbook.txt")] } });
+    fireEvent.click(screen.getByRole("button", { name: "Import Documents" }));
+
+    expect(await screen.findByText("Imported note: 00-Inbox/Imports/Handbook.md (inbox)")).toBeVisible();
+    expect(screen.getByText("Imported note: 04-Resources/Imports/Bills/Electric.md (pending_review)")).toBeVisible();
+  });
+
   it("renders workspace audit findings in the Knowledge route", () => {
     render(
       <KnowledgeRoute
         rebuilding={false}
         auditing={false}
         importDisabled={false}
+        importNotices={[]}
         auditResult={{
           status: "fail",
           findings: [
