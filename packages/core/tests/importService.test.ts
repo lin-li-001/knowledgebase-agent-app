@@ -100,4 +100,32 @@ describe("startImportBatch", () => {
       }),
     );
   });
+
+  it("records a failed import job when a source file cannot be imported", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-sources-"));
+    await mkdir(path.join(root, ".app"), { recursive: true });
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+    const unsupported = path.join(sourceDir, "Handbook.docx");
+    await writeFile(unsupported, "not a real docx", "utf8");
+
+    const job = await startImportBatch({
+      db,
+      workspaceRoot: root,
+      workspaceId: "workspace-1",
+      batchName: "Handbook",
+      files: [unsupported],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job).toMatchObject({
+      state: "failed",
+      failureReason: "DOCX import requires the DOCX parser dependency",
+    });
+    expect(db.sqlite.prepare("SELECT state, summary_note_path as summaryNotePath FROM import_jobs WHERE id = ?").get(job.id)).toEqual({
+      state: "failed",
+      summaryNotePath: "",
+    });
+  });
 });

@@ -100,7 +100,7 @@ async function recordImportJob(db: AppDatabase, workspaceId: string, job: Import
       job.batchName,
       job.state,
       job.attachmentDir,
-      job.notes[0]?.notePath ?? null,
+      job.notes[0]?.notePath ?? "",
       JSON.stringify(job.sourceFiles),
       createdAt,
       job.state === "completed" ? createdAt : null,
