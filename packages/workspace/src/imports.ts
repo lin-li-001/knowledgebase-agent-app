@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
 import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
@@ -70,8 +70,10 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
 
   try {
     const documents: ImportedDocument[] = [];
-    const attachmentNames = new Set<string>();
-    const sourceStems = new Set<string>();
+    const [attachmentNames, sourceStems] = await Promise.all([
+      existingNames(attachmentTargetDir),
+      existingSourceStems(input.workspaceRoot, batchName),
+    ]);
     for (const file of input.files) {
       const extracted = await extractDocumentText(file);
       const targetFileName = uniqueFileName(sanitizeFileName(extracted.fileName), attachmentNames);
@@ -117,11 +119,7 @@ async function persistSourceNote(
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
   const routed = routeDocument(batchName, title, document, policy);
-  const notePath = routed.routeStatus === "inbox"
-    ? sourceCount === 1
-      ? defaultRoutingPolicy.importInboxNotePath(batchName)
-      : defaultRoutingPolicy.importInboxSourceNotePath(batchName, title)
-    : defaultRoutingPolicy.importSourceNotePath(batchName, title);
+  const notePath = await notePathFor(workspaceRoot, batchName, title, routed.routeStatus, sourceCount);
   const targetPath = assertInsideWorkspace(workspaceRoot, notePath);
 
   await mkdir(path.dirname(targetPath), { recursive: true });
@@ -148,6 +146,25 @@ async function persistSourceNote(
     destination: routed.destination,
     risk: routed.risk,
   };
+}
+
+async function notePathFor(
+  workspaceRoot: string,
+  batchName: string,
+  sourceStem: string,
+  routeStatus: ImportSourceNote["routeStatus"],
+  sourceCount: number,
+): Promise<string> {
+  if (routeStatus === "pending_review") {
+    return defaultRoutingPolicy.importSourceNotePath(batchName, sourceStem);
+  }
+
+  const directInboxPath = defaultRoutingPolicy.importInboxNotePath(batchName);
+  if (sourceCount === 1 && !(await pathExists(assertInsideWorkspace(workspaceRoot, directInboxPath)))) {
+    return directInboxPath;
+  }
+
+  return defaultRoutingPolicy.importInboxSourceNotePath(batchName, sourceStem);
 }
 
 function routeDocument(
@@ -253,6 +270,47 @@ async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<Worksp
   } catch {
     return {};
   }
+}
+
+async function existingSourceStems(workspaceRoot: string, batchName: string): Promise<Set<string>> {
+  const directories = [
+    path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importSourceNotePath(batchName, "source"))),
+    path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importInboxSourceNotePath(batchName, "source"))),
+  ];
+  const names = await Promise.all(directories.map(existingNames));
+  return new Set(
+    names
+      .flatMap((entries) => [...entries])
+      .filter((name) => name.endsWith(".md"))
+      .map((name) => name.slice(0, -".md".length)),
+  );
+}
+
+async function existingNames(directoryPath: string): Promise<Set<string>> {
+  try {
+    return new Set((await readdir(directoryPath)).map((name) => name.toLocaleLowerCase()));
+  } catch (error) {
+    if (isMissingPath(error)) {
+      return new Set<string>();
+    }
+    throw error;
+  }
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await access(targetPath);
+    return true;
+  } catch (error) {
+    if (isMissingPath(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function isMissingPath(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 function extractEmploymentFacts(document: ImportedDocument): string[] {

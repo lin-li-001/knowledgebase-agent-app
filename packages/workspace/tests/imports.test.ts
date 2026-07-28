@@ -191,6 +191,42 @@ describe("importDocumentBatch", () => {
     await expect(readFile(path.join(root, job.notes[2]!.attachmentPath), "utf8")).resolves.toBe("Second text report content");
   });
 
+  it("preserves attachments and source notes across separate imports into the same batch", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const firstDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const secondDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const first = path.join(firstDir, "report.txt");
+    const second = path.join(secondDir, "report.txt");
+    await writeFile(first, "Electric bill\nDue: 2026-01-15\nAmount: $123.45", "utf8");
+    await writeFile(second, "Electric bill\nDue: 2026-02-15\nAmount: $456.78", "utf8");
+
+    const firstJob = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Reports",
+      files: [first],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+    const secondJob = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Reports",
+      files: [second],
+      now: "2026-07-22T00:00:00.000Z",
+    });
+
+    expect(firstJob.notes[0]).toMatchObject({
+      attachmentPath: "06-Attachments/Imports/Reports/report.txt",
+      notePath: "04-Resources/Imports/Reports/report.md",
+    });
+    expect(secondJob.notes[0]).toMatchObject({
+      attachmentPath: "06-Attachments/Imports/Reports/report-2.txt",
+      notePath: "04-Resources/Imports/Reports/report-2.md",
+    });
+    await expect(readFile(path.join(root, firstJob.notes[0]!.attachmentPath), "utf8")).resolves.toContain("$123.45");
+    await expect(readFile(path.join(root, secondJob.notes[0]!.attachmentPath), "utf8")).resolves.toContain("$456.78");
+    await expect(readFile(path.join(root, firstJob.notes[0]!.notePath), "utf8")).resolves.toContain("$123.45");
+    await expect(readFile(path.join(root, secondJob.notes[0]!.notePath), "utf8")).resolves.toContain("$456.78");
+  });
+
   it("keeps a finance source note pending review at its staging path", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
