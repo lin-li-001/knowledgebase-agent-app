@@ -1,11 +1,25 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { createReviewItem, getReviewItem, getReviewItemState, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem, type ReviewState } from "@kb-agent/storage";
+import { createReviewItem, getReviewItem, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
-import { assertInsideWorkspace, auditWorkspace, createWorkspace, defaultRoutingPolicy, indexWorkspace, syncWorkspaceContract, workspaceIdForRoot } from "@kb-agent/workspace";
+import {
+  assertInsideWorkspace,
+  auditWorkspace,
+  createWorkspace,
+  defaultRoutingPolicy,
+  evaluateImportSafety,
+  fingerprintImportClassification,
+  indexWorkspace,
+  mergeImportClassification,
+  syncWorkspaceContract,
+  workspaceIdForRoot,
+  type ContentCategory,
+  type ImportClassification,
+  type SafetyDecision,
+} from "@kb-agent/workspace";
 import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
 import { isAllowedChannel, type IpcChannel, type IpcResult } from "./ipcContract";
@@ -22,6 +36,15 @@ export interface IpcServices {
   abortControllers?: Map<string, AbortController>;
   modelProvider?: ModelProvider;
   debugLogPath?: string;
+  reviewImportFileOps?: Partial<ReviewImportFileOps>;
+}
+
+export interface ReviewImportFileOps {
+  mkdir(directoryPath: string): Promise<void>;
+  pathExists(targetPath: string): Promise<boolean>;
+  readFile(targetPath: string): Promise<Buffer>;
+  unlink(targetPath: string): Promise<void>;
+  writeFile(targetPath: string, contents: string, exclusive: boolean): Promise<void>;
 }
 
 interface WorkspaceTreeNode {
@@ -47,6 +70,19 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "review:approve": z.object({
     id: z.string(),
     targetPathOverride: z.string().optional(),
+    categoryOverride: z.enum([
+      "finance.utility",
+      "finance.insurance",
+      "finance.tax",
+      "finance.statement",
+      "profile.career",
+      "profile.personal_fact",
+      "memory.candidate",
+      "decision.record",
+      "project.document",
+      "resource",
+      "unknown",
+    ]).optional(),
     saveAsRoutingRule: z.boolean().optional(),
     routingRulePattern: z.string().optional(),
   }),
@@ -177,12 +213,13 @@ export async function handleIpcRequest(
       case "review:approve":
         result = await approveReviewItem(services, payload.id as string, {
           targetPathOverride: typeof payload.targetPathOverride === "string" ? payload.targetPathOverride : undefined,
+          categoryOverride: payload.categoryOverride as ContentCategory | undefined,
           saveAsRoutingRule: payload.saveAsRoutingRule === true,
           routingRulePattern: typeof payload.routingRulePattern === "string" ? payload.routingRulePattern : undefined,
         });
         return result;
       case "review:reject":
-        result = await approveOrRejectReviewItem(requireDatabase(services), payload.id as string, "rejected");
+        result = await rejectReviewItem(services, payload.id as string);
         return result;
       case "activity:list":
         result = { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
@@ -371,6 +408,7 @@ function getImportJob(db: AppDatabase, id: string): unknown {
 
 interface ReviewApproveOptions {
   targetPathOverride?: string | undefined;
+  categoryOverride?: ContentCategory | undefined;
   saveAsRoutingRule?: boolean | undefined;
   routingRulePattern?: string | undefined;
 }
@@ -386,6 +424,9 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
   }
   if (item.state !== "proposed" && item.state !== "approved") {
     return { ok: false, error: `Review item is already ${item.state}` };
+  }
+  if (isImportedSourceNotePayload(item.payload) && item.payload.safetyDecision.decision === "blocked") {
+    return { ok: false, error: "Blocked import artifacts cannot be approved" };
   }
 
   if (item.proposalType === "propose_create_note" || item.proposalType === "propose_decision") {
@@ -416,10 +457,13 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
       reviewItemId: id,
       createdAt: appliedAt,
     });
-    if (options.saveAsRoutingRule && options.targetPathOverride?.trim()) {
+    const routingDestination = routingDestinationFor(item, options);
+    if (options.saveAsRoutingRule && routingDestination) {
+      const routingCategory = routingCategoryFor(item, options);
       await saveUserRoutingRule(services, item, {
-        destination: options.targetPathOverride.trim(),
+        destination: routingDestination,
         pattern: options.routingRulePattern?.trim() || routingPatternFor(item),
+        ...(routingCategory === undefined ? {} : { category: routingCategory }),
         createdAt: appliedAt,
       });
     }
@@ -461,20 +505,28 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
   return { ok: true, data: { id, state: "applied" } };
 }
 
-async function approveOrRejectReviewItem(db: AppDatabase, id: string, targetState: Extract<ReviewState, "approved" | "rejected">): Promise<IpcResult> {
-  const currentState = await getReviewItemState(db, id);
-  if (!currentState) {
+async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcResult> {
+  const db = requireDatabase(services);
+  const item = await getReviewItem(db, id);
+  if (!item) {
     return { ok: false, error: "Review item not found" };
   }
-  if (currentState === targetState) {
-    return { ok: true, data: { id, state: targetState } };
+  if (item.state === "rejected") {
+    return { ok: true, data: { id, state: "rejected" } };
   }
-  if (currentState !== "proposed") {
-    return { ok: false, error: `Review item is already ${currentState}` };
+  if (item.state !== "proposed") {
+    return { ok: false, error: `Review item is already ${item.state}` };
+  }
+  if (isImportedSourceNotePayload(item.payload)) {
+    await rejectImportedSourceNote(
+      requireWorkspaceRoot(services),
+      item.payload.sourceNotePath,
+      reviewImportFileOps(services),
+    );
   }
 
-  await transitionReviewItem(db, id, "proposed", targetState);
-  return { ok: true, data: { id, state: targetState } };
+  await transitionReviewItem(db, id, "proposed", "rejected");
+  return { ok: true, data: { id, state: "rejected" } };
 }
 
 async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Promise<void> {
@@ -517,8 +569,13 @@ tags: []
 async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, options: ReviewApproveOptions = {}): Promise<string> {
   if (item.proposalType === "propose_create_note") {
     if (isImportedSourceNotePayload(item.payload)) {
-      const destination = options.targetPathOverride?.trim() || item.payload.destination;
-      return moveImportedSourceNote(requireWorkspaceRoot(services), item.payload.sourceNotePath, destination);
+      return moveImportedSourceNote(
+        requireWorkspaceRoot(services),
+        item,
+        item.payload,
+        options,
+        reviewImportFileOps(services),
+      );
     }
     const payload = createNotePayload(item.payload);
     const relativePath = options.targetPathOverride?.trim() || payload.path;
@@ -542,36 +599,134 @@ async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, o
 
 interface ImportedSourceNotePayload {
   sourceNotePath: string;
-  destination: string;
+  destination?: string;
+  classification: ImportClassification;
+  safetyDecision: SafetyDecision;
+  sourceFile: string;
 }
 
 function isImportedSourceNotePayload(payload: unknown): payload is ImportedSourceNotePayload {
-  return typeof payload === "object"
-    && payload !== null
-    && typeof (payload as Record<string, unknown>).sourceNotePath === "string"
-    && typeof (payload as Record<string, unknown>).destination === "string";
+  if (!isRecord(payload) || !isRecord(payload.classification) || !isRecord(payload.safetyDecision)) {
+    return false;
+  }
+
+  return typeof payload.sourceNotePath === "string"
+    && (payload.destination === undefined || typeof payload.destination === "string")
+    && typeof payload.sourceFile === "string"
+    && typeof payload.classification.primaryCategory === "string"
+    && Array.isArray(payload.classification.evidence)
+    && Array.isArray(payload.classification.signals)
+    && (
+      payload.safetyDecision.decision === "auto_write"
+      || payload.safetyDecision.decision === "review_required"
+      || payload.safetyDecision.decision === "blocked"
+    )
+    && Array.isArray(payload.safetyDecision.reasonCodes);
 }
 
-async function moveImportedSourceNote(workspaceRoot: string, sourceNotePath: string, destination: string): Promise<string> {
-  const sourcePath = assertInsideWorkspace(workspaceRoot, sourceNotePath);
-  const destinationPath = assertInsideWorkspace(workspaceRoot, destination);
-  const body = await readFile(sourcePath, "utf8");
-  const updatedBody = updateImportedSourceNoteRoute(body, sourcePath, destinationPath, destination);
+async function moveImportedSourceNote(
+  workspaceRoot: string,
+  item: ReviewItem,
+  payload: ImportedSourceNotePayload,
+  options: ReviewApproveOptions,
+  fileOps: ReviewImportFileOps,
+): Promise<string> {
+  const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
+  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  if (yamlField(body, "status") !== "pending_review" || yamlField(body, "route_status") !== "pending_review") {
+    throw new Error("Imported source note is no longer pending review");
+  }
 
-  await mkdir(path.dirname(destinationPath), { recursive: true });
-  await writeFile(destinationPath, updatedBody, { encoding: "utf8", flag: "wx" });
-  await unlink(sourcePath);
+  const destination = options.targetPathOverride?.trim()
+    || payload.destination?.trim()
+    || payload.classification.suggestedDestination?.trim()
+    || "";
+  const destinationPath = safeReviewDestination(workspaceRoot, destination);
+  const classification = classificationWithCurrentOverrides(item, payload.classification, destination, options);
+  const safetyDecision = evaluateImportSafety({
+    workspaceRoot,
+    operation: "move",
+    destination,
+    destinationExists: destinationPath === undefined ? false : await fileOps.pathExists(destinationPath),
+    autoWriteThreshold: 0.95,
+    classification,
+    approval: {
+      reviewItemId: item.id,
+      destination,
+      classificationFingerprint: fingerprintImportClassification(classification),
+    },
+  });
+  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+    throw new Error(`Import approval ${safetyDecision.decision}: ${safetyDecision.reasonCodes.join(", ")}`);
+  }
+
+  const approvedDestinationPath = safetyDecision.allowedDestination;
+  const updatedBody = updateImportedSourceNoteRoute(
+    body,
+    sourcePath,
+    approvedDestinationPath,
+    destination,
+    classification,
+  );
+  await fileOps.mkdir(path.dirname(approvedDestinationPath));
+  await fileOps.writeFile(approvedDestinationPath, updatedBody, true);
+  try {
+    await fileOps.unlink(sourcePath);
+  } catch (error) {
+    try {
+      await fileOps.unlink(approvedDestinationPath);
+    } catch (rollbackError) {
+      const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
+      throw new Error(`${error instanceof Error ? error.message : "Failed to remove staging"}; destination rollback failed: ${rollbackMessage}`);
+    }
+    throw error;
+  }
+
   return destination;
 }
 
-function updateImportedSourceNoteRoute(body: string, sourcePath: string, destinationPath: string, destination: string): string {
+function classificationWithCurrentOverrides(
+  item: ReviewItem,
+  classification: ImportClassification,
+  destination: string,
+  options: ReviewApproveOptions,
+): ImportClassification {
+  const destinationOverride = options.targetPathOverride?.trim();
+  if (options.categoryOverride === undefined && !destinationOverride) {
+    return classification;
+  }
+
+  return mergeImportClassification({
+    signals: [
+      ...classification.signals,
+      {
+        source: "current_user_override",
+        ...(options.categoryOverride === undefined ? {} : { category: options.categoryOverride }),
+        ...(destinationOverride ? { destination } : {}),
+        evidence: [`Review item ${item.id} current override`],
+      },
+    ],
+    fallbackDestination: destination,
+  });
+}
+
+function updateImportedSourceNoteRoute(
+  body: string,
+  sourcePath: string,
+  destinationPath: string,
+  destination: string,
+  classification: ImportClassification,
+): string {
   const currentSourceLink = yamlField(body, "source_file");
   const nextSourceLink = currentSourceLink
     ? path.relative(path.dirname(destinationPath), path.resolve(path.dirname(sourcePath), currentSourceLink)).split(path.sep).join("/")
     : undefined;
   let updated = body
-    .replace(/^status: .+$/mu, "status: active")
-    .replace(/^tags: \[imported, pending-review\]$/mu, "tags: [imported, approved]")
+    .replace(/^status: .+$/mu, "status: approved")
+    .replace(/^tags: .+$/mu, "tags: [imported, approved]")
+    .replace(/^content_category: .+$/mu, `content_category: ${classification.primaryCategory}`)
+    .replace(/^classification_confidence: .+$/mu, `classification_confidence: ${classification.confidence}`)
+    .replace(/^classification_evidence: .+$/mu, `classification_evidence: ${JSON.stringify(classification.evidence)}`)
     .replace(/^route_status: .+$/mu, "route_status: approved")
     .replace(/^route_destination: .+$/mu, `route_destination: ${destination}`)
     .replace(/^- Status: .+$/mu, "- Status: approved")
@@ -586,14 +741,77 @@ function updateImportedSourceNoteRoute(body: string, sourcePath: string, destina
   return updated;
 }
 
+async function rejectImportedSourceNote(
+  workspaceRoot: string,
+  sourceNotePath: string,
+  fileOps: ReviewImportFileOps,
+): Promise<void> {
+  const sourcePath = importStagingPath(workspaceRoot, sourceNotePath);
+  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const rejectedBody = body
+    .replace(/^status: .+$/mu, "status: rejected")
+    .replace(/^tags: .+$/mu, "tags: [imported, rejected]")
+    .replace(/^route_status: .+$/mu, "route_status: rejected")
+    .replace(/^- Status: .+$/mu, "- Status: rejected");
+  await fileOps.writeFile(sourcePath, rejectedBody, false);
+}
+
+function importStagingPath(workspaceRoot: string, sourceNotePath: string): string {
+  const sourcePath = assertInsideWorkspace(workspaceRoot, sourceNotePath);
+  const relativePath = path.relative(path.resolve(workspaceRoot), sourcePath).split(path.sep).join("/");
+  if (!relativePath.startsWith(".app/import-staging/")) {
+    throw new Error("Imported source note is not in staging");
+  }
+  return sourcePath;
+}
+
+function safeReviewDestination(workspaceRoot: string, destination: string): string | undefined {
+  try {
+    return assertInsideWorkspace(workspaceRoot, destination);
+  } catch {
+    return undefined;
+  }
+}
+
+function reviewImportFileOps(services: IpcServices): ReviewImportFileOps {
+  return { ...defaultReviewImportFileOps, ...services.reviewImportFileOps };
+}
+
+const defaultReviewImportFileOps: ReviewImportFileOps = {
+  mkdir: async (directoryPath) => {
+    await mkdir(directoryPath, { recursive: true });
+  },
+  pathExists: async (targetPath) => access(targetPath).then(
+    () => true,
+    (error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    },
+  ),
+  readFile: async (targetPath) => readFile(targetPath),
+  unlink: async (targetPath) => unlink(targetPath),
+  writeFile: async (targetPath, contents, exclusive) => writeFile(
+    targetPath,
+    contents,
+    { encoding: "utf8", flag: exclusive ? "wx" : "w" },
+  ),
+};
+
 function yamlField(body: string, key: string): string | undefined {
   const match = new RegExp(`^${key}:\\s*(.+)$`, "mu").exec(body);
   return match?.[1]?.trim().replace(/^(["'])(.*)\1$/u, "$2");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 interface UserRoutingRule {
   id: string;
   pattern: string;
+  category?: ContentCategory;
   destination: string;
   sourceReviewItemId: string;
   createdAt: string;
@@ -602,12 +820,13 @@ interface UserRoutingRule {
 async function saveUserRoutingRule(
   services: IpcServices,
   item: ReviewItem,
-  input: { pattern: string; destination: string; createdAt: string },
+  input: { pattern: string; category?: ContentCategory; destination: string; createdAt: string },
 ): Promise<void> {
   const workspaceRoot = requireWorkspaceRoot(services);
   const rule: UserRoutingRule = {
     id: `routing-rule-${item.id}`,
     pattern: input.pattern,
+    ...(input.category === undefined ? {} : { category: input.category }),
     destination: input.destination,
     sourceReviewItemId: item.id,
     createdAt: input.createdAt,
@@ -702,6 +921,26 @@ function routingPatternFor(item: ReviewItem): string {
     return path.basename(payload.path, path.extname(payload.path));
   }
   return item.proposalType;
+}
+
+function routingDestinationFor(item: ReviewItem, options: ReviewApproveOptions): string | undefined {
+  const override = options.targetPathOverride?.trim();
+  if (override) {
+    return override;
+  }
+  if (isImportedSourceNotePayload(item.payload)) {
+    return item.payload.destination?.trim() || item.payload.classification.suggestedDestination?.trim();
+  }
+  return item.targetPath?.trim();
+}
+
+function routingCategoryFor(item: ReviewItem, options: ReviewApproveOptions): ContentCategory | undefined {
+  if (options.categoryOverride !== undefined) {
+    return options.categoryOverride;
+  }
+  return isImportedSourceNotePayload(item.payload)
+    ? item.payload.classification.primaryCategory
+    : undefined;
 }
 
 function createNotePayload(payload: unknown): { path: string; body: string } {

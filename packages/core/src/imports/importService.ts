@@ -25,7 +25,7 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
   await recordImportJob(input.db, workspaceId, job, createdAt);
 
   if (job.state === "completed") {
-    await enqueueHighRiskImportCandidates(input.db, workspaceId, job, createdAt);
+    await recordImportSafetyOutcomes(input.db, workspaceId, job, createdAt);
     await exportLlmsFlat(input.workspaceRoot, input.db);
   }
 
@@ -50,22 +50,32 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
   return job;
 }
 
-async function enqueueHighRiskImportCandidates(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
-  for (const note of job.notes.filter(
-    (item) => item.status === "pending_review" && item.safetyDecision.decision === "review_required",
-  )) {
-    const reviewItem = reviewItemForImportSourceNote(workspaceId, job, note, createdAt);
-    await createReviewItem(db, reviewItem);
-    await recordActivity(db, {
-      id: randomUUID(),
-      workspaceId,
-      kind: "review",
-      title: "Import candidate requires review",
-      message: `${note.sourceFile} requires review before moving to ${note.destination}.`,
-      entityPath: note.notePath,
-      reviewItemId: reviewItem.id,
-      createdAt,
-    });
+async function recordImportSafetyOutcomes(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
+  for (const note of job.notes) {
+    if (note.safetyDecision.decision === "review_required") {
+      const reviewItem = reviewItemForImportSourceNote(workspaceId, job, note, createdAt);
+      await createReviewItem(db, reviewItem);
+      await recordActivity(db, {
+        id: randomUUID(),
+        workspaceId,
+        kind: "review",
+        title: "Import candidate requires review",
+        message: `${note.sourceFile} requires review before moving to ${note.destination}.`,
+        entityPath: note.notePath,
+        reviewItemId: reviewItem.id,
+        createdAt,
+      });
+    } else if (note.safetyDecision.decision === "blocked") {
+      await recordActivity(db, {
+        id: randomUUID(),
+        workspaceId,
+        kind: "error",
+        title: "Import candidate blocked",
+        message: `${note.sourceFile} remains staged: ${note.safetyDecision.reasonCodes.join(", ")}.`,
+        entityPath: note.notePath,
+        createdAt,
+      });
+    }
   }
 }
 
@@ -80,6 +90,9 @@ function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note
     payload: {
       sourceNotePath: note.notePath,
       destination: note.destination,
+      classification: note.classification,
+      safetyDecision: note.safetyDecision,
+      sourceFile: note.sourceFile,
     },
     reason: `Imported ${note.sourceFile} is pending review before it moves to ${note.destination}.`,
     sourceSessionId: `import:${job.id}`,
