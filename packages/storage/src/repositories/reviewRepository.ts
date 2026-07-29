@@ -36,14 +36,15 @@ export async function claimReviewItem(
     startedAt: string;
     application?: unknown;
     staleBefore?: string;
+    staleClaimToken?: string;
   },
 ): Promise<boolean> {
   if (claim.from.length === 0) {
     return false;
   }
   const placeholders = claim.from.map(() => "?").join(", ");
-  const staleClause = claim.staleBefore
-    ? " OR (state = ? AND claim_started_at < ?)"
+  const staleClause = claim.staleBefore && claim.staleClaimToken
+    ? " OR (state = ? AND claim_token = ? AND claim_started_at < ?)"
     : "";
   const result = db.sqlite
     .prepare(
@@ -59,7 +60,9 @@ export async function claimReviewItem(
       claim.application === undefined ? null : JSON.stringify(claim.application),
       id,
       ...claim.from,
-      ...(claim.staleBefore ? [claim.to, claim.staleBefore] : []),
+      ...(claim.staleBefore && claim.staleClaimToken
+        ? [claim.to, claim.staleClaimToken, claim.staleBefore]
+        : []),
     );
   return result.changes === 1;
 }
@@ -103,6 +106,9 @@ export async function transitionReviewItem(
   to: ReviewState,
   options: { appliedAt?: string; failureReason?: string | null } = {},
 ): Promise<void> {
+  if (from === "applying" || from === "rejecting") {
+    throw new Error("Claimed review transitions require a claim token");
+  }
   const result = db.sqlite
     .prepare(
       `UPDATE review_items
@@ -114,6 +120,41 @@ export async function transitionReviewItem(
   if (result.changes !== 1) {
     throw new Error("Invalid review transition");
   }
+}
+
+export async function transitionClaimedReviewItem(
+  db: AppDatabase,
+  id: string,
+  from: "applying" | "rejecting",
+  to: ReviewState,
+  claimToken: string,
+  options: { appliedAt?: string; failureReason?: string | null } = {},
+): Promise<void> {
+  const result = db.sqlite
+    .prepare(
+      `UPDATE review_items
+       SET state = ?, applied_at = ?, failure_reason = ?, claim_token = NULL, claim_started_at = NULL
+       WHERE id = ? AND state = ? AND claim_token = ?`,
+    )
+    .run(to, options.appliedAt ?? null, options.failureReason ?? null, id, from, claimToken);
+  if (result.changes !== 1) {
+    throw new Error("Review claim was lost");
+  }
+}
+
+export async function renewReviewItemClaim(
+  db: AppDatabase,
+  id: string,
+  state: "applying" | "rejecting",
+  claimToken: string,
+  startedAt: string,
+): Promise<boolean> {
+  const result = db.sqlite
+    .prepare(
+      "UPDATE review_items SET claim_started_at = ? WHERE id = ? AND state = ? AND claim_token = ?",
+    )
+    .run(startedAt, id, state, claimToken);
+  return result.changes === 1;
 }
 
 export async function getReviewItemState(db: AppDatabase, id: string): Promise<ReviewState | null> {

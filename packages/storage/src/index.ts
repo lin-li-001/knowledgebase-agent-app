@@ -7,6 +7,8 @@ export {
   getReviewItem,
   getReviewItemState,
   listReviewItems,
+  renewReviewItemClaim,
+  transitionClaimedReviewItem,
   transitionReviewItem,
   updateReviewItemApplication,
   updateReviewItemPayload,

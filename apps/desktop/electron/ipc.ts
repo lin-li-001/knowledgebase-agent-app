@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, open, readdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -13,6 +14,7 @@ import {
   recordActivityOnce,
   searchNotes,
   searchSessions,
+  transitionClaimedReviewItem,
   transitionReviewItem,
   updateReviewItemApplication,
   updateReviewItemPayload,
@@ -59,8 +61,12 @@ export interface IpcServices {
   debugLogPath?: string;
   reviewImportFileOps?: Partial<ReviewImportFileOps>;
   reviewApplyHooks?: {
+    afterClaim?(reviewItemId: string): Promise<void>;
     afterPromotion?(reviewItemId: string): Promise<void>;
     beforeApplied?(reviewItemId: string): Promise<void>;
+  };
+  reviewIoHooks?: {
+    afterPathSnapshot?(operation: string, targetPath: string): Promise<void>;
   };
 }
 
@@ -475,10 +481,12 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
       startedAt: new Date().toISOString(),
       application: reviewApplicationIntent(item, options),
       staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
+      ...(claimIsStale && item.claimToken ? { staleClaimToken: item.claimToken } : {}),
     });
     if (!claimed) {
       return reviewClaimConflict(db, id);
     }
+    await services.reviewApplyHooks?.afterClaim?.(id);
 
     let claimedItem = item;
     if (
@@ -498,7 +506,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         await updateReviewItemPayload(db, id, claimToken, importedPayload);
         claimedItem = { ...item, payload: importedPayload };
       } catch (error) {
-        await transitionReviewItem(db, id, "applying", "failed", {
+        await transitionClaimedReviewItem(db, id, "applying", "failed", claimToken, {
           failureReason: error instanceof Error ? error.message : "Failed to migrate imported Review item",
         });
         throw error;
@@ -512,22 +520,23 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         onPrepared: async (application) => {
           await updateReviewItemApplication(db, id, claimToken, application);
         },
+        ioHooks: services.reviewIoHooks,
       });
       await services.reviewApplyHooks?.afterPromotion?.(id);
     } catch (error) {
-      await transitionReviewItem(db, id, "applying", "failed", {
+      await transitionClaimedReviewItem(db, id, "applying", "failed", claimToken, {
         failureReason: error instanceof Error ? error.message : "Failed to apply Review item",
       });
       throw error;
     }
     const appliedAt = new Date().toISOString();
     try {
-      const routingDestination = routingDestinationFor(item, options);
+      const routingDestination = routingDestinationFor(claimedItem, options);
       if (options.saveAsRoutingRule && routingDestination) {
-        const routingCategory = routingCategoryFor(item, options);
-        await saveUserRoutingRule(services, item, {
+        const routingCategory = routingCategoryFor(claimedItem, options);
+        await saveUserRoutingRule(services, claimedItem, {
           destination: routingDestination,
-          pattern: options.routingRulePattern?.trim() || routingPatternFor(item),
+          pattern: options.routingRulePattern?.trim() || routingPatternFor(claimedItem),
           ...(routingCategory === undefined ? {} : { category: routingCategory }),
           createdAt: appliedAt,
         });
@@ -546,11 +555,13 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         createdAt: appliedAt,
       });
       await services.reviewApplyHooks?.beforeApplied?.(id);
-      await transitionReviewItem(db, id, "applying", "applied", { appliedAt });
+      await transitionClaimedReviewItem(db, id, "applying", "applied", claimToken, { appliedAt });
     } catch (error) {
-      await transitionReviewItem(db, id, "applying", "failed", {
-        failureReason: error instanceof Error ? error.message : "Failed to finish Review application",
-      });
+      if (!(error instanceof Error && error.message === "Review claim was lost")) {
+        await transitionClaimedReviewItem(db, id, "applying", "failed", claimToken, {
+          failureReason: error instanceof Error ? error.message : "Failed to finish Review application",
+        });
+      }
       throw error;
     }
 
@@ -574,6 +585,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     startedAt: new Date().toISOString(),
     application: { options },
     staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
+    ...(claimIsStale && item.claimToken ? { staleClaimToken: item.claimToken } : {}),
   });
   if (!claimed) {
     return reviewClaimConflict(db, id);
@@ -594,11 +606,13 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
       reviewItemId: id,
       createdAt: appliedAt,
     });
-    await transitionReviewItem(db, id, "applying", "applied", { appliedAt });
+    await transitionClaimedReviewItem(db, id, "applying", "applied", claimToken, { appliedAt });
   } catch (error) {
-    await transitionReviewItem(db, id, "applying", "failed", {
-      failureReason: error instanceof Error ? error.message : "Failed to apply memory",
-    });
+    if (!(error instanceof Error && error.message === "Review claim was lost")) {
+      await transitionClaimedReviewItem(db, id, "applying", "failed", claimToken, {
+        failureReason: error instanceof Error ? error.message : "Failed to apply memory",
+      });
+    }
     throw error;
   }
 
@@ -617,17 +631,24 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
   if (item.state === "applying") {
     return { ok: false, error: "Review item is currently applying" };
   }
-  if (item.state === "rejecting") {
+  const claimStartedAt = item.claimStartedAt ? Date.parse(item.claimStartedAt) : Number.NaN;
+  const claimIsStale = item.state === "rejecting"
+    && Number.isFinite(claimStartedAt)
+    && claimStartedAt < Date.now() - reviewClaimLeaseMs;
+  if (item.state === "rejecting" && !claimIsStale) {
     return { ok: false, error: "Review item is currently rejecting" };
   }
-  if (item.state !== "proposed" && item.state !== "failed") {
+  if (item.state !== "proposed" && item.state !== "failed" && !claimIsStale) {
     return { ok: false, error: `Review item is already ${item.state}` };
   }
+  const claimToken = randomUUID();
   const claimed = await claimReviewItem(db, id, {
     from: ["proposed", "failed"],
     to: "rejecting",
-    token: randomUUID(),
+    token: claimToken,
     startedAt: new Date().toISOString(),
+    staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
+    ...(claimIsStale && item.claimToken ? { staleClaimToken: item.claimToken } : {}),
   });
   if (!claimed) {
     return reviewClaimConflict(db, id);
@@ -639,13 +660,16 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
         requireWorkspaceRoot(services),
         item.payload.sourceNotePath,
         reviewImportFileOps(services),
+        services.reviewIoHooks,
       );
     }
-    await transitionReviewItem(db, id, "rejecting", "rejected");
+    await transitionClaimedReviewItem(db, id, "rejecting", "rejected", claimToken);
   } catch (error) {
-    await transitionReviewItem(db, id, "rejecting", "failed", {
-      failureReason: error instanceof Error ? error.message : "Failed to reject Review item",
-    });
+    if (!(error instanceof Error && error.message === "Review claim was lost")) {
+      await transitionClaimedReviewItem(db, id, "rejecting", "failed", claimToken, {
+        failureReason: error instanceof Error ? error.message : "Failed to reject Review item",
+      });
+    }
     throw error;
   }
   return { ok: true, data: { id, state: "rejected" } };
@@ -708,7 +732,8 @@ async function applyKnowledgeProposal(
   options: ReviewApproveOptions = {},
   application: {
     previousApplication?: unknown;
-    onPrepared?(application: ImportMoveApplication): Promise<void>;
+    onPrepared?(application: ReviewWriteApplication): Promise<void>;
+    ioHooks?: IpcServices["reviewIoHooks"];
   } = {},
 ): Promise<string> {
   if (item.proposalType === "propose_create_note") {
@@ -725,8 +750,25 @@ async function applyKnowledgeProposal(
     const payload = createNotePayload(item.payload);
     const relativePath = options.targetPathOverride?.trim() || payload.path;
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
-    await mkdir(path.dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, payload.body, { encoding: "utf8", flag: "wx" });
+    const prepared = genericWriteApplication(item, relativePath, payload.body, options);
+    if (await reviewImportFileOps(services).pathExists(targetPath)) {
+      await reconcileGenericWrite(
+        requireWorkspaceRoot(services),
+        targetPath,
+        prepared,
+        application.previousApplication,
+        application.ioHooks,
+      );
+      return relativePath;
+    }
+    await application.onPrepared?.(prepared);
+    await secureWriteExclusive(
+      requireWorkspaceRoot(services),
+      targetPath,
+      payload.body,
+      reviewImportFileOps(services),
+      application.ioHooks,
+    );
     return relativePath;
   }
 
@@ -734,8 +776,26 @@ async function applyKnowledgeProposal(
     const body = extractDecisionBody(item.payload);
     const relativePath = options.targetPathOverride?.trim() || item.targetPath || defaultRoutingPolicy.decisionPath(item.id);
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
-    await mkdir(path.dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, `${body.trimEnd()}\n`, { encoding: "utf8", flag: "wx" });
+    const contents = `${body.trimEnd()}\n`;
+    const prepared = genericWriteApplication(item, relativePath, contents, options);
+    if (await reviewImportFileOps(services).pathExists(targetPath)) {
+      await reconcileGenericWrite(
+        requireWorkspaceRoot(services),
+        targetPath,
+        prepared,
+        application.previousApplication,
+        application.ioHooks,
+      );
+      return relativePath;
+    }
+    await application.onPrepared?.(prepared);
+    await secureWriteExclusive(
+      requireWorkspaceRoot(services),
+      targetPath,
+      contents,
+      reviewImportFileOps(services),
+      application.ioHooks,
+    );
     return relativePath;
   }
 
@@ -759,6 +819,17 @@ interface ImportMoveApplication {
   promotedContentHash: string;
   options: ReviewApproveOptions;
 }
+
+interface GenericWriteApplication {
+  kind: "exclusive_write";
+  reviewItemId: string;
+  proposalType: string;
+  destination: string;
+  promotedContentHash: string;
+  options: ReviewApproveOptions;
+}
+
+type ReviewWriteApplication = ImportMoveApplication | GenericWriteApplication;
 
 function hasImportedSourceReference(payload: unknown): payload is { sourceNotePath: string; destination?: string } {
   return isRecord(payload)
@@ -793,7 +864,8 @@ async function moveImportedSourceNote(
   fileOps: ReviewImportFileOps,
   application: {
     previousApplication?: unknown;
-    onPrepared?(application: ImportMoveApplication): Promise<void>;
+    onPrepared?(application: ReviewWriteApplication): Promise<void>;
+    ioHooks?: IpcServices["reviewIoHooks"];
   },
 ): Promise<string> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
@@ -820,10 +892,41 @@ async function moveImportedSourceNote(
   }
 
   await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const body = await secureReadExisting(workspaceRoot, sourcePath, "staging_read", application.ioHooks);
   const document = parseMarkdownDocument(body);
   if (document.frontmatter.status !== "pending_review" || document.frontmatter.route_status !== "pending_review") {
     throw new Error("Imported source note is no longer pending review");
+  }
+  const updatedBody = updateImportedSourceNoteRoute(
+    body,
+    sourcePath,
+    destinationPath ?? destination,
+    destination,
+    classification,
+  );
+  const previous = application.previousApplication;
+  if (destinationPath !== undefined
+    && await fileOps.pathExists(destinationPath)
+    && isImportMoveApplication(previous)) {
+    if (previous.reviewItemId !== item.id
+      || previous.sourceNotePath !== payload.sourceNotePath
+      || previous.destination !== destination
+      || previous.classificationFingerprint !== classificationFingerprint
+      || previous.promotedContentHash !== hashContents(updatedBody)) {
+      throw new Error("Promoted import does not match current Review intent");
+    }
+    const existing = await secureReadExisting(workspaceRoot, destinationPath, "destination_reconcile", application.ioHooks);
+    if (hashContents(existing) !== previous.promotedContentHash) {
+      throw new Error("Promoted import does not match the persisted application");
+    }
+    await secureUnlinkExisting(
+      workspaceRoot,
+      sourcePath,
+      "staging_unlink",
+      fileOps,
+      application.ioHooks,
+    );
+    return destination;
   }
   const safetyDecision = evaluateImportSafety({
     workspaceRoot,
@@ -844,33 +947,42 @@ async function moveImportedSourceNote(
 
   const approvedDestinationPath = safetyDecision.allowedDestination;
   await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);
-  const updatedBody = updateImportedSourceNoteRoute(
-    body,
-    sourcePath,
-    approvedDestinationPath,
-    destination,
-    classification,
-  );
+  const approvedBody = destinationPath === approvedDestinationPath
+    ? updatedBody
+    : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);
   const preparedApplication: ImportMoveApplication = {
     kind: "import_move",
     reviewItemId: item.id,
     sourceNotePath: payload.sourceNotePath,
     destination,
     classificationFingerprint,
-    promotedContentHash: hashContents(updatedBody),
+    promotedContentHash: hashContents(approvedBody),
     options,
   };
   await application.onPrepared?.(preparedApplication);
-  await fileOps.mkdir(path.dirname(approvedDestinationPath));
-  await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);
-  await fileOps.writeFile(approvedDestinationPath, updatedBody, true);
+  await secureWriteExclusive(
+    workspaceRoot,
+    approvedDestinationPath,
+    approvedBody,
+    fileOps,
+    application.ioHooks,
+  );
   try {
-    await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-    await fileOps.unlink(sourcePath);
+    await secureUnlinkExisting(
+      workspaceRoot,
+      sourcePath,
+      "staging_unlink",
+      fileOps,
+      application.ioHooks,
+    );
   } catch (error) {
     try {
-      await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath, { mustExist: true });
-      await fileOps.unlink(approvedDestinationPath);
+      await secureUnlinkExisting(
+        workspaceRoot,
+        approvedDestinationPath,
+        "destination_rollback",
+        fileOps,
+      );
     } catch (rollbackError) {
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
       throw new Error(`${error instanceof Error ? error.message : "Failed to remove staging"}; destination rollback failed: ${rollbackMessage}`);
@@ -899,7 +1011,7 @@ async function reconcileImportedMove(
   }
   const destinationPath = assertInsideWorkspace(workspaceRoot, destination);
   await assertRealPathInsideWorkspace(workspaceRoot, destinationPath, { mustExist: true });
-  const destinationBody = (await fileOps.readFile(destinationPath)).toString("utf8");
+  const destinationBody = await secureReadExisting(workspaceRoot, destinationPath, "destination_reconcile");
   if (hashContents(destinationBody) !== previousApplication.promotedContentHash) {
     throw new Error("Promoted import no longer matches the claimed application");
   }
@@ -923,11 +1035,57 @@ function isImportMoveApplication(value: unknown): value is ImportMoveApplication
     && isRecord(value.options);
 }
 
+function isGenericWriteApplication(value: unknown): value is GenericWriteApplication {
+  return isRecord(value)
+    && value.kind === "exclusive_write"
+    && typeof value.reviewItemId === "string"
+    && typeof value.proposalType === "string"
+    && typeof value.destination === "string"
+    && typeof value.promotedContentHash === "string"
+    && isRecord(value.options);
+}
+
 function reviewApplicationIntent(item: ReviewItem, options: ReviewApproveOptions): unknown {
-  if (isImportMoveApplication(item.application)) {
+  if (isImportMoveApplication(item.application) || isGenericWriteApplication(item.application)) {
     return { ...item.application, options };
   }
   return { options };
+}
+
+function genericWriteApplication(
+  item: ReviewItem,
+  destination: string,
+  contents: string,
+  options: ReviewApproveOptions,
+): GenericWriteApplication {
+  return {
+    kind: "exclusive_write",
+    reviewItemId: item.id,
+    proposalType: item.proposalType,
+    destination,
+    promotedContentHash: hashContents(contents),
+    options,
+  };
+}
+
+async function reconcileGenericWrite(
+  workspaceRoot: string,
+  targetPath: string,
+  prepared: GenericWriteApplication,
+  previousApplication: unknown,
+  ioHooks?: IpcServices["reviewIoHooks"],
+): Promise<void> {
+  if (!isGenericWriteApplication(previousApplication)
+    || previousApplication.reviewItemId !== prepared.reviewItemId
+    || previousApplication.proposalType !== prepared.proposalType
+    || previousApplication.destination !== prepared.destination
+    || previousApplication.promotedContentHash !== prepared.promotedContentHash) {
+    throw new Error("Destination already exists");
+  }
+  const existing = await secureReadExisting(workspaceRoot, targetPath, "destination_reconcile", ioHooks);
+  if (hashContents(existing) !== prepared.promotedContentHash) {
+    throw new Error("Existing destination does not match the persisted application");
+  }
 }
 
 function hashContents(contents: string): string {
@@ -998,10 +1156,10 @@ async function rejectImportedSourceNote(
   workspaceRoot: string,
   sourceNotePath: string,
   fileOps: ReviewImportFileOps,
+  ioHooks?: IpcServices["reviewIoHooks"],
 ): Promise<void> {
   const sourcePath = importStagingPath(workspaceRoot, sourceNotePath);
-  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const body = await secureReadExisting(workspaceRoot, sourcePath, "staging_read", ioHooks);
   const document = parseMarkdownDocument(body);
   document.frontmatter = {
     ...document.frontmatter,
@@ -1011,8 +1169,7 @@ async function rejectImportedSourceNote(
   };
   document.content = document.content.replace(/^- Status: .+$/mu, "- Status: rejected");
   const rejectedBody = serializeMarkdownDocument(document);
-  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-  await fileOps.writeFile(sourcePath, rejectedBody, false);
+  await secureRewriteExisting(workspaceRoot, sourcePath, rejectedBody, "staging_rewrite", ioHooks);
 }
 
 async function reconstructImportedSourcePayload(
@@ -1022,7 +1179,7 @@ async function reconstructImportedSourcePayload(
 ): Promise<ImportedSourceNotePayload> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
   await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const body = await secureReadExisting(workspaceRoot, sourcePath, "staging_read");
   const { frontmatter } = parseMarkdownDocument(body);
   const category = contentCategoryFrom(frontmatter.content_category);
   const evidence = frontmatter.classification_evidence ?? [];
@@ -1104,6 +1261,313 @@ function safeReviewDestination(workspaceRoot: string, destination: string): stri
 
 function reviewImportFileOps(services: IpcServices): ReviewImportFileOps {
   return { ...defaultReviewImportFileOps, ...services.reviewImportFileOps };
+}
+
+interface PathIdentity {
+  targetPath: string;
+  parentPath: string;
+  parentRealPath: string;
+  parentDev: number;
+  parentIno: number;
+  fileDev?: number;
+  fileIno?: number;
+}
+
+interface DirectoryIdentity {
+  path: string;
+  realPath: string;
+  dev: number;
+  ino: number;
+}
+
+// Node exposes O_NOFOLLOW but not openat/unlinkat. These checks close deterministic
+// ancestor-swap windows around each operation; an OS-level rename after the final
+// identity check cannot be made fully race-free without directory-relative syscalls.
+async function secureReadExisting(
+  workspaceRoot: string,
+  targetPath: string,
+  operation: string,
+  ioHooks?: IpcServices["reviewIoHooks"],
+): Promise<string> {
+  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
+  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
+  await revalidatePathIdentity(workspaceRoot, identity, true);
+  const handle = await open(
+    targetPath,
+    constants.O_RDONLY | noFollowFlag(),
+  );
+  try {
+    await assertHandleIdentity(handle, identity);
+    await revalidatePathIdentity(workspaceRoot, identity, true);
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function secureRewriteExisting(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string,
+  operation: string,
+  ioHooks?: IpcServices["reviewIoHooks"],
+): Promise<void> {
+  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
+  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
+  await revalidatePathIdentity(workspaceRoot, identity, true);
+  const handle = await open(
+    targetPath,
+    constants.O_WRONLY | noFollowFlag(),
+  );
+  try {
+    await assertHandleIdentity(handle, identity);
+    await revalidatePathIdentity(workspaceRoot, identity, true);
+    await handle.truncate(0);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await revalidatePathIdentity(workspaceRoot, identity, true);
+}
+
+async function secureUnlinkExisting(
+  workspaceRoot: string,
+  targetPath: string,
+  operation: string,
+  fileOps: ReviewImportFileOps,
+  ioHooks?: IpcServices["reviewIoHooks"],
+): Promise<void> {
+  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
+  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
+  await revalidatePathIdentity(workspaceRoot, identity, true);
+  await fileOps.unlink(targetPath);
+}
+
+async function secureWriteExclusive(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string,
+  fileOps: ReviewImportFileOps,
+  ioHooks?: IpcServices["reviewIoHooks"],
+): Promise<void> {
+  const nearestParent = await captureNearestExistingDirectory(workspaceRoot, path.dirname(targetPath));
+  await fileOps.mkdir(path.dirname(targetPath));
+  await revalidateDirectoryIdentity(workspaceRoot, nearestParent);
+  const identity = await capturePathIdentity(workspaceRoot, targetPath, false);
+  await ioHooks?.afterPathSnapshot?.("destination_create", targetPath);
+  await revalidatePathIdentity(workspaceRoot, identity, false);
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let wroteContent = false;
+  try {
+    handle = await open(
+      targetPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(),
+      0o600,
+    );
+    const created = await handle.stat();
+    const createdIdentity: PathIdentity = {
+      ...identity,
+      fileDev: created.dev,
+      fileIno: created.ino,
+    };
+    await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
+    await assertHandleIdentity(handle, createdIdentity);
+    await handle.writeFile(contents, "utf8");
+    wroteContent = true;
+    await handle.sync();
+    await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
+  } catch (error) {
+    if (handle && !wroteContent) {
+      await removeVerifiedEmptyCreatedFile(workspaceRoot, targetPath, handle).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function captureNearestExistingDirectory(
+  workspaceRoot: string,
+  targetDirectory: string,
+): Promise<DirectoryIdentity> {
+  const normalizedDirectory = assertInsideWorkspace(workspaceRoot, targetDirectory);
+  await assertNoSymlinkAncestors(workspaceRoot, normalizedDirectory);
+  let current = normalizedDirectory;
+  while (true) {
+    try {
+      const entry = await lstat(current);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new Error("Path resolves outside workspace");
+      }
+      const realPath = await realpath(current);
+      await assertCanonicalInsideWorkspace(workspaceRoot, realPath);
+      return { path: current, realPath, dev: entry.dev, ino: entry.ino };
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      current = parent;
+    }
+  }
+}
+
+async function revalidateDirectoryIdentity(
+  workspaceRoot: string,
+  identity: DirectoryIdentity,
+): Promise<void> {
+  await assertNoSymlinkAncestors(workspaceRoot, identity.path);
+  const entry = await lstat(identity.path);
+  const realPath = await realpath(identity.path);
+  if (
+    !entry.isDirectory()
+    || entry.isSymbolicLink()
+    || entry.dev !== identity.dev
+    || entry.ino !== identity.ino
+    || realPath !== identity.realPath
+  ) {
+    throw new Error("Path identity changed during secure IO");
+  }
+}
+
+async function capturePathIdentity(
+  workspaceRoot: string,
+  targetPath: string,
+  includeFile: boolean,
+): Promise<PathIdentity> {
+  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
+  await assertNoSymlinkAncestors(workspaceRoot, includeFile ? normalizedTarget : path.dirname(normalizedTarget));
+  const parentPath = path.dirname(normalizedTarget);
+  const parent = await lstat(parentPath);
+  if (!parent.isDirectory() || parent.isSymbolicLink()) {
+    throw new Error("Path resolves outside workspace");
+  }
+  const parentRealPath = await realpath(parentPath);
+  await assertCanonicalInsideWorkspace(workspaceRoot, parentRealPath);
+  const identity: PathIdentity = {
+    targetPath: normalizedTarget,
+    parentPath,
+    parentRealPath,
+    parentDev: parent.dev,
+    parentIno: parent.ino,
+  };
+  if (includeFile) {
+    const file = await lstat(normalizedTarget);
+    if (!file.isFile() || file.isSymbolicLink()) {
+      throw new Error("Path resolves outside workspace");
+    }
+    identity.fileDev = file.dev;
+    identity.fileIno = file.ino;
+    await assertRealPathInsideWorkspace(workspaceRoot, normalizedTarget, { mustExist: true });
+  }
+  return identity;
+}
+
+async function assertCanonicalInsideWorkspace(workspaceRoot: string, canonicalPath: string): Promise<void> {
+  const canonicalRoot = await realpath(workspaceRoot);
+  const relative = path.relative(canonicalRoot, canonicalPath);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Path resolves outside workspace");
+  }
+}
+
+async function revalidatePathIdentity(
+  workspaceRoot: string,
+  identity: PathIdentity,
+  includeFile: boolean,
+): Promise<void> {
+  await assertNoSymlinkAncestors(workspaceRoot, includeFile ? identity.targetPath : identity.parentPath);
+  const parent = await lstat(identity.parentPath);
+  const parentRealPath = await realpath(identity.parentPath);
+  if (
+    !parent.isDirectory()
+    || parent.isSymbolicLink()
+    || parent.dev !== identity.parentDev
+    || parent.ino !== identity.parentIno
+    || parentRealPath !== identity.parentRealPath
+  ) {
+    throw new Error("Path identity changed during secure IO");
+  }
+  if (includeFile) {
+    const file = await lstat(identity.targetPath);
+    if (
+      !file.isFile()
+      || file.isSymbolicLink()
+      || file.dev !== identity.fileDev
+      || file.ino !== identity.fileIno
+    ) {
+      throw new Error("Path identity changed during secure IO");
+    }
+    await assertRealPathInsideWorkspace(workspaceRoot, identity.targetPath, { mustExist: true });
+  }
+}
+
+async function assertHandleIdentity(
+  handle: Awaited<ReturnType<typeof open>>,
+  identity: PathIdentity,
+): Promise<void> {
+  const file = await handle.stat();
+  if (!file.isFile() || file.dev !== identity.fileDev || file.ino !== identity.fileIno) {
+    throw new Error("Path identity changed during secure IO");
+  }
+}
+
+async function assertNoSymlinkAncestors(workspaceRoot: string, targetPath: string): Promise<void> {
+  const root = path.resolve(workspaceRoot);
+  const target = assertInsideWorkspace(root, targetPath);
+  const relative = path.relative(root, target);
+  let current = root;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink()) {
+        throw new Error("Path resolves outside workspace");
+      }
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+  }
+}
+
+async function removeVerifiedEmptyCreatedFile(
+  workspaceRoot: string,
+  targetPath: string,
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<void> {
+  const opened = await handle.stat();
+  if (opened.size !== 0) {
+    return;
+  }
+  const canonicalPath = await realpath(targetPath);
+  const canonical = await lstat(canonicalPath);
+  if (
+    canonical.isSymbolicLink()
+    || canonical.dev !== opened.dev
+    || canonical.ino !== opened.ino
+    || canonical.size !== 0
+  ) {
+    return;
+  }
+  const canonicalRoot = await realpath(workspaceRoot);
+  const relative = path.relative(canonicalRoot, canonicalPath);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    await unlink(canonicalPath);
+    return;
+  }
+  await unlink(canonicalPath);
+}
+
+function noFollowFlag(): number {
+  return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
 }
 
 const defaultReviewImportFileOps: ReviewImportFileOps = {

@@ -1,6 +1,7 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   appendMessage,
@@ -9,8 +10,10 @@ import {
   getReviewItem,
   latestMigrationVersion,
   openAppDatabase,
+  renewReviewItemClaim,
   searchNotes,
   searchSessions,
+  transitionClaimedReviewItem,
   type AppDatabase,
   type ReviewItem,
 } from "../src/index";
@@ -64,6 +67,53 @@ describe("migrations", () => {
       .all()
       .map((row) => (row as { name: string }).name);
     expect(reviewColumns).toEqual(expect.arrayContaining(["claim_token", "claim_started_at", "application_json"]));
+  });
+
+  it("keeps checked-in schema.sql synchronized with Review claim columns", async () => {
+    const schemaFile = await readFile(new URL("../src/schema.sql", import.meta.url), "utf8");
+    expect(schemaFile).toContain("claim_token TEXT");
+    expect(schemaFile).toContain("claim_started_at TEXT");
+    expect(schemaFile).toContain("application_json TEXT");
+  });
+
+  it("migrates a version 1 Review table to durable claim storage", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kb-agent-db-v1-"));
+    const dbPath = path.join(dir, "index.sqlite");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE review_items (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        risk TEXT NOT NULL,
+        proposal_type TEXT NOT NULL,
+        target_path TEXT,
+        payload_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        source_session_id TEXT NOT NULL,
+        source_turn_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        applied_at TEXT,
+        superseded_by TEXT,
+        failure_reason TEXT
+      );
+    `);
+    legacy.pragma("user_version = 1");
+    legacy.close();
+
+    const migrated = openAppDatabase(dbPath);
+    opened.push(migrated);
+    const columns = migrated.sqlite
+      .prepare("PRAGMA table_info(review_items)")
+      .all()
+      .map((row) => (row as { name: string }).name);
+    expect(columns).toEqual(expect.arrayContaining(["claim_token", "claim_started_at", "application_json"]));
+    expect(migrated.sqlite.pragma("user_version", { simple: true })).toBe(2);
   });
 
   it("cascades workspace-owned runtime records", async () => {
@@ -169,7 +219,105 @@ describe("Review item claims", () => {
       }),
     );
   });
+
+  it("prevents an expired applying worker from completing after takeover", async () => {
+    const db = await openTempDb();
+    const item = await insertClaimableReview(db, "review-stale-apply");
+    await claimReviewItem(db, item.id, {
+      from: ["proposed"],
+      to: "applying",
+      token: "old-worker",
+      startedAt: "2000-01-01T00:00:00.000Z",
+    });
+    await expect(claimReviewItem(db, item.id, {
+      from: ["failed"],
+      to: "applying",
+      token: "new-worker",
+      startedAt: "2026-07-29T00:00:00.000Z",
+      staleBefore: "2026-07-28T00:00:00.000Z",
+      staleClaimToken: "wrong-worker",
+    })).resolves.toBe(false);
+    await expect(claimReviewItem(db, item.id, {
+      from: ["failed"],
+      to: "applying",
+      token: "new-worker",
+      startedAt: "2026-07-29T00:00:00.000Z",
+      staleBefore: "2026-07-28T00:00:00.000Z",
+      staleClaimToken: "old-worker",
+    })).resolves.toBe(true);
+
+    await expect(transitionClaimedReviewItem(
+      db,
+      item.id,
+      "applying",
+      "applied",
+      "old-worker",
+    )).rejects.toThrow("Review claim was lost");
+    await expect(renewReviewItemClaim(db, item.id, "applying", "old-worker", new Date().toISOString())).resolves.toBe(false);
+    await expect(getReviewItem(db, item.id)).resolves.toEqual(
+      expect.objectContaining({ state: "applying", claimToken: "new-worker" }),
+    );
+    await expect(transitionClaimedReviewItem(
+      db,
+      item.id,
+      "applying",
+      "applied",
+      "new-worker",
+    )).resolves.toBeUndefined();
+  });
+
+  it("prevents an expired rejecting worker from completing after takeover", async () => {
+    const db = await openTempDb();
+    const item = await insertClaimableReview(db, "review-stale-reject");
+    await claimReviewItem(db, item.id, {
+      from: ["proposed"],
+      to: "rejecting",
+      token: "old-rejecter",
+      startedAt: "2000-01-01T00:00:00.000Z",
+    });
+    await expect(claimReviewItem(db, item.id, {
+      from: ["failed"],
+      to: "rejecting",
+      token: "new-rejecter",
+      startedAt: "2026-07-29T00:00:00.000Z",
+      staleBefore: "2026-07-28T00:00:00.000Z",
+      staleClaimToken: "old-rejecter",
+    })).resolves.toBe(true);
+
+    await expect(transitionClaimedReviewItem(
+      db,
+      item.id,
+      "rejecting",
+      "rejected",
+      "old-rejecter",
+    )).rejects.toThrow("Review claim was lost");
+    await expect(getReviewItem(db, item.id)).resolves.toEqual(
+      expect.objectContaining({ state: "rejecting", claimToken: "new-rejecter" }),
+    );
+  });
 });
+
+async function insertClaimableReview(db: AppDatabase, id: string): Promise<ReviewItem> {
+  const now = new Date().toISOString();
+  const workspaceId = `workspace-${id}`;
+  db.sqlite
+    .prepare("INSERT INTO workspaces (id, root_path, created_at, updated_at) VALUES (?, ?, ?, ?)")
+    .run(workspaceId, `/tmp/${workspaceId}`, now, now);
+  const item: ReviewItem = {
+    id,
+    workspaceId,
+    state: "proposed",
+    risk: "high",
+    proposalType: "propose_create_note",
+    payload: { path: "Note.md", body: "body" },
+    reason: "test",
+    sourceSessionId: "session",
+    sourceTurnId: "turn",
+    createdAt: now,
+  };
+  await createReviewItem(db, item);
+  return item;
+}
 
 describe("search", () => {
   it("finds English and Chinese notes and sessions", async () => {
