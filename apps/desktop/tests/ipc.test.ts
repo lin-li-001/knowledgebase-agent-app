@@ -888,6 +888,81 @@ January bill.
     });
   });
 
+  it("keeps the applied destination when an old worker resumes before staging unlink", async () => {
+    const setup = await setupImportedReview();
+    const oldWorkerPaused = deferred<void>();
+    const releaseOldWorker = deferred<void>();
+    let unlinkSnapshots = 0;
+    setup.services.reviewIoHooks = {
+      afterPathSnapshot: async (operation) => {
+        if (operation !== "staging_unlink") {
+          return;
+        }
+        unlinkSnapshots += 1;
+        if (unlinkSnapshots === 1) {
+          oldWorkerPaused.resolve();
+          await releaseOldWorker.promise;
+        }
+      },
+    };
+    const destination = "04-Resources/Approved/Utility Bill.md";
+    const request = {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource" as const,
+    };
+
+    const oldWorker = handleIpcRequest(setup.services, "review:approve", request);
+    await oldWorkerPaused.promise;
+    setup.services.db?.sqlite
+      .prepare("UPDATE review_items SET claim_started_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", "review-import-source-note");
+    await expect(handleIpcRequest(setup.services, "review:approve", request)).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    const appliedBody = await readFile(path.join(setup.root, destination), "utf8");
+
+    releaseOldWorker.resolve();
+    await expect(oldWorker).resolves.toEqual({ ok: false, error: "Review claim was lost" });
+    await expect(readFile(path.join(setup.root, destination), "utf8")).resolves.toBe(appliedBody);
+    await expect(handleIpcRequest(setup.services, "review:list", {})).resolves.toEqual(
+      expect.objectContaining({
+        data: expect.arrayContaining([
+          expect.objectContaining({ id: "review-import-source-note", state: "applied" }),
+        ]),
+      }),
+    );
+  });
+
+  it("does not roll back a replacement destination inode", async () => {
+    const setup = await setupImportedReview();
+    const destination = "04-Resources/Approved/Utility Bill.md";
+    const destinationPath = path.join(setup.root, destination);
+    const replacement = "replacement destination owned by another worker";
+    setup.services.reviewImportFileOps = {
+      unlink: async (targetPath) => {
+        if (targetPath === path.join(setup.root, setup.sourceNotePath)) {
+          await unlink(destinationPath);
+          await writeFile(destinationPath, replacement, "utf8");
+          throw new Error("staging unlink failed after replacement");
+        }
+        await unlink(targetPath);
+      },
+    };
+
+    await expect(handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining("Destination identity changed before rollback"),
+    });
+    await expect(readFile(destinationPath, "utf8")).resolves.toBe(replacement);
+    await expect(readFile(path.join(setup.root, setup.sourceNotePath), "utf8")).resolves.toContain("pending_review");
+  });
+
   it("blocks a reviewed import collision during approval and preserves the staged authority", async () => {
     const existingDestination = activeResourceNote("Existing Utility Bill");
     const { root, services, sourceNotePath, destination } = await setupImportedReview({ existingDestination });
@@ -1504,6 +1579,49 @@ January bill.
     });
     const rejected = await parseMarkdownNote(path.join(root, sourceNotePath));
     expect(rejected.frontmatter.status).toBe("rejected");
+  });
+
+  it("prevents an old rejecter from overwriting body B after takeover", async () => {
+    const setup = await setupImportedReview();
+    const oldWorkerPaused = deferred<void>();
+    const releaseOldWorker = deferred<void>();
+    let rewriteSnapshots = 0;
+    setup.services.reviewIoHooks = {
+      afterPathSnapshot: async (operation) => {
+        if (operation !== "staging_rewrite") {
+          return;
+        }
+        rewriteSnapshots += 1;
+        if (rewriteSnapshots === 1) {
+          oldWorkerPaused.resolve();
+          await releaseOldWorker.promise;
+        }
+      },
+    };
+
+    const oldWorker = handleIpcRequest(setup.services, "review:reject", {
+      id: "review-import-source-note",
+    });
+    await oldWorkerPaused.promise;
+    setup.services.db?.sqlite
+      .prepare("UPDATE review_items SET claim_started_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", "review-import-source-note");
+    const stagedPath = path.join(setup.root, setup.sourceNotePath);
+    const bodyB = (await readFile(stagedPath, "utf8"))
+      .replace("Electric bill January 2026.", "Body B from the takeover.");
+    await writeFile(stagedPath, bodyB, "utf8");
+
+    await expect(handleIpcRequest(setup.services, "review:reject", {
+      id: "review-import-source-note",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "rejected" },
+    });
+    releaseOldWorker.resolve();
+    await expect(oldWorker).resolves.toEqual({ ok: false, error: "Review claim was lost" });
+    const finalBody = await readFile(stagedPath, "utf8");
+    expect(finalBody).toContain("Body B from the takeover.");
+    expect(finalBody).not.toContain("Electric bill January 2026.");
   });
 
   it("applies approved decision proposals to the workspace decision folder", async () => {

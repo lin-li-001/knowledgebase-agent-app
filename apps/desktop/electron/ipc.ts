@@ -12,6 +12,7 @@ import {
   openAppDatabase,
   recordActivity,
   recordActivityOnce,
+  renewReviewItemClaim,
   searchNotes,
   searchSessions,
   transitionClaimedReviewItem,
@@ -521,6 +522,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
           await updateReviewItemApplication(db, id, claimToken, application);
         },
         ioHooks: services.reviewIoHooks,
+        claimFence: reviewClaimFence(db, id, "applying", claimToken),
       });
       await services.reviewApplyHooks?.afterPromotion?.(id);
     } catch (error) {
@@ -661,6 +663,7 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
         item.payload.sourceNotePath,
         reviewImportFileOps(services),
         services.reviewIoHooks,
+        reviewClaimFence(db, id, "rejecting", claimToken),
       );
     }
     await transitionClaimedReviewItem(db, id, "rejecting", "rejected", claimToken);
@@ -687,6 +690,26 @@ async function reviewClaimConflict(db: AppDatabase, id: string): Promise<IpcResu
     return { ok: false, error: "Review item is currently rejecting" };
   }
   return { ok: false, error: `Review item is already ${current?.state ?? "missing"}` };
+}
+
+function reviewClaimFence(
+  db: AppDatabase,
+  id: string,
+  state: "applying" | "rejecting",
+  claimToken: string,
+): () => Promise<void> {
+  return async () => {
+    const renewed = await renewReviewItemClaim(
+      db,
+      id,
+      state,
+      claimToken,
+      new Date().toISOString(),
+    );
+    if (!renewed) {
+      throw new Error("Review claim was lost");
+    }
+  };
 }
 
 async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Promise<void> {
@@ -734,6 +757,7 @@ async function applyKnowledgeProposal(
     previousApplication?: unknown;
     onPrepared?(application: ReviewWriteApplication): Promise<void>;
     ioHooks?: IpcServices["reviewIoHooks"];
+    claimFence?: () => Promise<void>;
   } = {},
 ): Promise<string> {
   if (item.proposalType === "propose_create_note") {
@@ -866,6 +890,7 @@ async function moveImportedSourceNote(
     previousApplication?: unknown;
     onPrepared?(application: ReviewWriteApplication): Promise<void>;
     ioHooks?: IpcServices["reviewIoHooks"];
+    claimFence?: () => Promise<void>;
   },
 ): Promise<string> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
@@ -925,6 +950,7 @@ async function moveImportedSourceNote(
       "staging_unlink",
       fileOps,
       application.ioHooks,
+      application.claimFence,
     );
     return destination;
   }
@@ -960,7 +986,7 @@ async function moveImportedSourceNote(
     options,
   };
   await application.onPrepared?.(preparedApplication);
-  await secureWriteExclusive(
+  const createdDestination = await secureWriteExclusive(
     workspaceRoot,
     approvedDestinationPath,
     approvedBody,
@@ -974,6 +1000,7 @@ async function moveImportedSourceNote(
       "staging_unlink",
       fileOps,
       application.ioHooks,
+      application.claimFence,
     );
   } catch (error) {
     try {
@@ -982,6 +1009,9 @@ async function moveImportedSourceNote(
         approvedDestinationPath,
         "destination_rollback",
         fileOps,
+        undefined,
+        application.claimFence,
+        createdDestination,
       );
     } catch (rollbackError) {
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
@@ -1157,6 +1187,7 @@ async function rejectImportedSourceNote(
   sourceNotePath: string,
   fileOps: ReviewImportFileOps,
   ioHooks?: IpcServices["reviewIoHooks"],
+  claimFence?: () => Promise<void>,
 ): Promise<void> {
   const sourcePath = importStagingPath(workspaceRoot, sourceNotePath);
   const body = await secureReadExisting(workspaceRoot, sourcePath, "staging_read", ioHooks);
@@ -1169,7 +1200,14 @@ async function rejectImportedSourceNote(
   };
   document.content = document.content.replace(/^- Status: .+$/mu, "- Status: rejected");
   const rejectedBody = serializeMarkdownDocument(document);
-  await secureRewriteExisting(workspaceRoot, sourcePath, rejectedBody, "staging_rewrite", ioHooks);
+  await secureRewriteExisting(
+    workspaceRoot,
+    sourcePath,
+    rejectedBody,
+    "staging_rewrite",
+    ioHooks,
+    claimFence,
+  );
 }
 
 async function reconstructImportedSourcePayload(
@@ -1311,6 +1349,7 @@ async function secureRewriteExisting(
   contents: string,
   operation: string,
   ioHooks?: IpcServices["reviewIoHooks"],
+  claimFence?: () => Promise<void>,
 ): Promise<void> {
   const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
   await ioHooks?.afterPathSnapshot?.(operation, targetPath);
@@ -1322,6 +1361,9 @@ async function secureRewriteExisting(
   try {
     await assertHandleIdentity(handle, identity);
     await revalidatePathIdentity(workspaceRoot, identity, true);
+    // Node cannot atomically couple rename() to the SQLite claim CAS. Renewing
+    // immediately before mutating the verified open inode avoids that rename gap.
+    await claimFence?.();
     await handle.truncate(0);
     await handle.writeFile(contents, "utf8");
     await handle.sync();
@@ -1337,10 +1379,16 @@ async function secureUnlinkExisting(
   operation: string,
   fileOps: ReviewImportFileOps,
   ioHooks?: IpcServices["reviewIoHooks"],
+  claimFence?: () => Promise<void>,
+  expectedIdentity?: PathIdentity,
 ): Promise<void> {
   const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
+  if (expectedIdentity && !samePathIdentity(identity, expectedIdentity)) {
+    throw new Error("Destination identity changed before rollback");
+  }
   await ioHooks?.afterPathSnapshot?.(operation, targetPath);
   await revalidatePathIdentity(workspaceRoot, identity, true);
+  await claimFence?.();
   await fileOps.unlink(targetPath);
 }
 
@@ -1350,7 +1398,7 @@ async function secureWriteExclusive(
   contents: string,
   fileOps: ReviewImportFileOps,
   ioHooks?: IpcServices["reviewIoHooks"],
-): Promise<void> {
+): Promise<PathIdentity> {
   const nearestParent = await captureNearestExistingDirectory(workspaceRoot, path.dirname(targetPath));
   await fileOps.mkdir(path.dirname(targetPath));
   await revalidateDirectoryIdentity(workspaceRoot, nearestParent);
@@ -1360,6 +1408,7 @@ async function secureWriteExclusive(
 
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let wroteContent = false;
+  let createdIdentity: PathIdentity | undefined;
   try {
     handle = await open(
       targetPath,
@@ -1367,7 +1416,7 @@ async function secureWriteExclusive(
       0o600,
     );
     const created = await handle.stat();
-    const createdIdentity: PathIdentity = {
+    createdIdentity = {
       ...identity,
       fileDev: created.dev,
       fileIno: created.ino,
@@ -1386,6 +1435,19 @@ async function secureWriteExclusive(
   } finally {
     await handle?.close().catch(() => undefined);
   }
+  if (!createdIdentity) {
+    throw new Error("Destination identity was not captured");
+  }
+  return createdIdentity;
+}
+
+function samePathIdentity(left: PathIdentity, right: PathIdentity): boolean {
+  return left.targetPath === right.targetPath
+    && left.parentRealPath === right.parentRealPath
+    && left.parentDev === right.parentDev
+    && left.parentIno === right.parentIno
+    && left.fileDev === right.fileDev
+    && left.fileIno === right.fileIno;
 }
 
 async function captureNearestExistingDirectory(
