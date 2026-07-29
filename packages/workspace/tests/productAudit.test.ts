@@ -242,7 +242,7 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
   it("fails when an importer final write is not structurally gated on auto_write", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = importsSource.replace("if (status === \"auto_written\")", "if (status === \"unsafe\")");
+    const brokenImportsSource = importsSource.replace("if (safetyDecision.decision === \"auto_write\")", "if (safetyDecision.decision !== \"auto_write\")");
 
     const result = await auditProductContracts({
       repoRoot,
@@ -255,7 +255,7 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
   it("rejects an executable importer decoy when the real promotion writer is ungated", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = `${importsSource.replace("if (status === \"auto_written\")", "if (status === \"unsafe\")")}
+    const brokenImportsSource = `${importsSource.replace("if (safetyDecision.decision === \"auto_write\")", "if (safetyDecision.decision !== \"auto_write\")")}
 async function decoyPromotion(fileOps: ImportFileOps) {
   const workspaceRoot = "/workspace";
   const routed: RoutedDocument = {
@@ -279,8 +279,7 @@ async function decoyPromotion(fileOps: ImportFileOps) {
     autoWriteThreshold: 0.95,
     classification: routed.classification,
   });
-  const status = artifactStatusFor(safetyDecision);
-  if (status === "auto_written") {
+  if (safetyDecision.decision === "auto_write") {
     const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
     await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
   }
@@ -343,13 +342,49 @@ async function decoyReviewPromotion(
     expect(result.failures).toContain("final import writer does not call the Safety Kernel: apps/desktop/electron/ipc.ts");
   });
 
+  it("rejects an inverted Review auto_write equality guard", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = reviewSource.replace(
+      /safetyDecision\.decision !== "auto_write"(?: \|\| safetyDecision\.allowedDestination === undefined)?/u,
+      'safetyDecision.decision === "auto_write"',
+    );
+
+    expect(brokenReviewSource).toContain('if (safetyDecision.decision === "auto_write")');
+    expectSourceOverrideToCompile(reviewPath, brokenReviewSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: apps/desktop/electron/ipc.ts");
+  });
+
+  it("rejects a Review guard whose throw is conditional and nested", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = reviewSource.replace(
+      /  if \(safetyDecision\.decision !== "auto_write"(?: \|\| safetyDecision\.allowedDestination === undefined)?\) \{\n    (throw new Error\(`Import approval \$\{safetyDecision\.decision\}: \$\{safetyDecision\.reasonCodes\.join\(", "\)\}`\);)\n  \}/u,
+      "  if (safetyDecision.decision !== \"auto_write\") {\n    if (item.id === \"nested\") {\n      $1\n    }\n  }",
+    );
+
+    expect(brokenReviewSource).toContain('if (item.id === "nested")');
+    expectSourceOverrideToCompile(reviewPath, brokenReviewSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: apps/desktop/electron/ipc.ts");
+  });
+
   it("rejects a second unconditional importer promotion write", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
     const brokenImportsSource = importsSource
       .replace(
-        "  if (status === \"auto_written\") {\n    const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);",
-        "  const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);\n  if (status === \"auto_written\") {",
+        "  if (safetyDecision.decision === \"auto_write\") {\n    const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);",
+        "  const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);\n  if (safetyDecision.decision === \"auto_write\") {",
       )
       .replace(
         "\n  return {\n    sourceFile: document.fileName,\n    attachmentPath: document.attachmentRelativePath,\n    notePath,",
@@ -370,8 +405,11 @@ async function decoyReviewPromotion(
     const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
     const reviewSource = await readFile(reviewPath, "utf8");
     const brokenReviewSource = reviewSource.replace(
-      `  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+      `  if (safetyDecision.decision !== "auto_write") {
     throw new Error(\`Import approval \${safetyDecision.decision}: \${safetyDecision.reasonCodes.join(", ")}\`);
+  }
+  if (safetyDecision.allowedDestination === undefined) {
+    throw new Error("Import approval is missing an allowed destination");
   }
 
   const approvedDestinationPath = safetyDecision.allowedDestination;
@@ -384,8 +422,11 @@ async function decoyReviewPromotion(
     ? updatedBody
     : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);
   await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);
-  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+  if (safetyDecision.decision !== "auto_write") {
     throw new Error(\`Import approval \${safetyDecision.decision}: \${safetyDecision.reasonCodes.join(", ")}\`);
+  }
+  if (safetyDecision.allowedDestination === undefined) {
+    throw new Error("Import approval is missing an allowed destination");
   }
 
   await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);`,
@@ -481,7 +522,35 @@ async function decoyReviewPromotion(
       sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
     });
 
-    expect(result.failures).toContain("import routing source declares a Review bypass field: bypassReview");
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails for property access using the Review bypass identifier", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst unsafeRule: Record<string, boolean> = {};\nunsafeRule.skipReview = true;\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails for scoped const bypass keys without alias resolution", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\n{ const firstKey = "skipReview"; void firstKey; }\n{ const secondKey = "skipReview"; void secondKey; }\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
   });
 
   it("fails when aliases, spreads, or string-key access carry a Review bypass", async () => {
@@ -542,6 +611,23 @@ void shouldSkipDirectory(".app");
     const brokenIndexerSource = indexerSource.replace(
       "      if (shouldSkipDirectory(entry.name)) {\n        continue;\n      }",
       "      shouldSkipDirectory(entry.name);",
+    );
+
+    expectSourceOverrideToCompile(indexerPath, brokenIndexerSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
+    });
+
+    expect(result.failures).toContain("indexer does not exclude runtime staging from indexing");
+  });
+
+  it("rejects a staging guard whose continue belongs to an inner loop", async () => {
+    const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
+    const indexerSource = await readFile(indexerPath, "utf8");
+    const brokenIndexerSource = indexerSource.replace(
+      "      if (shouldSkipDirectory(entry.name)) {\n        continue;\n      }",
+      "      if (shouldSkipDirectory(entry.name)) {\n        for (const ignored of [entry.name]) {\n          continue;\n        }\n      }",
     );
 
     expectSourceOverrideToTypecheck(indexerPath, brokenIndexerSource);

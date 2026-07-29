@@ -967,8 +967,11 @@ async function moveImportedSourceNote(
       classificationFingerprint,
     },
   });
-  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+  if (safetyDecision.decision !== "auto_write") {
     throw new Error(`Import approval ${safetyDecision.decision}: ${safetyDecision.reasonCodes.join(", ")}`);
+  }
+  if (safetyDecision.allowedDestination === undefined) {
+    throw new Error("Import approval is missing an allowed destination");
   }
 
   const approvedDestinationPath = safetyDecision.allowedDestination;

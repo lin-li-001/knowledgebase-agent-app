@@ -189,7 +189,7 @@ async function persistSourceNote(
   await fileOps.writeFile(stagingTargetPath, rendered, true);
   createdArtifacts.add(stagingTargetPath);
 
-  if (status === "auto_written") {
+  if (safetyDecision.decision === "auto_write") {
     const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
     try {
       await fileOps.mkdir(path.dirname(finalTargetPath));

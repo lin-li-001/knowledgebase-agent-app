@@ -144,7 +144,7 @@ async function auditImportSafetyKernel(repoRoot: string, sourceOverrides: Map<st
   auditReviewSafetyKernel(reviewPath, reviewSource, result);
 }
 
-// These checks bind named safety data flow to every final write in the local writer function.
+// These checks accept only explicit Safety Kernel control-flow shapes around final writes.
 // They cannot prove behavior through dynamic dispatch, runtime code generation, or aliased module imports.
 function auditImporterSafetyKernel(relativePath: string, source: string, result: ProductAuditResult): void {
   const sourceFile = ts.createSourceFile(relativePath, source, ts.ScriptTarget.Latest, true);
@@ -154,11 +154,11 @@ function auditImporterSafetyKernel(relativePath: string, source: string, result:
   }
 
   const promotionWriters = writerFunctions(sourceFile, isFinalImportPromotionWrite);
-  if (!promotionWriters.length || !promotionWriters.every(({ declaration }) => functionContains(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety")))) {
+  if (!promotionWriters.length || !promotionWriters.every(({ declaration }) => functionContains(declaration, isSafetyKernelCall))) {
     result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!promotionWriters.every(({ declaration, writes }) => writes.every((write) => hasImporterAutoWriteGate(declaration, write)))) {
+  if (!promotionWriters.every(({ declaration, writes }) => writes.every((write) => hasAcceptedAutoWriteShape(declaration, write)))) {
     result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
     return;
   }
@@ -173,11 +173,11 @@ function auditReviewSafetyKernel(relativePath: string, source: string, result: P
   }
 
   const reviewWriters = writerFunctions(sourceFile, isReviewImportPromotionWrite);
-  if (!reviewWriters.length || !reviewWriters.every(({ declaration }) => functionContains(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety")))) {
+  if (!reviewWriters.length || !reviewWriters.every(({ declaration }) => functionContains(declaration, isSafetyKernelCall))) {
     result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!reviewWriters.every(({ declaration, writes }) => writes.every((write) => hasReviewAutoWriteGate(declaration, write)))) {
+  if (!reviewWriters.every(({ declaration, writes }) => writes.every((write) => hasAcceptedAutoWriteShape(declaration, write)))) {
     result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
     return;
   }
@@ -196,27 +196,62 @@ function importsNamedBinding(sourceFile: ts.SourceFile, moduleSpecifier: string,
   });
 }
 
-function hasImporterAutoWriteGate(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
-  const safetyDecision = findNodeInFunction(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety"));
-  const status = findNodeInFunction(declaration, (node) => isVariableCall(node, "status", "artifactStatusFor", "safetyDecision"));
-  const guards = nodesInFunction(declaration).filter((node): node is ts.IfStatement => ts.isIfStatement(node)
-    && isEqualityWithString(node.expression, "status", "auto_written")
-    && nodeContains(finalWrite, node.thenStatement));
-  return safetyDecision !== undefined
-    && status !== undefined
-    && safetyDecision.end < status.pos
-    && status.end < finalWrite.pos
-    && guards.some((guard) => status.end < guard.pos && guard.pos < finalWrite.pos);
+function isSafetyKernelCall(node: ts.Node): boolean {
+  return ts.isCallExpression(node) && calledName(node) === "evaluateImportSafety";
 }
 
-function hasReviewAutoWriteGate(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
-  const safetyDecision = findNodeInFunction(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety"));
-  const gates = nodesInFunction(declaration).filter((node): node is ts.IfStatement => ts.isIfStatement(node)
-    && isReviewAutoWriteGuard(node.expression)
-    && containsOutsideNestedFunctions(node.thenStatement, ts.isThrowStatement));
-  return safetyDecision !== undefined
-    && safetyDecision.end < finalWrite.pos
-    && gates.some((gate) => safetyDecision.end < gate.pos && isStatementAfter(gate, finalWrite, declaration));
+function hasAcceptedAutoWriteShape(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
+  return isInsideAutoWriteBranch(declaration, finalWrite) || isAfterTerminatingAutoWriteGuard(declaration, finalWrite);
+}
+
+function isInsideAutoWriteBranch(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
+  let current: ts.Node | undefined = finalWrite;
+  while (current !== undefined && current !== declaration) {
+    const parent: ts.Node = current.parent;
+    if (ts.isIfStatement(parent)
+      && parent.thenStatement === current
+      && isExactSafetyDecisionComparison(parent.expression, ts.SyntaxKind.EqualsEqualsEqualsToken)) {
+      return true;
+    }
+    current = parent;
+  }
+  return false;
+}
+
+function isAfterTerminatingAutoWriteGuard(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
+  let current: ts.Node | undefined = finalWrite;
+  while (current !== undefined && current !== declaration) {
+    const block = current.parent;
+    if (ts.isBlock(block) && ts.isStatement(current)) {
+      const statementIndex = block.statements.indexOf(current);
+      if (block.statements.slice(0, statementIndex).some((statement) => ts.isIfStatement(statement)
+        && isExactSafetyDecisionComparison(statement.expression, ts.SyntaxKind.ExclamationEqualsEqualsToken)
+        && terminatesDirectly(statement.thenStatement))) {
+        return true;
+      }
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
+function isExactSafetyDecisionComparison(expression: ts.Expression, operator: ts.SyntaxKind): boolean {
+  return ts.isBinaryExpression(expression)
+    && expression.operatorToken.kind === operator
+    && ts.isPropertyAccessExpression(expression.left)
+    && isIdentifierNamed(expression.left.expression, "safetyDecision")
+    && expression.left.name.text === "decision"
+    && ts.isStringLiteral(expression.right)
+    && expression.right.text === "auto_write";
+}
+
+function terminatesDirectly(statement: ts.Statement): boolean {
+  if (ts.isThrowStatement(statement) || ts.isReturnStatement(statement)) {
+    return true;
+  }
+  return ts.isBlock(statement)
+    && statement.statements.length > 0
+    && statement.statements.every((child) => ts.isThrowStatement(child) || ts.isReturnStatement(child));
 }
 
 function isFinalImportPromotionWrite(node: ts.Node): boolean {
@@ -267,39 +302,11 @@ function isPropertyAccessNamed(node: ts.Node | undefined, receiver: string, prop
     && node.name.text === property;
 }
 
-function isVariableCall(node: ts.Node, variableName: string, callName: string, argumentName?: string): boolean {
-  if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || node.name.text !== variableName || !node.initializer || !ts.isCallExpression(node.initializer)) {
-    return false;
-  }
-  return calledName(node.initializer) === callName
-    && (argumentName === undefined || node.initializer.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === argumentName));
-}
-
-function isEqualityWithString(expression: ts.Expression, identifier: string, value: string): boolean {
-  if (!ts.isBinaryExpression(expression) || (expression.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken && expression.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsToken)) {
-    return false;
-  }
-  return (ts.isIdentifier(expression.left) && expression.left.text === identifier && ts.isStringLiteral(expression.right) && expression.right.text === value)
-    || (ts.isIdentifier(expression.right) && expression.right.text === identifier && ts.isStringLiteral(expression.left) && expression.left.text === value);
-}
-
-function isReviewAutoWriteGuard(expression: ts.Expression): boolean {
-  return sourceContains(expression, (node) => ts.isStringLiteral(node) && node.text === "auto_write")
-    && sourceContains(expression, (node) => ts.isPropertyAccessExpression(node)
-      && ts.isIdentifier(node.expression)
-      && node.expression.text === "safetyDecision"
-      && node.name.text === "decision");
-}
-
 function calledName(node: ts.CallExpression): string | undefined {
   if (ts.isIdentifier(node.expression)) {
     return node.expression.text;
   }
   return ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : undefined;
-}
-
-function sourceContains(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
-  return findNode(root, predicate) !== undefined;
 }
 
 function functionDeclarations(sourceFile: ts.SourceFile): ts.FunctionDeclaration[] {
@@ -341,59 +348,7 @@ function nodesInFunction(functionDeclaration: ts.FunctionDeclaration): ts.Node[]
 }
 
 function functionContains(functionDeclaration: ts.FunctionDeclaration, predicate: (node: ts.Node) => boolean): boolean {
-  return findNodeInFunction(functionDeclaration, predicate) !== undefined;
-}
-
-function findNodeInFunction(functionDeclaration: ts.FunctionDeclaration, predicate: (node: ts.Node) => boolean): ts.Node | undefined {
-  const visit = (node: ts.Node): ts.Node | undefined => {
-    if (predicate(node)) {
-      return node;
-    }
-    if (node !== functionDeclaration && ts.isFunctionLike(node)) {
-      return undefined;
-    }
-    return ts.forEachChild(node, visit);
-  };
-  return visit(functionDeclaration);
-}
-
-function containsOutsideNestedFunctions(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
-  const visit = (node: ts.Node): ts.Node | undefined => {
-    if (predicate(node)) {
-      return node;
-    }
-    if (node !== root && ts.isFunctionLike(node)) {
-      return undefined;
-    }
-    return ts.forEachChild(node, visit);
-  };
-  return visit(root) !== undefined;
-}
-
-function nodeContains(node: ts.Node, container: ts.Node): boolean {
-  return container.pos <= node.pos && node.end <= container.end;
-}
-
-function isStatementAfter(guard: ts.IfStatement, node: ts.Node, declaration: ts.FunctionDeclaration): boolean {
-  const guardBlock = guard.parent;
-  if (!ts.isBlock(guardBlock)) {
-    return false;
-  }
-  let current: ts.Node | undefined = node;
-  while (current !== undefined && current !== declaration) {
-    if (current.parent === guardBlock && ts.isStatement(current)) {
-      return guardBlock.statements.indexOf(guard) < guardBlock.statements.indexOf(current);
-    }
-    current = current.parent;
-  }
-  return false;
-}
-
-function findNode(root: ts.Node, predicate: (node: ts.Node) => boolean): ts.Node | undefined {
-  if (predicate(root)) {
-    return root;
-  }
-  return ts.forEachChild(root, (child) => findNode(child, predicate));
+  return nodesInFunction(functionDeclaration).some(predicate);
 }
 
 function expectContractText(result: ProductAuditResult, source: string, expectedRoute: string, label: string): void {
@@ -433,7 +388,7 @@ async function auditImportStagingExclusion(repoRoot: string, sourceOverrides: Ma
     : nodesInFunction(traversal).filter((node): node is ts.CallExpression => ts.isCallExpression(node)
       && calledName(node) === "collectMarkdownFiles"
       && isIdentifierNamed(node.arguments[0], "fullPath"));
-  const predicateSkipsApp = skipPredicate !== undefined && functionContains(skipPredicate, (node) => ts.isExpression(node) && isEqualityWithString(node, "name", ".app"));
+  const predicateSkipsApp = skipPredicate !== undefined && functionContains(skipPredicate, isExactAppDirectoryCheck);
   const recursiveCallsAreGuarded = traversal !== undefined && recursiveCalls.length > 0 && recursiveCalls.every((recursiveCall) => isRecursiveIndexCallGuarded(traversal, recursiveCall));
   if (!predicateSkipsApp || !recursiveCallsAreGuarded) {
     result.failures.push("indexer does not exclude runtime staging from indexing");
@@ -443,14 +398,20 @@ async function auditImportStagingExclusion(repoRoot: string, sourceOverrides: Ma
 }
 
 function isRecursiveIndexCallGuarded(traversal: ts.FunctionDeclaration, recursiveCall: ts.CallExpression): boolean {
-  const directoryBranches = nodesInFunction(traversal).filter((node): node is ts.IfStatement => ts.isIfStatement(node)
-    && isDirectoryBranch(node)
-    && nodeContains(recursiveCall, node.thenStatement));
-  return directoryBranches.some((directoryBranch) => nodesInFunction(traversal).some((node) => ts.isIfStatement(node)
-    && nodeContains(node, directoryBranch.thenStatement)
-    && isSkipDirectoryGuard(node)
-    && containsOutsideNestedFunctions(node.thenStatement, (child) => ts.isContinueStatement(child) || ts.isReturnStatement(child))
-    && isStatementAfter(node, recursiveCall, traversal)));
+  const recursiveStatement = enclosingStatementInBlock(recursiveCall);
+  const directoryBlock = recursiveStatement?.parent;
+  const directoryBranch = directoryBlock !== undefined && ts.isBlock(directoryBlock) && ts.isIfStatement(directoryBlock.parent)
+    && directoryBlock.parent.thenStatement === directoryBlock
+    && isDirectoryBranch(directoryBlock.parent);
+  const loop = nearestIterationAncestor(recursiveCall);
+  if (!directoryBranch || recursiveStatement === undefined || loop === undefined || !ts.isBlock(directoryBlock)) {
+    return false;
+  }
+
+  const statementIndex = directoryBlock.statements.indexOf(recursiveStatement);
+  return directoryBlock.statements.slice(0, statementIndex).some((statement) => ts.isIfStatement(statement)
+    && isSkipDirectoryGuard(statement)
+    && hasDirectContinueForLoop(statement.thenStatement, loop));
 }
 
 function isDirectoryBranch(node: ts.IfStatement): boolean {
@@ -468,10 +429,57 @@ function isSkipDirectoryGuard(node: ts.IfStatement): boolean {
     && isPropertyAccessNamed(node.expression.arguments[0], "entry", "name");
 }
 
+function isExactAppDirectoryCheck(node: ts.Node): boolean {
+  return ts.isBinaryExpression(node)
+    && node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+    && isIdentifierNamed(node.left, "name")
+    && ts.isStringLiteral(node.right)
+    && node.right.text === ".app";
+}
+
+function enclosingStatementInBlock(node: ts.Node): ts.Statement | undefined {
+  let current: ts.Node | undefined = node;
+  while (current !== undefined) {
+    if (ts.isStatement(current) && ts.isBlock(current.parent)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function nearestIterationAncestor(node: ts.Node): ts.IterationStatement | undefined {
+  let current: ts.Node | undefined = node.parent;
+  while (current !== undefined) {
+    if (isIterationStatement(current)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function isIterationStatement(node: ts.Node): node is ts.IterationStatement {
+  return ts.isForStatement(node)
+    || ts.isForInStatement(node)
+    || ts.isForOfStatement(node)
+    || ts.isWhileStatement(node)
+    || ts.isDoStatement(node);
+}
+
+function hasDirectContinueForLoop(statement: ts.Statement, loop: ts.IterationStatement): boolean {
+  const directStatements = ts.isBlock(statement) ? statement.statements : [statement];
+  return directStatements.some((child) => ts.isContinueStatement(child) && nearestIterationAncestor(child) === loop);
+}
+
 async function auditReviewBypassFields(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
-  const source = await readSource(repoRoot, "packages/workspace/src/imports.ts", sourceOverrides);
-  const sourceFile = ts.createSourceFile("packages/workspace/src/imports.ts", source, ts.ScriptTarget.Latest, true);
-  const bypassField = findReviewBypassField(sourceFile);
+  const sources = await Promise.all([
+    readSource(repoRoot, "packages/workspace/src/imports.ts", sourceOverrides),
+    readSource(repoRoot, "apps/desktop/electron/ipc.ts", sourceOverrides),
+  ]);
+  const bypassField = sources
+    .map((source, index) => findReviewBypassField(ts.createSourceFile(index === 0 ? "imports.ts" : "ipc.ts", source, ts.ScriptTarget.Latest, true)))
+    .find((field) => field !== undefined);
   if (bypassField !== undefined) {
     result.failures.push(`import routing source declares a Review bypass field: ${bypassField}`);
     return;
@@ -480,56 +488,10 @@ async function auditReviewBypassFields(repoRoot: string, sourceOverrides: Map<st
 }
 
 function findReviewBypassField(sourceFile: ts.SourceFile): string | undefined {
-  const aliases = constStringAliases(sourceFile);
-  const bypassNode = findNode(sourceFile, (node) => {
-    if (ts.isPropertyAssignment(node)) {
-      return reviewBypassName(node.name, aliases) !== undefined;
-    }
-    if (ts.isShorthandPropertyAssignment(node)) {
-      return reviewBypassName(node.name, aliases) !== undefined;
-    }
-    if (ts.isElementAccessExpression(node) && node.argumentExpression !== undefined) {
-      return reviewBypassName(node.argumentExpression, aliases) !== undefined;
-    }
-    return ts.isComputedPropertyName(node) && reviewBypassName(node.expression, aliases) !== undefined;
-  });
-  if (bypassNode === undefined) {
-    return undefined;
-  }
-  if (ts.isPropertyAssignment(bypassNode)) {
-    return reviewBypassName(bypassNode.name, aliases);
-  }
-  if (ts.isShorthandPropertyAssignment(bypassNode)) {
-    return reviewBypassName(bypassNode.name, aliases);
-  }
-  if (ts.isElementAccessExpression(bypassNode) && bypassNode.argumentExpression !== undefined) {
-    return reviewBypassName(bypassNode.argumentExpression, aliases);
-  }
-  return ts.isComputedPropertyName(bypassNode) ? reviewBypassName(bypassNode.expression, aliases) : undefined;
-}
-
-function constStringAliases(sourceFile: ts.SourceFile): Map<string, string> {
-  const declarations = nodesInSourceFile(sourceFile).filter((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
-    && ts.isIdentifier(node.name)
-    && node.initializer !== undefined
-    && ts.isVariableDeclarationList(node.parent)
-    && (node.parent.flags & ts.NodeFlags.Const) !== 0);
-  const aliases = new Map<string, string>();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const declaration of declarations) {
-      if (!ts.isIdentifier(declaration.name)) {
-        continue;
-      }
-      const value = resolveConstString(declaration.initializer, aliases);
-      if (value !== undefined && aliases.get(declaration.name.text) !== value) {
-        aliases.set(declaration.name.text, value);
-        changed = true;
-      }
-    }
-  }
-  return aliases;
+  const bypassNode = nodesInSourceFile(sourceFile).find((node) => isReviewBypassToken(node));
+  return bypassNode !== undefined && (ts.isIdentifier(bypassNode) || ts.isStringLiteral(bypassNode) || ts.isNoSubstitutionTemplateLiteral(bypassNode))
+    ? bypassNode.text
+    : undefined;
 }
 
 function nodesInSourceFile(sourceFile: ts.SourceFile): ts.Node[] {
@@ -542,23 +504,9 @@ function nodesInSourceFile(sourceFile: ts.SourceFile): ts.Node[] {
   return nodes;
 }
 
-function resolveConstString(node: ts.Expression | undefined, aliases: Map<string, string>): string | undefined {
-  if (node === undefined) {
-    return undefined;
-  }
-  if (ts.isStringLiteral(node)) {
-    return node.text;
-  }
-  return ts.isIdentifier(node) ? aliases.get(node.text) : undefined;
-}
-
-function reviewBypassName(node: ts.PropertyName | ts.Expression, aliases: Map<string, string>): string | undefined {
-  const value = ts.isComputedPropertyName(node)
-    ? resolveConstString(node.expression, aliases)
-    : ts.isIdentifier(node)
-      ? aliases.get(node.text) ?? node.text
-      : resolveConstString(node, aliases);
-  return value === "skipReview" || value === "bypassReview" ? value : undefined;
+function isReviewBypassToken(node: ts.Node): boolean {
+  return (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+    && (node.text === "skipReview" || node.text === "bypassReview");
 }
 
 async function auditDecisionMirror(repoRoot: string, result: ProductAuditResult): Promise<void> {
