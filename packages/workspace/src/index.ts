@@ -1,4 +1,5 @@
 export { assertInsideWorkspace } from "./pathGuard";
+export { evaluateImportSafety } from "./importSafety";
 export { exportLlmsFlat } from "./exporter";
 export { importDocumentBatch } from "./imports";
 export { parseFrontmatter } from "./frontmatter";
@@ -17,4 +18,15 @@ export type { ProductAuditInput, ProductAuditResult } from "./productAudit";
 export type { WorkspaceAuditFinding, WorkspaceAuditInput, WorkspaceAuditResult, WorkspaceAuditSeverity, WorkspaceAuditStatus } from "./workspaceAudit";
 export type { RoutingPolicy } from "./routingPolicy";
 export type { ImportCandidateRoutingPrecedence, ImportCandidateRouteInput } from "./importCandidateRoutingPolicy";
+export type {
+  ClassificationSignal,
+  ContentCategory,
+  ImportClassification,
+  ImportOperation,
+  ImportSensitivity,
+  ImportWriteIntent,
+  ReviewDecision,
+  SafetyDecision,
+  SafetyReasonCode,
+} from "./importSafety";
 export type { WorkspaceInfo } from "./workspace";

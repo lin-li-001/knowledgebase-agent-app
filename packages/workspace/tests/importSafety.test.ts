@@ -1,0 +1,240 @@
+import { describe, expect, it } from "vitest";
+import {
+  evaluateImportSafety,
+  type ContentCategory,
+  type ImportClassification,
+  type ImportWriteIntent,
+} from "../src/index";
+
+const workspaceRoot = "/tmp/import-safety-workspace";
+
+function classification(
+  overrides: Partial<ImportClassification> = {},
+): ImportClassification {
+  return {
+    primaryCategory: "resource",
+    alternativeCategories: [],
+    sensitivity: "normal",
+    confidence: 1,
+    evidence: ["source evidence"],
+    signals: [],
+    conflict: false,
+    ...overrides,
+  };
+}
+
+function validIntent(overrides: Partial<ImportWriteIntent> = {}): ImportWriteIntent {
+  return {
+    workspaceRoot,
+    operation: "create",
+    destination: "04-Resources/Imports/A.md",
+    destinationExists: false,
+    autoWriteThreshold: 0.9,
+    classification: classification(),
+    ...overrides,
+  };
+}
+
+describe("evaluateImportSafety", () => {
+  it.each([
+    ["workspace escape", { operation: "create", destination: "../outside.md" }, "PATH_ESCAPES_WORKSPACE"],
+    ["overwrite", { operation: "overwrite", destination: "00-Inbox/A.md" }, "OPERATION_NOT_ALLOWED"],
+    ["delete", { operation: "delete", destination: "00-Inbox/A.md" }, "OPERATION_NOT_ALLOWED"],
+    ["collision", { operation: "move", destination: "00-Inbox/A.md", destinationExists: true }, "DESTINATION_EXISTS"],
+    ["malformed destination", { operation: "create", destination: "" }, "PATH_ESCAPES_WORKSPACE"],
+    ["unsupported operation", { operation: "publish" }, "OPERATION_NOT_ALLOWED"],
+  ])("blocks %s", (_name, partial, reasonCode) => {
+    const result = evaluateImportSafety(validIntent(partial as Partial<ImportWriteIntent>));
+
+    expect(result.decision).toBe("blocked");
+    expect(result.reasonCodes).toContain(reasonCode);
+  });
+
+  it("blocks a destination containing a NUL byte", () => {
+    const result = evaluateImportSafety(validIntent({ destination: "04-Resources/\0A.md" }));
+
+    expect(result).toMatchObject({
+      decision: "blocked",
+      reasonCodes: ["PATH_ESCAPES_WORKSPACE"],
+    });
+  });
+
+  it("requires Review when classification is missing", () => {
+    const result = evaluateImportSafety(validIntent({ classification: undefined }));
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: ["CLASSIFICATION_MISSING"],
+    });
+  });
+
+  it.each([
+    ["unknown category", classification({ primaryCategory: "unknown" }), "CLASSIFICATION_UNKNOWN"],
+    ["classifier conflict", classification({ conflict: true }), "CLASSIFIER_CONFLICT"],
+    ["low confidence", classification({ confidence: 0.89 }), "CONFIDENCE_BELOW_THRESHOLD"],
+  ])("requires Review for %s", (_name, value, reasonCode) => {
+    const result = evaluateImportSafety(validIntent({ classification: value }));
+
+    expect(result.decision).toBe("review_required");
+    expect(result.reasonCodes).toContain(reasonCode);
+  });
+
+  it.each([
+    ["personal", "personal"],
+    ["private", "private"],
+    ["restricted", "restricted"],
+  ])("requires Review for %s sensitivity", (_name, sensitivity) => {
+    const result = evaluateImportSafety(
+      validIntent({ classification: classification({ sensitivity }) }),
+    );
+
+    expect(result.decision).toBe("review_required");
+    expect(result.reasonCodes).toContain("SENSITIVITY_REQUIRES_REVIEW");
+  });
+
+  it.each([
+    "finance.utility",
+    "finance.insurance",
+    "finance.tax",
+    "finance.statement",
+    "profile.career",
+    "profile.personal_fact",
+    "memory.candidate",
+    "decision.record",
+  ])("requires Review for protected category %s", (primaryCategory) => {
+    const result = evaluateImportSafety(
+      validIntent({
+        classification: classification({
+          primaryCategory: primaryCategory as ContentCategory,
+        }),
+      }),
+    );
+
+    expect(result.decision).toBe("review_required");
+    expect(result.reasonCodes).toContain("CATEGORY_REQUIRES_REVIEW");
+  });
+
+  it("requires Review for protected destinations", () => {
+    for (const destination of [
+      "02-Personal/default/Finance/Tax.md",
+      "02-Profiles/default/Profile.md",
+      "07-Private/Secret.md",
+      ".vault/decisions/review.md",
+    ]) {
+      const result = evaluateImportSafety(validIntent({ destination }));
+
+      expect(result.decision).toBe("review_required");
+      expect(result.reasonCodes).toContain("DESTINATION_REQUIRES_REVIEW");
+    }
+  });
+
+  it("accumulates category and sensitivity Review reasons", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        classification: classification({
+          primaryCategory: "finance.tax",
+          sensitivity: "personal",
+        }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: expect.arrayContaining([
+        "CATEGORY_REQUIRES_REVIEW",
+        "SENSITIVITY_REQUIRES_REVIEW",
+      ]),
+    });
+  });
+
+  it("requires Review when a detector exposes a higher-risk signal", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        classification: classification({
+          signals: [
+            {
+              source: "model",
+              category: "resource",
+              sensitivity: "normal",
+              confidence: 1,
+              evidence: ["model result"],
+            },
+            {
+              source: "detector",
+              category: "finance.utility",
+              sensitivity: "personal",
+              confidence: 1,
+              evidence: ["Amount due"],
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(result.decision).toBe("review_required");
+    expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+  });
+
+  it("auto-writes a safe resource create", () => {
+    expect(
+      evaluateImportSafety(
+        validIntent({
+          classification: classification({
+            primaryCategory: "resource",
+            sensitivity: "normal",
+            confidence: 0.95,
+          }),
+        }),
+      ),
+    ).toMatchObject({
+      decision: "auto_write",
+      reasonCodes: [],
+    });
+  });
+
+  it("requires Review when the active threshold is stricter", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        autoWriteThreshold: 0.96,
+        classification: classification({ confidence: 0.95 }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: ["CONFIDENCE_BELOW_THRESHOLD"],
+    });
+  });
+
+  it("lets explicit approval clear Review-only reasons for one move", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        operation: "move",
+        destination: "02-Personal/default/Finance/Tax.md",
+        approvedByUser: true,
+        classification: classification({
+          primaryCategory: "finance.tax",
+          sensitivity: "personal",
+          confidence: 0.5,
+        }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "auto_write",
+      reasonCodes: [],
+    });
+  });
+
+  it("never lets approval clear blocked reasons", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        destination: "../outside.md",
+        approvedByUser: true,
+      }),
+    );
+
+    expect(result.decision).toBe("blocked");
+    expect(result.reasonCodes).toContain("PATH_ESCAPES_WORKSPACE");
+  });
+});
