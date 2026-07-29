@@ -258,7 +258,7 @@ function isExactSafetyDecisionComparison(
     && expression.operatorToken.kind === operator
     && ts.isPropertyAccessExpression(expression.left)
     && ts.isIdentifier(expression.left.expression)
-    && resolvesToBinding(declaration, expression.left.expression) === binding
+    && resolvesToSafetyBinding(declaration, expression.left.expression, binding)
     && expression.left.name.text === "decision"
     && ts.isStringLiteral(expression.right)
     && expression.right.text === "auto_write";
@@ -281,6 +281,22 @@ function resolvesToBinding(declaration: ts.FunctionDeclaration, reference: ts.Id
       const depthDifference = scopeDepth(right.scope) - scopeDepth(left.scope);
       return depthDifference !== 0 ? depthDifference : right.identifier.pos - left.identifier.pos;
     })[0]?.declaration;
+}
+
+function resolvesToSafetyBinding(
+  declaration: ts.FunctionDeclaration,
+  reference: ts.Identifier,
+  kernelDeclaration: ts.VariableDeclaration,
+): boolean {
+  const resolved = resolvesToBinding(declaration, reference);
+  return resolved === kernelDeclaration
+    || (resolved !== undefined
+      && ts.isVariableDeclaration(resolved)
+      && ts.isIdentifier(kernelDeclaration.name)
+      && kernelDeclaration.name.text === reference.text
+      && isFunctionScopedVar(resolved)
+      && isFunctionScopedVar(kernelDeclaration)
+      && declarationScope(resolved, declaration) === declarationScope(kernelDeclaration, declaration));
 }
 
 function lexicalBindings(declaration: ts.FunctionDeclaration): LexicalBinding[] {
@@ -328,6 +344,11 @@ function declarationScope(binding: LexicalDeclaration, declaration: ts.FunctionD
 function isBlockScopedVariable(declaration: ts.VariableDeclaration): boolean {
   return ts.isVariableDeclarationList(declaration.parent)
     && (declaration.parent.flags & ts.NodeFlags.BlockScoped) !== 0;
+}
+
+function isFunctionScopedVar(declaration: ts.VariableDeclaration): boolean {
+  return ts.isVariableDeclarationList(declaration.parent)
+    && (declaration.parent.flags & ts.NodeFlags.BlockScoped) === 0;
 }
 
 function nodeIsInside(node: ts.Node, container: ts.Node): boolean {

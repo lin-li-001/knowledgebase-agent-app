@@ -60,6 +60,7 @@ function importerWriterFixture(
   guardBody: string,
   kernelBinding = "safetyDecision",
   extraParameter = "",
+  kernelDeclaration = "const",
 ): string {
   return `${importsSource}
 async function adversarialPromotion(
@@ -81,7 +82,7 @@ async function adversarialPromotion(
   };
   const stagingTargetPath = assertInsideWorkspace(workspaceRoot, [".app", "import-staging", "adversarial.md"].join("/"));
   const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
-  const ${kernelBinding} = evaluateImportSafety({
+  ${kernelDeclaration} ${kernelBinding} = evaluateImportSafety({
     workspaceRoot,
     operation: "create",
     destination: routed.destination,
@@ -398,6 +399,54 @@ function fabricatedSafetyDecision(destination: string): SafetyDecision {
     });
 
     expect(result.failures).toEqual([]);
+  });
+
+  it("accepts a later typed var redeclaration of the kernel binding", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const validImportsSource = importerWriterFixture(
+      importsSource,
+      `  var safetyDecision: SafetyDecision;
+  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+      "safetyDecision",
+      "",
+      "var",
+    );
+
+    expectSourceOverrideToTypecheck(importsPath, validImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, validImportsSource]]),
+    });
+
+    expect(result.failures).toEqual([]);
+  });
+
+  it("rejects a nested block lexical shadow of a var kernel binding", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importerWriterFixture(
+      importsSource,
+      `  {
+    const safetyDecision: SafetyDecision = fabricated;
+    if (safetyDecision.decision === "auto_write") {
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+    }
+  }`,
+      "safetyDecision",
+      "",
+      "var",
+    );
+
+    expectSourceOverrideToTypecheck(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
   });
 
   it("rejects an executable importer decoy when the real promotion writer is ungated", async () => {
