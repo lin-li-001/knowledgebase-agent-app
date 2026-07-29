@@ -98,6 +98,44 @@ Profile body.
       }),
     );
   });
+
+  it("accepts import routing fields while preserving legacy sensitive parsing", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-md-"));
+    const notePath = path.join(root, "Imported Note.md");
+    await writeFile(
+      notePath,
+      `---
+title: Imported Note
+type: resource
+status: auto_written
+owner: default
+scope: personal
+sensitivity: sensitive
+created: 2026-07-20
+tags: [imported]
+content_category: resource
+classification_confidence: 1
+classification_evidence: [Saved routing rule]
+review_decision: auto_write
+safety_reason_codes: []
+route_status: auto_written
+route_destination: 00-Inbox/Imports/Imported Note.md
+---
+
+# Imported Note
+`,
+    );
+
+    await expect(parseMarkdownNote(notePath)).resolves.toEqual(
+      expect.objectContaining({
+        frontmatter: expect.objectContaining({
+          sensitivity: "sensitive",
+          content_category: "resource",
+          review_decision: "auto_write",
+        }),
+      }),
+    );
+  });
 });
 
 describe("indexWorkspace", () => {
@@ -173,6 +211,26 @@ Broken.
     expect(db.sqlite.prepare("SELECT path FROM notes").all()).toEqual([
       { path: "03-Knowledge/Graph Memory.md" },
     ]);
+  });
+
+  it("excludes staged imports from notes and FTS", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-index-"));
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await mkdir(path.join(root, ".app/import-staging/job-1"), { recursive: true });
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    await writeNote(path.join(root, ".app/import-staging/job-1/Staged.md"), "Staged Import", "Must not enter SQLite or FTS");
+
+    const result = await indexWorkspace(root, db);
+
+    expect(result.noteCount).toBe(1);
+    expect(db.sqlite.prepare("SELECT path FROM notes").all()).toEqual([
+      { path: "03-Knowledge/Graph Memory.md" },
+    ]);
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_fts WHERE title = ?").get("Staged Import")).toEqual({ count: 0 });
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_fts_trigram WHERE title = ?").get("Staged Import")).toEqual({ count: 0 });
   });
 });
 

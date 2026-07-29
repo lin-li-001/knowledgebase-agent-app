@@ -6,6 +6,8 @@ export interface RoutingPolicy {
   importInboxDir(): string;
   importInboxNotePath(batchName: string): string;
   importInboxSourceNotePath(batchName: string, sourceStem: string): string;
+  importStagingDir(importId: string): string;
+  importStagingNotePath(importId: string, sourceStem: string): string;
   importSourceNotePath(batchName: string, sourceStem: string): string;
   importSummaryDir(): string;
   importSummaryNotePath(batchName: string): string;
@@ -17,6 +19,7 @@ export interface RoutingPolicy {
 const importAttachmentRoot = "06-Attachments/Imports";
 const importInboxDir = "00-Inbox/Imports";
 const importSummaryDir = "04-Resources/Imports";
+const importStagingRoot = ".app/import-staging";
 const exportDir = ".app/exports";
 const decisionDir = ".vault/decisions";
 
@@ -41,6 +44,12 @@ export const defaultRoutingPolicy: RoutingPolicy = {
   },
   importInboxSourceNotePath(batchName: string, sourceStem: string): string {
     return `${importInboxDir}/${batchName}/${sourceStem}.md`;
+  },
+  importStagingDir(importId: string): string {
+    return `${importStagingRoot}/${importId}`;
+  },
+  importStagingNotePath(importId: string, sourceStem: string): string {
+    return `${importStagingRoot}/${importId}/${sourceStem}.md`;
   },
   importSourceNotePath(batchName: string, sourceStem: string): string {
     return `${importSummaryDir}/${batchName}/${sourceStem}.md`;

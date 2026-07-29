@@ -21,6 +21,7 @@ describe("exportLlmsFlat", () => {
     opened.push(db);
 
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await mkdir(path.join(root, ".app/import-staging/job-1"), { recursive: true });
     await writeFile(
       path.join(root, "03-Knowledge/Graph Memory.md"),
       `---
@@ -40,6 +41,24 @@ summary: Graph memory architecture summary.
 Body.
 `,
     );
+    await writeFile(
+      path.join(root, ".app/import-staging/job-1/Staged.md"),
+      `---
+title: Staged Import
+type: resource
+status: pending_review
+owner: default
+scope: personal
+sensitivity: normal
+created: 2026-07-20
+tags: [imported]
+---
+
+# Staged Import
+
+Not exportable.
+`,
+    );
     await indexWorkspace(root, db);
 
     const exportPath = await exportLlmsFlat(root, db);
@@ -51,5 +70,7 @@ Body.
     expect(content).toContain("summary: Graph memory architecture summary.");
     expect(content).toContain("status: active");
     expect(content).toContain("tags: graph, memory");
+    expect(content).not.toContain("Staged Import");
+    expect(content).not.toContain(".app/import-staging/job-1/Staged.md");
   });
 });

@@ -22,6 +22,13 @@ export const noteFrontmatterSchema = z.object({
   source_type: z.string().optional(),
   source_file: z.string().optional(),
   source_files: z.array(z.string()).optional(),
+  content_category: z.string().min(1).optional(),
+  classification_confidence: z.number().min(0).max(1).optional(),
+  classification_evidence: z.array(z.string()).optional(),
+  review_decision: z.enum(["auto_write", "review_required", "blocked"]).optional(),
+  safety_reason_codes: z.array(z.string()).optional(),
+  route_status: z.string().min(1).optional(),
+  route_destination: z.string().min(1).optional(),
 });
 
 export type NoteFrontmatter = z.infer<typeof noteFrontmatterSchema>;

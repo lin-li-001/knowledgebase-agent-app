@@ -25,6 +25,9 @@ describe("defaultRoutingPolicy", () => {
     expect(defaultRoutingPolicy.importSourceNotePath("2026 Utility Bills", "2026-01 Electric")).toBe(
       "04-Resources/Imports/2026 Utility Bills/2026-01 Electric.md",
     );
+    expect(defaultRoutingPolicy.importStagingNotePath("job-1", "Handbook")).toBe(
+      ".app/import-staging/job-1/Handbook.md",
+    );
   });
 
   it("routes profile files to the active profile folder", () => {

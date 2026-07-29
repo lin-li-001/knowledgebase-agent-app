@@ -92,7 +92,7 @@ describe("importDocumentBatch", () => {
     expect(document.requiresOcr).toBe(true);
   });
 
-  it("moves an unclassified import note to Inbox immediately", async () => {
+  it("keeps an unclassified import note staged pending review", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     await mkdir(sourceDir, { recursive: true });
@@ -107,10 +107,15 @@ describe("importDocumentBatch", () => {
     });
 
     expect(job.notes[0]).toMatchObject({
-      routeStatus: "inbox",
-      notePath: "00-Inbox/Imports/Loose Notes.md",
+      status: "pending_review",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
+      classification: { primaryCategory: "unknown" },
+      safetyDecision: {
+        decision: "review_required",
+        reasonCodes: expect.arrayContaining(["CLASSIFICATION_UNKNOWN"]),
+      },
     });
-    await expect(readFile(path.join(root, "00-Inbox/Imports/Loose Notes.md"), "utf8")).resolves.toContain("## Routing");
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("## Routing");
   });
 
   it("derives the summary from whole-document metadata and later content instead of repeating the opening paragraph", async () => {
@@ -139,7 +144,7 @@ describe("importDocumentBatch", () => {
     expect(summary).toContain("Later implementation detail used for the summary.");
   });
 
-  it("keeps one Inbox note per source when a batch has multiple unclassified files", async () => {
+  it("keeps one staged note per source when a batch has multiple unclassified files", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const first = path.join(sourceDir, "First.txt");
@@ -155,8 +160,8 @@ describe("importDocumentBatch", () => {
     });
 
     expect(job.notes.map((note) => note.notePath)).toEqual([
-      "00-Inbox/Imports/Loose Notes/First.md",
-      "00-Inbox/Imports/Loose Notes/Second.md",
+      expect.stringMatching(/^\.app\/import-staging\//),
+      expect.stringMatching(/^\.app\/import-staging\//),
     ]);
   });
 
@@ -185,9 +190,9 @@ describe("importDocumentBatch", () => {
       "06-Attachments/Imports/Reports/report-2.txt",
     ]);
     expect(job.notes.map((note) => note.notePath)).toEqual([
-      "00-Inbox/Imports/Reports/report.md",
-      "00-Inbox/Imports/Reports/report-2.md",
-      "00-Inbox/Imports/Reports/report-3.md",
+      expect.stringMatching(/^\.app\/import-staging\//),
+      expect.stringMatching(/^\.app\/import-staging\//),
+      expect.stringMatching(/^\.app\/import-staging\//),
     ]);
     await expect(readFile(path.join(root, job.notes[2]!.attachmentPath), "utf8")).resolves.toBe("Second text report content");
   });
@@ -216,11 +221,13 @@ describe("importDocumentBatch", () => {
 
     expect(firstJob.notes[0]).toMatchObject({
       attachmentPath: "06-Attachments/Imports/Reports/report.txt",
-      notePath: "04-Resources/Imports/Reports/report.md",
+      status: "pending_review",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
     });
     expect(secondJob.notes[0]).toMatchObject({
       attachmentPath: "06-Attachments/Imports/Reports/report-2.txt",
-      notePath: "04-Resources/Imports/Reports/report-2.md",
+      status: "pending_review",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
     });
     await expect(readFile(path.join(root, firstJob.notes[0]!.attachmentPath), "utf8")).resolves.toContain("$123.45");
     await expect(readFile(path.join(root, secondJob.notes[0]!.attachmentPath), "utf8")).resolves.toContain("$456.78");
@@ -242,11 +249,96 @@ describe("importDocumentBatch", () => {
     });
 
     expect(job.notes[0]).toMatchObject({
-      routeStatus: "pending_review",
-      risk: "high",
-      notePath: "04-Resources/Imports/2026 Utility Bills/Electric Bill.md",
+      status: "pending_review",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
       destination: "02-Personal/default/Finance/Utilities/2026/Electric Bill.md",
     });
+  });
+
+  it("moves a safe saved-policy import from staging to its destination without leaving a staged copy", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({
+        rules: [
+          {
+            pattern: "Handbook",
+            category: "resource",
+            sensitivity: "normal",
+            destination: "00-Inbox/Imports/Handbook.md",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await writeFile(source, "Handbook content that should remain unchanged during the move.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Handbook",
+      files: [source],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      status: "auto_written",
+      notePath: "00-Inbox/Imports/Handbook.md",
+      destination: "00-Inbox/Imports/Handbook.md",
+      classification: { primaryCategory: "resource", sensitivity: "normal", confidence: 1 },
+      safetyDecision: { decision: "auto_write", reasonCodes: [] },
+    });
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain(
+      "Handbook content that should remain unchanged during the move.",
+    );
+    await expect(
+      readFile(path.join(root, ".app/import-staging", job.id, "Handbook.md"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not overwrite an existing auto-write destination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    const destination = path.join(root, "00-Inbox/Imports/Handbook.md");
+    await mkdir(path.dirname(destination), { recursive: true });
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(destination, "Existing authoritative note.", "utf8");
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({
+        rules: [
+          {
+            pattern: "Handbook",
+            category: "resource",
+            sensitivity: "normal",
+            destination: "00-Inbox/Imports/Handbook.md",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await writeFile(source, "New handbook content.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Handbook",
+      files: [source],
+      now: "2026-07-21T00:00:00.000Z",
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      status: "blocked",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
+      safetyDecision: {
+        decision: "blocked",
+        reasonCodes: expect.arrayContaining(["DESTINATION_EXISTS"]),
+      },
+    });
+    await expect(readFile(destination, "utf8")).resolves.toBe("Existing authoritative note.");
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("New handbook content.");
   });
 });
 

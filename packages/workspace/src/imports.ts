@@ -1,4 +1,5 @@
-import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, copyFile, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
 import {
@@ -7,7 +8,14 @@ import {
   type SavedImportRule,
 } from "./importClassification";
 import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
-import type { ClassificationSignal, ContentCategory, ImportClassification, ImportSensitivity } from "./importSafety";
+import {
+  evaluateImportSafety,
+  type ClassificationSignal,
+  type ContentCategory,
+  type ImportClassification,
+  type ImportSensitivity,
+  type SafetyDecision,
+} from "./importSafety";
 import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
@@ -18,14 +26,22 @@ export interface ImportBatchInput {
   now?: string;
 }
 
+export type ImportArtifactStatus =
+  | "classifying"
+  | "pending_review"
+  | "auto_written"
+  | "approved"
+  | "blocked"
+  | "rejected";
+
 export interface ImportSourceNote {
   sourceFile: string;
   attachmentPath: string;
   notePath: string;
-  routeStatus: "inbox" | "pending_review";
-  destination: string;
-  risk: "low" | "high";
+  status: ImportArtifactStatus;
+  destination?: string;
   classification: ImportClassification;
+  safetyDecision: SafetyDecision;
 }
 
 export interface ImportJob {
@@ -50,23 +66,24 @@ interface WorkspaceRoutingPolicyFile {
 interface RoutedDocument {
   classification: ImportClassification;
   destination: string;
-  risk: ImportSourceNote["risk"];
-  routeStatus: ImportSourceNote["routeStatus"];
 }
 
 interface RenderSourceNoteInput {
   attachmentPath: string;
+  classification: ImportClassification;
   created: string;
   destination: string;
   document: ImportedDocument;
   notePath: string;
-  routeStatus: ImportSourceNote["routeStatus"];
+  safetyDecision: SafetyDecision;
+  status: ImportArtifactStatus;
   summary: string;
   title: string;
 }
 
 export async function importDocumentBatch(input: ImportBatchInput): Promise<ImportJob> {
   const batchName = sanitizeBatchName(input.batchName);
+  const id = importJobId(batchName, input.now);
   const created = (input.now ?? new Date().toISOString()).slice(0, 10);
   const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
@@ -77,24 +94,25 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
     const documents: ImportedDocument[] = [];
     const [attachmentNames, sourceStems] = await Promise.all([
       existingNames(attachmentTargetDir),
-      existingSourceStems(input.workspaceRoot, batchName),
+      existingSourceStems(input.workspaceRoot, id),
     ]);
     for (const file of input.files) {
       const extracted = await extractDocumentText(file);
       const targetFileName = uniqueFileName(sanitizeFileName(extracted.fileName), attachmentNames);
       const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
       const attachmentRelativePath = `${attachmentDir}/${targetFileName}`;
-      await copyFile(file, assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath));
+      await copyFile(file, assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath), constants.COPYFILE_EXCL);
       documents.push({ ...extracted, attachmentRelativePath, sourceStem });
     }
 
     const policy = await readWorkspaceRoutingPolicy(input.workspaceRoot);
-    const notes = await Promise.all(
-      documents.map((document) => persistSourceNote(input.workspaceRoot, batchName, created, document, policy, documents.length)),
-    );
+    const notes: ImportSourceNote[] = [];
+    for (const document of documents) {
+      notes.push(await persistSourceNote(input.workspaceRoot, id, batchName, created, document, policy));
+    }
 
     return {
-      id: importJobId(batchName, input.now),
+      id,
       batchName,
       state: "completed",
       attachmentDir,
@@ -103,7 +121,7 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
     };
   } catch (error) {
     return {
-      id: importJobId(batchName, input.now),
+      id,
       batchName,
       state: "failed",
       attachmentDir,
@@ -116,61 +134,59 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
 
 async function persistSourceNote(
   workspaceRoot: string,
+  importId: string,
   batchName: string,
   created: string,
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
-  sourceCount: number,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
   const routed = routeDocument(batchName, title, document, policy);
-  const notePath = await notePathFor(workspaceRoot, batchName, title, routed.routeStatus, sourceCount);
-  const targetPath = assertInsideWorkspace(workspaceRoot, notePath);
+  const stagingPath = defaultRoutingPolicy.importStagingNotePath(importId, title);
+  const stagingTargetPath = assertInsideWorkspace(workspaceRoot, stagingPath);
+  const destinationTargetPath = safeWorkspacePath(workspaceRoot, routed.destination);
+  const safetyDecision = evaluateImportSafety({
+    workspaceRoot,
+    operation: "create",
+    destination: routed.destination,
+    destinationExists: destinationTargetPath === undefined ? false : await pathExists(destinationTargetPath),
+    autoWriteThreshold: 0.95,
+    classification: routed.classification,
+  });
+  const status = artifactStatusFor(safetyDecision);
+  const notePath = status === "auto_written" ? routed.destination : stagingPath;
+  const rendered = renderImportedSourceNote({
+    attachmentPath: document.attachmentRelativePath,
+    classification: routed.classification,
+    created,
+    destination: routed.destination,
+    document,
+    notePath,
+    safetyDecision,
+    status,
+    summary: summaryFor(document),
+    title,
+  });
 
-  await mkdir(path.dirname(targetPath), { recursive: true });
-  await writeFile(
-    targetPath,
-    renderImportedSourceNote({
-      attachmentPath: document.attachmentRelativePath,
-      created,
-      destination: routed.destination,
-      document,
-      notePath,
-      routeStatus: routed.routeStatus,
-      summary: summaryFor(document),
-      title,
-    }),
-    "utf8",
-  );
+  await mkdir(path.dirname(stagingTargetPath), { recursive: true });
+  await writeFile(stagingTargetPath, rendered, { encoding: "utf8", flag: "wx" });
+
+  if (status === "auto_written") {
+    const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
+    await mkdir(path.dirname(finalTargetPath), { recursive: true });
+    await writeFile(finalTargetPath, await readFile(stagingTargetPath), { flag: "wx" });
+    await unlink(stagingTargetPath);
+  }
 
   return {
     sourceFile: document.fileName,
     attachmentPath: document.attachmentRelativePath,
     notePath,
-    routeStatus: routed.routeStatus,
+    status,
     destination: routed.destination,
-    risk: routed.risk,
     classification: routed.classification,
+    safetyDecision,
   };
-}
-
-async function notePathFor(
-  workspaceRoot: string,
-  batchName: string,
-  sourceStem: string,
-  routeStatus: ImportSourceNote["routeStatus"],
-  sourceCount: number,
-): Promise<string> {
-  if (routeStatus === "pending_review") {
-    return defaultRoutingPolicy.importSourceNotePath(batchName, sourceStem);
-  }
-
-  const directInboxPath = defaultRoutingPolicy.importInboxNotePath(batchName);
-  if (sourceCount === 1 && !(await pathExists(assertInsideWorkspace(workspaceRoot, directInboxPath)))) {
-    return directInboxPath;
-  }
-
-  return defaultRoutingPolicy.importInboxSourceNotePath(batchName, sourceStem);
 }
 
 function routeDocument(
@@ -200,25 +216,22 @@ function routeDocument(
     fallbackDestination,
   });
   const destination = classification.suggestedDestination ?? fallbackDestination;
-  const risk: ImportSourceNote["risk"] = requiresReview(classification.signals) ? "high" : "low";
 
   return {
     classification,
     destination,
-    risk,
-    routeStatus: risk === "high" ? "pending_review" : "inbox",
   };
 }
 
 function renderImportedSourceNote(input: RenderSourceNoteInput): string {
   const sourceLink = sourceLinkFor(input.notePath, input.attachmentPath);
   const documentBody = input.document.markdownBody || ocrMessage(input.document);
-  const tags = input.routeStatus === "inbox" ? "[imported, inbox]" : "[imported, pending-review]";
+  const tags = `[imported, ${input.status.replace(/_/gu, "-")}]`;
 
   return `---
 title: ${escapeYamlString(input.title)}
 type: resource
-status: ${input.routeStatus}
+status: ${input.status}
 owner: default
 scope: personal
 sensitivity: normal
@@ -227,7 +240,12 @@ tags: ${tags}
 source_type: import
 source_file: ${escapeYamlString(sourceLink)}
 summary: ${escapeYamlString(input.summary)}
-route_status: ${input.routeStatus}
+content_category: ${input.classification.primaryCategory}
+classification_confidence: ${input.classification.confidence}
+classification_evidence: ${JSON.stringify(input.classification.evidence)}
+review_decision: ${input.safetyDecision.decision}
+safety_reason_codes: ${JSON.stringify(input.safetyDecision.reasonCodes)}
+route_status: ${input.status}
 route_destination: ${escapeYamlString(input.destination)}
 ${input.document.pageCount ? `page_count: ${input.document.pageCount}\n` : ""}${input.document.requiresOcr ? "requires_ocr: true\n" : ""}---
 
@@ -243,7 +261,7 @@ ${documentBody}
 
 ## Routing
 
-- Status: ${input.routeStatus}
+- Status: ${input.status}
 - Destination: ${input.destination}
 `;
 }
@@ -302,25 +320,6 @@ function parseSavedImportRule(value: unknown): SavedImportRule | undefined {
   };
 }
 
-function requiresReview(signals: ClassificationSignal[]): boolean {
-  return signals.some((signal) =>
-    signal.source === "saved_user_policy" ||
-    signal.sensitivity !== undefined && signal.sensitivity !== "normal" ||
-    signal.category !== undefined && protectedCategories.has(signal.category),
-  );
-}
-
-const protectedCategories = new Set<ContentCategory>([
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-]);
-
 const contentCategories = new Set<ContentCategory>([
   "finance.utility",
   "finance.insurance",
@@ -361,11 +360,8 @@ async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<Worksp
   }
 }
 
-async function existingSourceStems(workspaceRoot: string, batchName: string): Promise<Set<string>> {
-  const directories = [
-    path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importSourceNotePath(batchName, "source"))),
-    path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importInboxSourceNotePath(batchName, "source"))),
-  ];
+async function existingSourceStems(workspaceRoot: string, importId: string): Promise<Set<string>> {
+  const directories = [path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importStagingNotePath(importId, "source")))];
   const names = await Promise.all(directories.map(existingNames));
   return new Set(
     names
@@ -461,7 +457,26 @@ function sanitizeFileName(fileName: string): string {
 }
 
 function importJobId(batchName: string, now: string | undefined): string {
-  return `${batchName}:${now ?? "now"}`;
+  return sanitizeImportId(`${batchName}-${now ?? "now"}`);
+}
+
+function sanitizeImportId(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "") || "import";
+}
+
+function safeWorkspacePath(workspaceRoot: string, relativePath: string): string | undefined {
+  try {
+    return assertInsideWorkspace(workspaceRoot, relativePath);
+  } catch {
+    return undefined;
+  }
+}
+
+function artifactStatusFor(safetyDecision: SafetyDecision): ImportArtifactStatus {
+  if (safetyDecision.decision === "auto_write") {
+    return "auto_written";
+  }
+  return safetyDecision.decision === "blocked" ? "blocked" : "pending_review";
 }
 
 function escapeYamlString(value: string): string {
