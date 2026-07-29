@@ -264,24 +264,70 @@ function isExactSafetyDecisionComparison(
     && expression.right.text === "auto_write";
 }
 
-function resolvesToBinding(declaration: ts.FunctionDeclaration, reference: ts.Identifier): ts.VariableDeclaration | undefined {
-  const candidates = nodesInFunction(declaration).filter((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
-    && ts.isIdentifier(node.name)
-    && node.name.text === reference.text
-    && node.pos < reference.pos
-    && nodeIsInside(reference, declarationScope(node, declaration)));
-  return candidates.sort((left, right) => scopeDepth(declarationScope(right, declaration)) - scopeDepth(declarationScope(left, declaration)))[0];
+type LexicalDeclaration = ts.VariableDeclaration | ts.ParameterDeclaration;
+
+interface LexicalBinding {
+  declaration: LexicalDeclaration;
+  identifier: ts.Identifier;
+  scope: ts.Node;
 }
 
-function declarationScope(variable: ts.VariableDeclaration, declaration: ts.FunctionDeclaration): ts.Node {
-  let current: ts.Node | undefined = variable.parent;
+function resolvesToBinding(declaration: ts.FunctionDeclaration, reference: ts.Identifier): LexicalDeclaration | undefined {
+  return lexicalBindings(declaration)
+    .filter((binding) => binding.identifier.text === reference.text
+      && binding.identifier.pos < reference.pos
+      && nodeIsInside(reference, binding.scope))
+    .sort((left, right) => {
+      const depthDifference = scopeDepth(right.scope) - scopeDepth(left.scope);
+      return depthDifference !== 0 ? depthDifference : right.identifier.pos - left.identifier.pos;
+    })[0]?.declaration;
+}
+
+function lexicalBindings(declaration: ts.FunctionDeclaration): LexicalBinding[] {
+  return nodesInFunction(declaration).flatMap((node): LexicalBinding[] => {
+    if (!ts.isVariableDeclaration(node) && !ts.isParameter(node)) {
+      return [];
+    }
+    const scope = declarationScope(node, declaration);
+    return bindingIdentifiers(node.name).map((identifier) => ({ declaration: node, identifier, scope }));
+  });
+}
+
+function bindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
+  if (ts.isIdentifier(name)) {
+    return [name];
+  }
+  return name.elements.flatMap((element) => ts.isOmittedExpression(element) ? [] : bindingIdentifiers(element.name));
+}
+
+function declarationScope(binding: LexicalDeclaration, declaration: ts.FunctionDeclaration): ts.Node {
+  if (ts.isParameter(binding)) {
+    return declaration;
+  }
+  if (ts.isCatchClause(binding.parent)) {
+    return binding.parent.block;
+  }
+  if (!isBlockScopedVariable(binding)) {
+    return declaration;
+  }
+
+  let current: ts.Node | undefined = binding.parent;
   while (current !== undefined && current !== declaration) {
-    if (ts.isBlock(current)) {
+    if (ts.isBlock(current)
+      || ts.isCaseBlock(current)
+      || ts.isForStatement(current)
+      || ts.isForInStatement(current)
+      || ts.isForOfStatement(current)) {
       return current;
     }
     current = current.parent;
   }
   return declaration;
+}
+
+function isBlockScopedVariable(declaration: ts.VariableDeclaration): boolean {
+  return ts.isVariableDeclarationList(declaration.parent)
+    && (declaration.parent.flags & ts.NodeFlags.BlockScoped) !== 0;
 }
 
 function nodeIsInside(node: ts.Node, container: ts.Node): boolean {

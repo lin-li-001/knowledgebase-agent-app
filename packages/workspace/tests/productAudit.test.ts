@@ -55,6 +55,45 @@ function expectSourceOverrideToTypecheck(sourcePath: string, source: string): vo
   expect(ts.getPreEmitDiagnostics(program)).toEqual([]);
 }
 
+function importerWriterFixture(
+  importsSource: string,
+  guardBody: string,
+  kernelBinding = "safetyDecision",
+  extraParameter = "",
+): string {
+  return `${importsSource}
+async function adversarialPromotion(
+  fileOps: ImportFileOps,
+  fabricated: SafetyDecision${extraParameter},
+) {
+  const workspaceRoot = "/workspace";
+  const routed: RoutedDocument = {
+    classification: {
+      primaryCategory: "resource",
+      alternativeCategories: [],
+      sensitivity: "normal",
+      confidence: 1,
+      evidence: [],
+      signals: [],
+      conflict: false,
+    },
+    destination: "00-Inbox/Imports/adversarial.md",
+  };
+  const stagingTargetPath = assertInsideWorkspace(workspaceRoot, [".app", "import-staging", "adversarial.md"].join("/"));
+  const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
+  const ${kernelBinding} = evaluateImportSafety({
+    workspaceRoot,
+    operation: "create",
+    destination: routed.destination,
+    destinationExists: false,
+    autoWriteThreshold: 0.95,
+    classification: routed.classification,
+  });
+${guardBody}
+}
+`;
+}
+
 describe("product audit", () => {
   it("checks product contract drift in the current repo", async () => {
     const result = await auditProductContracts({ repoRoot });
@@ -271,6 +310,94 @@ function fabricatedSafetyDecision(destination: string): SafetyDecision {
     });
 
     expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
+  it.each([
+    [
+      "object shorthand",
+      `  {
+    const { safetyDecision } = { safetyDecision: fabricated };
+    if (safetyDecision.decision === "auto_write") {
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+    }
+  }`,
+      "safetyDecision",
+      "",
+    ],
+    [
+      "aliased object binding",
+      `  {
+    const { safetyDecision: local } = { safetyDecision: fabricated };
+    if (local.decision === "auto_write") {
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+    }
+  }`,
+      "safetyDecision",
+      "",
+    ],
+    [
+      "array binding",
+      `  {
+    const [safetyDecision] = [fabricated];
+    if (safetyDecision.decision === "auto_write") {
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+    }
+  }`,
+      "safetyDecision",
+      "",
+    ],
+    [
+      "parameter",
+      `  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+      "kernelDecision",
+      ",\n  safetyDecision: SafetyDecision",
+    ],
+    [
+      "catch binding",
+      `  try {
+    throw fabricated;
+  } catch (safetyDecision) {
+    if (safetyDecision.decision === "auto_write") {
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+    }
+  }`,
+      "safetyDecision",
+      "",
+    ],
+  ])("rejects an importer guard using a %s shadow", async (_label, guardBody, kernelBinding, extraParameter) => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importerWriterFixture(importsSource, guardBody, kernelBinding, extraParameter);
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
+  it("accepts an importer guard using its direct non-shadowed kernel binding", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const validImportsSource = importerWriterFixture(
+      importsSource,
+      `  if (kernelDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+      "kernelDecision",
+    );
+
+    expectSourceOverrideToCompile(importsPath, validImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, validImportsSource]]),
+    });
+
+    expect(result.failures).toEqual([]);
   });
 
   it("rejects an executable importer decoy when the real promotion writer is ungated", async () => {
