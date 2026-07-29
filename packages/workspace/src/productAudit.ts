@@ -289,14 +289,39 @@ function resolvesToSafetyBinding(
   kernelDeclaration: ts.VariableDeclaration,
 ): boolean {
   const resolved = resolvesToBinding(declaration, reference);
-  return resolved === kernelDeclaration
+  const resolvesToKernel = resolved === kernelDeclaration
     || (resolved !== undefined
       && ts.isVariableDeclaration(resolved)
-      && ts.isIdentifier(kernelDeclaration.name)
-      && kernelDeclaration.name.text === reference.text
-      && isFunctionScopedVar(resolved)
-      && isFunctionScopedVar(kernelDeclaration)
-      && declarationScope(resolved, declaration) === declarationScope(kernelDeclaration, declaration));
+      && isSameFunctionScopedVarBinding(declaration, resolved, kernelDeclaration, reference.text));
+  return resolvesToKernel
+    && (!isFunctionScopedVar(kernelDeclaration)
+      || isSoleInitializedVarDeclaration(declaration, reference, kernelDeclaration));
+}
+
+function isSameFunctionScopedVarBinding(
+  declaration: ts.FunctionDeclaration,
+  candidate: ts.VariableDeclaration,
+  kernelDeclaration: ts.VariableDeclaration,
+  bindingName: string,
+): boolean {
+  return ts.isIdentifier(kernelDeclaration.name)
+    && kernelDeclaration.name.text === bindingName
+    && bindingIdentifiers(candidate.name).some((identifier) => identifier.text === bindingName)
+    && isFunctionScopedVar(candidate)
+    && isFunctionScopedVar(kernelDeclaration)
+    && declarationScope(candidate, declaration) === declarationScope(kernelDeclaration, declaration);
+}
+
+function isSoleInitializedVarDeclaration(
+  declaration: ts.FunctionDeclaration,
+  reference: ts.Identifier,
+  kernelDeclaration: ts.VariableDeclaration,
+): boolean {
+  const initializedDeclarations = nodesInFunction(declaration).filter((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
+    && node.pos < reference.pos
+    && node.initializer !== undefined
+    && isSameFunctionScopedVarBinding(declaration, node, kernelDeclaration, reference.text));
+  return initializedDeclarations.length === 1 && initializedDeclarations[0] === kernelDeclaration;
 }
 
 function lexicalBindings(declaration: ts.FunctionDeclaration): LexicalBinding[] {

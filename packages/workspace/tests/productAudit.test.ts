@@ -61,6 +61,7 @@ function importerWriterFixture(
   kernelBinding = "safetyDecision",
   extraParameter = "",
   kernelDeclaration = "const",
+  beforeKernel = "",
 ): string {
   return `${importsSource}
 async function adversarialPromotion(
@@ -82,7 +83,7 @@ async function adversarialPromotion(
   };
   const stagingTargetPath = assertInsideWorkspace(workspaceRoot, [".app", "import-staging", "adversarial.md"].join("/"));
   const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
-  ${kernelDeclaration} ${kernelBinding} = evaluateImportSafety({
+${beforeKernel}  ${kernelDeclaration} ${kernelBinding} = evaluateImportSafety({
     workspaceRoot,
     operation: "create",
     destination: routed.destination,
@@ -422,6 +423,58 @@ function fabricatedSafetyDecision(destination: string): SafetyDecision {
     });
 
     expect(result.failures).toEqual([]);
+  });
+
+  it.each([
+    [
+      "a fabricated initializer after the kernel",
+      "",
+      `  var safetyDecision = fabricated;
+  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+    ],
+    [
+      "a second kernel initializer after the kernel",
+      "",
+      `  var safetyDecision = evaluateImportSafety({
+    workspaceRoot,
+    operation: "create",
+    destination: routed.destination,
+    destinationExists: false,
+    autoWriteThreshold: 0.95,
+    classification: routed.classification,
+  });
+  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+    ],
+    [
+      "a fabricated initializer before the kernel",
+      "  var safetyDecision = fabricated;\n",
+      `  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }`,
+    ],
+  ])("rejects a coalesced var binding with %s", async (_label, beforeKernel, guardBody) => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importerWriterFixture(
+      importsSource,
+      guardBody,
+      "safetyDecision",
+      "",
+      "var",
+      beforeKernel,
+    );
+
+    expectSourceOverrideToTypecheck(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
   });
 
   it("rejects a nested block lexical shadow of a var kernel binding", async () => {
