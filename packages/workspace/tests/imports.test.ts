@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { extractDocumentText } from "../src/importExtractors";
-import { importDocumentBatch } from "../src/index";
+import { importDocumentBatch, type ImportFileOps } from "../src/index";
 
 describe("importDocumentBatch", () => {
   it("creates one Markdown note with derived summary, body, source, and route metadata for one PDF", async () => {
@@ -276,11 +277,22 @@ describe("importDocumentBatch", () => {
     );
     await writeFile(source, "Handbook content that should remain unchanged during the move.", "utf8");
 
+    const writes: Array<{ path: string; bytes: Buffer }> = [];
+    const operations = testFileOps();
     const job = await importDocumentBatch({
       workspaceRoot: root,
       batchName: "Handbook",
       files: [source],
       now: "2026-07-21T00:00:00.000Z",
+      fileOps: {
+        ...operations,
+        writeFile: async (targetPath, contents, exclusive) => {
+          if (exclusive) {
+            writes.push({ path: targetPath, bytes: Buffer.from(contents) });
+          }
+          await operations.writeFile(targetPath, contents, exclusive);
+        },
+      },
     });
 
     expect(job.notes[0]).toMatchObject({
@@ -296,6 +308,8 @@ describe("importDocumentBatch", () => {
     await expect(
       readFile(path.join(root, ".app/import-staging", job.id, "Handbook.md"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(writes).toHaveLength(2);
+    expect(writes[1]!.bytes.equals(writes[0]!.bytes)).toBe(true);
   });
 
   it("does not overwrite an existing auto-write destination", async () => {
@@ -340,7 +354,133 @@ describe("importDocumentBatch", () => {
     await expect(readFile(destination, "utf8")).resolves.toBe("Existing authoritative note.");
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("New handbook content.");
   });
+
+  it("cleans only artifacts created before a later source fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const first = path.join(sourceDir, "First.txt");
+    const unsupported = path.join(sourceDir, "Second.docx");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await mkdir(path.join(root, "06-Attachments/Imports/Recovery"), { recursive: true });
+    await writeFile(path.join(root, "06-Attachments/Imports/Recovery/Existing.txt"), "Pre-existing attachment.", "utf8");
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({ rules: [{ pattern: "First", category: "resource", sensitivity: "normal", destination: "00-Inbox/Imports/First.md" }] }),
+      "utf8",
+    );
+    await writeFile(first, "First source content.", "utf8");
+    await writeFile(unsupported, "Unsupported source.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Recovery",
+      files: [first, unsupported],
+      now: "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(job).toMatchObject({ state: "failed", sourceFiles: [], notes: [] });
+    await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/First.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, "00-Inbox/Imports/First.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, ".app/import-staging/Recovery-2026-07-29T00-00-00.000Z/First.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/Existing.txt"), "utf8")).resolves.toBe("Pre-existing attachment.");
+  });
+
+  it("keeps a truthful blocked staging artifact when promotion races an existing destination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    const finalPath = path.join(root, "00-Inbox/Imports/Handbook.md");
+    await writeAutoWritePolicy(root);
+    await writeFile(source, "Handbook source content.", "utf8");
+    const operations = testFileOps();
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Handbook",
+      files: [source],
+      now: "2026-07-29T00:00:00.000Z",
+      fileOps: {
+        ...operations,
+        writeFile: async (targetPath, contents, exclusive) => {
+          if (exclusive && targetPath === finalPath) {
+            throw Object.assign(new Error("Destination appeared during promotion"), { code: "EEXIST" });
+          }
+          await operations.writeFile(targetPath, contents, exclusive);
+        },
+      },
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      status: "blocked",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
+      safetyDecision: { decision: "blocked", reasonCodes: ["DESTINATION_EXISTS"] },
+    });
+    await expect(readFile(finalPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("status: blocked");
+  });
+
+  it("rolls back a newly promoted final file when staging cleanup fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    const finalPath = path.join(root, "00-Inbox/Imports/Handbook.md");
+    await writeAutoWritePolicy(root);
+    await writeFile(source, "Handbook source content.", "utf8");
+    const operations = testFileOps();
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Handbook",
+      files: [source],
+      now: "2026-07-29T00:00:00.000Z",
+      fileOps: {
+        ...operations,
+        unlink: async (targetPath) => {
+          if (targetPath.includes("/.app/import-staging/")) {
+            throw new Error("Staging unlink failed");
+          }
+          await operations.unlink(targetPath);
+        },
+      },
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      status: "blocked",
+      notePath: expect.stringMatching(/^\.app\/import-staging\//),
+      safetyDecision: { decision: "blocked", reasonCodes: ["INTERNAL_EVALUATION_ERROR"] },
+    });
+    await expect(readFile(finalPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("status: blocked");
+  });
 });
+
+async function writeAutoWritePolicy(root: string): Promise<void> {
+  await mkdir(path.join(root, ".vault"), { recursive: true });
+  await writeFile(
+    path.join(root, ".vault/routing-policy.json"),
+    JSON.stringify({ rules: [{ pattern: "Handbook", category: "resource", sensitivity: "normal", destination: "00-Inbox/Imports/Handbook.md" }] }),
+    "utf8",
+  );
+}
+
+function testFileOps(): ImportFileOps {
+  return {
+    copyFile: (sourcePath, targetPath) => copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL),
+    mkdir: async (directoryPath) => { await mkdir(directoryPath, { recursive: true }); },
+    pathExists: async (targetPath) => {
+      try {
+        await access(targetPath);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    readFile: (targetPath) => readFile(targetPath),
+    readdir: (directoryPath) => readdir(directoryPath),
+    unlink: (targetPath) => unlink(targetPath),
+    writeFile: (targetPath, contents, exclusive) => writeFile(targetPath, contents, exclusive ? { flag: "wx" } : undefined),
+  };
+}
 
 function frontmatterField(note: string, field: string): string {
   const match = new RegExp(`^${field}:\\s*(.+)$`, "mu").exec(note);

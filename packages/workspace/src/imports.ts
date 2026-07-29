@@ -24,6 +24,7 @@ export interface ImportBatchInput {
   batchName: string;
   files: string[];
   now?: string;
+  fileOps?: Partial<ImportFileOps>;
 }
 
 export type ImportArtifactStatus =
@@ -42,6 +43,16 @@ export interface ImportSourceNote {
   destination?: string;
   classification: ImportClassification;
   safetyDecision: SafetyDecision;
+}
+
+export interface ImportFileOps {
+  copyFile(sourcePath: string, targetPath: string): Promise<void>;
+  mkdir(directoryPath: string): Promise<void>;
+  pathExists(targetPath: string): Promise<boolean>;
+  readFile(targetPath: string): Promise<Buffer>;
+  readdir(directoryPath: string): Promise<string[]>;
+  unlink(targetPath: string): Promise<void>;
+  writeFile(targetPath: string, contents: string | Buffer, exclusive: boolean): Promise<void>;
 }
 
 export interface ImportJob {
@@ -87,28 +98,31 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
   const created = (input.now ?? new Date().toISOString()).slice(0, 10);
   const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
-
-  await mkdir(attachmentTargetDir, { recursive: true });
+  const fileOps: ImportFileOps = { ...defaultImportFileOps, ...input.fileOps };
+  const createdArtifacts = new Set<string>();
 
   try {
+    await fileOps.mkdir(attachmentTargetDir);
     const documents: ImportedDocument[] = [];
     const [attachmentNames, sourceStems] = await Promise.all([
-      existingNames(attachmentTargetDir),
-      existingSourceStems(input.workspaceRoot, id),
+      existingNames(attachmentTargetDir, fileOps),
+      existingSourceStems(input.workspaceRoot, id, fileOps),
     ]);
     for (const file of input.files) {
       const extracted = await extractDocumentText(file);
       const targetFileName = uniqueFileName(sanitizeFileName(extracted.fileName), attachmentNames);
       const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
       const attachmentRelativePath = `${attachmentDir}/${targetFileName}`;
-      await copyFile(file, assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath), constants.COPYFILE_EXCL);
+      const attachmentTargetPath = assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath);
+      await fileOps.copyFile(file, attachmentTargetPath);
+      createdArtifacts.add(attachmentTargetPath);
       documents.push({ ...extracted, attachmentRelativePath, sourceStem });
     }
 
     const policy = await readWorkspaceRoutingPolicy(input.workspaceRoot);
     const notes: ImportSourceNote[] = [];
     for (const document of documents) {
-      notes.push(await persistSourceNote(input.workspaceRoot, id, batchName, created, document, policy));
+      notes.push(await persistSourceNote(input.workspaceRoot, id, batchName, created, document, policy, fileOps, createdArtifacts));
     }
 
     return {
@@ -120,6 +134,7 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
       notes,
     };
   } catch (error) {
+    await cleanupCreatedArtifacts(fileOps, createdArtifacts);
     return {
       id,
       batchName,
@@ -139,6 +154,8 @@ async function persistSourceNote(
   created: string,
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
+  fileOps: ImportFileOps,
+  createdArtifacts: Set<string>,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
   const routed = routeDocument(batchName, title, document, policy);
@@ -149,7 +166,7 @@ async function persistSourceNote(
     workspaceRoot,
     operation: "create",
     destination: routed.destination,
-    destinationExists: destinationTargetPath === undefined ? false : await pathExists(destinationTargetPath),
+    destinationExists: destinationTargetPath === undefined ? false : await fileOps.pathExists(destinationTargetPath),
     autoWriteThreshold: 0.95,
     classification: routed.classification,
   });
@@ -168,14 +185,57 @@ async function persistSourceNote(
     title,
   });
 
-  await mkdir(path.dirname(stagingTargetPath), { recursive: true });
-  await writeFile(stagingTargetPath, rendered, { encoding: "utf8", flag: "wx" });
+  await fileOps.mkdir(path.dirname(stagingTargetPath));
+  await fileOps.writeFile(stagingTargetPath, rendered, true);
+  createdArtifacts.add(stagingTargetPath);
 
   if (status === "auto_written") {
     const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
-    await mkdir(path.dirname(finalTargetPath), { recursive: true });
-    await writeFile(finalTargetPath, await readFile(stagingTargetPath), { flag: "wx" });
-    await unlink(stagingTargetPath);
+    try {
+      await fileOps.mkdir(path.dirname(finalTargetPath));
+      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+      createdArtifacts.add(finalTargetPath);
+      await fileOps.unlink(stagingTargetPath);
+      createdArtifacts.delete(stagingTargetPath);
+    } catch (error) {
+      if (createdArtifacts.has(finalTargetPath)) {
+        try {
+          await fileOps.unlink(finalTargetPath);
+          createdArtifacts.delete(finalTargetPath);
+        } catch {
+          throw error;
+        }
+      }
+
+      const blockedSafetyDecision = blockedPromotionSafetyDecision(error);
+      const blockedNotePath = stagingPath;
+      await fileOps.writeFile(
+        stagingTargetPath,
+        renderImportedSourceNote({
+          attachmentPath: document.attachmentRelativePath,
+          classification: routed.classification,
+          created,
+          destination: routed.destination,
+          document,
+          notePath: blockedNotePath,
+          safetyDecision: blockedSafetyDecision,
+          status: "blocked",
+          summary: summaryFor(document),
+          title,
+        }),
+        false,
+      );
+
+      return {
+        sourceFile: document.fileName,
+        attachmentPath: document.attachmentRelativePath,
+        notePath: blockedNotePath,
+        status: "blocked",
+        destination: routed.destination,
+        classification: routed.classification,
+        safetyDecision: blockedSafetyDecision,
+      };
+    }
   }
 
   return {
@@ -360,9 +420,9 @@ async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<Worksp
   }
 }
 
-async function existingSourceStems(workspaceRoot: string, importId: string): Promise<Set<string>> {
+async function existingSourceStems(workspaceRoot: string, importId: string, fileOps: ImportFileOps): Promise<Set<string>> {
   const directories = [path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importStagingNotePath(importId, "source")))];
-  const names = await Promise.all(directories.map(existingNames));
+  const names = await Promise.all(directories.map((directoryPath) => existingNames(directoryPath, fileOps)));
   return new Set(
     names
       .flatMap((entries) => [...entries])
@@ -371,24 +431,12 @@ async function existingSourceStems(workspaceRoot: string, importId: string): Pro
   );
 }
 
-async function existingNames(directoryPath: string): Promise<Set<string>> {
+async function existingNames(directoryPath: string, fileOps: ImportFileOps): Promise<Set<string>> {
   try {
-    return new Set((await readdir(directoryPath)).map((name) => name.toLocaleLowerCase()));
+    return new Set((await fileOps.readdir(directoryPath)).map((name) => name.toLocaleLowerCase()));
   } catch (error) {
     if (isMissingPath(error)) {
       return new Set<string>();
-    }
-    throw error;
-  }
-}
-
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await access(targetPath);
-    return true;
-  } catch (error) {
-    if (isMissingPath(error)) {
-      return false;
     }
     throw error;
   }
@@ -477,6 +525,49 @@ function artifactStatusFor(safetyDecision: SafetyDecision): ImportArtifactStatus
     return "auto_written";
   }
   return safetyDecision.decision === "blocked" ? "blocked" : "pending_review";
+}
+
+const defaultImportFileOps: ImportFileOps = {
+  copyFile: (sourcePath, targetPath) => copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL),
+  mkdir: async (directoryPath) => { await mkdir(directoryPath, { recursive: true }); },
+  pathExists: async (targetPath) => {
+    try {
+      await access(targetPath);
+      return true;
+    } catch (error) {
+      if (isMissingPath(error)) {
+        return false;
+      }
+      throw error;
+    }
+  },
+  readFile: (targetPath) => readFile(targetPath),
+  readdir: (directoryPath) => readdir(directoryPath),
+  unlink: (targetPath) => unlink(targetPath),
+  writeFile: (targetPath, contents, exclusive) => writeFile(targetPath, contents, exclusive ? { flag: "wx" } : undefined),
+};
+
+async function cleanupCreatedArtifacts(fileOps: ImportFileOps, createdArtifacts: Set<string>): Promise<void> {
+  for (const targetPath of [...createdArtifacts].reverse()) {
+    try {
+      await fileOps.unlink(targetPath);
+    } catch (error) {
+      if (!isMissingPath(error)) {
+        continue;
+      }
+    }
+  }
+}
+
+function blockedPromotionSafetyDecision(error: unknown): SafetyDecision {
+  return {
+    decision: "blocked",
+    reasonCodes: [isFileAlreadyExists(error) ? "DESTINATION_EXISTS" : "INTERNAL_EVALUATION_ERROR"],
+  };
+}
+
+function isFileAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 function escapeYamlString(value: string): string {

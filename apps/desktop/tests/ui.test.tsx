@@ -142,8 +142,8 @@ describe("desktop shell", () => {
             data: {
               state: "completed",
               notes: [
-                { notePath: "00-Inbox/Imports/Handbook.md", routeStatus: "inbox" },
-                { notePath: "04-Resources/Imports/Bills/Electric.md", routeStatus: "pending_review" },
+                { notePath: "00-Inbox/Imports/Handbook.md", status: "auto_written" },
+                { notePath: ".app/import-staging/Bills/Electric.md", status: "pending_review" },
               ],
             },
           };
@@ -159,8 +159,8 @@ describe("desktop shell", () => {
     fireEvent.change(screen.getByLabelText("Import files"), { target: { files: [new File(["body"], "Handbook.txt")] } });
     fireEvent.click(screen.getByRole("button", { name: "Import Documents" }));
 
-    expect(await screen.findByText("Imported note: 00-Inbox/Imports/Handbook.md (inbox)")).toBeVisible();
-    expect(screen.getByText("Imported note: 04-Resources/Imports/Bills/Electric.md (pending_review)")).toBeVisible();
+    expect(await screen.findByText("Imported note: 00-Inbox/Imports/Handbook.md (auto_written)")).toBeVisible();
+    expect(screen.getByText("Imported note: .app/import-staging/Bills/Electric.md (pending_review)")).toBeVisible();
   });
 
   it("renders workspace audit findings in the Knowledge route", () => {

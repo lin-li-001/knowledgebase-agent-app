@@ -200,7 +200,7 @@ export function App() {
     setError(null);
     const result = await api.invoke<{
       state: string;
-      notes?: Array<{ notePath: string; routeStatus: string }>;
+      notes?: Array<{ notePath: string; status: string }>;
       failureReason?: string;
     }>("import:start", input);
     if (!result.ok) {
@@ -211,7 +211,7 @@ export function App() {
       setError(result.data.failureReason ?? "Import failed.");
     } else {
       setImportNotices(
-        (result.data.notes ?? []).map((note) => `Imported note: ${note.notePath} (${note.routeStatus})`),
+        (result.data.notes ?? []).map((note) => `Imported note: ${note.notePath} (${note.status})`),
       );
     }
     await refreshPanels();

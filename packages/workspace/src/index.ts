@@ -13,7 +13,7 @@ export { importCandidateRoutingPolicy, importCandidateRoutingPrecedence } from "
 export { createWorkspace, syncWorkspaceContract } from "./workspace";
 export type { NoteFrontmatter } from "./frontmatter";
 export type { IndexWorkspaceResult } from "./indexer";
-export type { ImportArtifactStatus, ImportBatchInput, ImportJob, ImportSourceNote } from "./imports";
+export type { ImportArtifactStatus, ImportBatchInput, ImportFileOps, ImportJob, ImportSourceNote } from "./imports";
 export type { ParsedMarkdownNote } from "./markdown";
 export type { ProductAuditInput, ProductAuditResult } from "./productAudit";
 export type { WorkspaceAuditFinding, WorkspaceAuditInput, WorkspaceAuditResult, WorkspaceAuditSeverity, WorkspaceAuditStatus } from "./workspaceAudit";

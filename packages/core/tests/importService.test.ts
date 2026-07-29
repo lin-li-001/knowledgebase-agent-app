@@ -15,13 +15,19 @@ afterEach(() => {
 });
 
 describe("startImportBatch", () => {
-  it("imports a low-risk source note into Inbox, indexes it, exports llms-flat, and records activity", async () => {
+  it("auto-writes a safe source note, indexes it, exports llms-flat, and records activity", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-sources-"));
     await mkdir(path.join(root, ".app"), { recursive: true });
     const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
     opened.push(db);
     const handbook = path.join(sourceDir, "Team Handbook.txt");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({ rules: [{ pattern: "Team Handbook", category: "resource", sensitivity: "normal", destination: "00-Inbox/Imports/Team Handbook.md" }] }),
+      "utf8",
+    );
     await writeFile(handbook, "Welcome to the team handbook.\n", "utf8");
 
     const job = await startImportBatch({
@@ -38,7 +44,7 @@ describe("startImportBatch", () => {
     expect(job.notes).toEqual([
       expect.objectContaining({
         notePath: "00-Inbox/Imports/Team Handbook.md",
-        routeStatus: "inbox",
+        status: "auto_written",
       }),
     ]);
     expect(db.sqlite.prepare("SELECT title FROM notes WHERE path = ?").get("00-Inbox/Imports/Team Handbook.md")).toEqual({
@@ -70,7 +76,8 @@ describe("startImportBatch", () => {
 
     expect(job.notes).toEqual([
       expect.objectContaining({
-        routeStatus: "pending_review",
+        status: "pending_review",
+        safetyDecision: expect.objectContaining({ decision: "review_required" }),
         destination: "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md",
       }),
     ]);

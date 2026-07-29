@@ -189,7 +189,7 @@ describe("saved import rules", () => {
 
     expect(job.notes[0]).toMatchObject({
       destination: "03-Knowledge/Project Brief.md",
-      routeStatus: "pending_review",
+      status: "pending_review",
       classification: {
         primaryCategory: "resource",
         sensitivity: "restricted",
@@ -202,7 +202,7 @@ describe("saved import rules", () => {
     ]));
   });
 
-  it("keeps saved user policies in Review even when their classification is normal", async () => {
+  it("auto-writes a normal resource saved policy with full confidence", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-source-"));
     const sourcePath = path.join(sourceDir, "Project Brief.txt");
@@ -230,8 +230,9 @@ describe("saved import rules", () => {
 
     expect(job.notes[0]).toMatchObject({
       destination: "03-Knowledge/Project Brief.md",
-      routeStatus: "pending_review",
-      risk: "high",
+      status: "auto_written",
+      notePath: "03-Knowledge/Project Brief.md",
+      safetyDecision: { decision: "auto_write", reasonCodes: [] },
     });
   });
 
@@ -265,7 +266,7 @@ describe("saved import rules", () => {
       state: "completed",
       notes: [expect.objectContaining({
         destination: "03-Knowledge/Utility Bills.md",
-        routeStatus: "pending_review",
+        status: "pending_review",
       })],
     });
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain(

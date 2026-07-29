@@ -51,7 +51,9 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
 }
 
 async function enqueueHighRiskImportCandidates(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
-  for (const note of job.notes.filter((item) => item.risk === "high" && item.routeStatus === "pending_review")) {
+  for (const note of job.notes.filter(
+    (item) => item.status === "pending_review" && item.safetyDecision.decision === "review_required",
+  )) {
     const reviewItem = reviewItemForImportSourceNote(workspaceId, job, note, createdAt);
     await createReviewItem(db, reviewItem);
     await recordActivity(db, {
@@ -72,9 +74,9 @@ function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note
     id: `import-source-note:${job.id}:${note.notePath}`,
     workspaceId,
     state: "proposed",
-    risk: note.risk,
+    risk: "high",
     proposalType: "propose_create_note",
-    targetPath: note.destination,
+    targetPath: note.destination ?? note.notePath,
     payload: {
       sourceNotePath: note.notePath,
       destination: note.destination,
