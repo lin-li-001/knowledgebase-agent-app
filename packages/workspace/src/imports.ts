@@ -7,7 +7,7 @@ import {
   type SavedImportRule,
 } from "./importClassification";
 import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
-import type { ClassificationSignal, ContentCategory, ImportSensitivity } from "./importSafety";
+import type { ClassificationSignal, ContentCategory, ImportClassification, ImportSensitivity } from "./importSafety";
 import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
@@ -25,6 +25,7 @@ export interface ImportSourceNote {
   routeStatus: "inbox" | "pending_review";
   destination: string;
   risk: "low" | "high";
+  classification: ImportClassification;
 }
 
 export interface ImportJob {
@@ -47,6 +48,7 @@ interface WorkspaceRoutingPolicyFile {
 }
 
 interface RoutedDocument {
+  classification: ImportClassification;
   destination: string;
   risk: ImportSourceNote["risk"];
   routeStatus: ImportSourceNote["routeStatus"];
@@ -148,6 +150,7 @@ async function persistSourceNote(
     routeStatus: routed.routeStatus,
     destination: routed.destination,
     risk: routed.risk,
+    classification: routed.classification,
   };
 }
 
@@ -191,15 +194,16 @@ function routeDocument(
     : hasPersonalFacts
       ? importCandidateRoutingPolicy.profileMemoryDestination("default")
       : importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
-  const savedRuleSignal = savedRoutingRuleSignal(policy, `${title}\n${document.fileName}\n${document.text}`);
+  const savedRuleSignals = savedRoutingRuleSignals(policy, `${title}\n${document.fileName}\n${document.text}`);
   const classification = mergeImportClassification({
-    signals: savedRuleSignal === undefined ? detectorSignals : [...detectorSignals, savedRuleSignal],
+    signals: [...detectorSignals, ...savedRuleSignals],
     fallbackDestination,
   });
   const destination = classification.suggestedDestination ?? fallbackDestination;
   const risk: ImportSourceNote["risk"] = requiresReview(classification.signals) ? "high" : "low";
 
   return {
+    classification,
     destination,
     risk,
     routeStatus: risk === "high" ? "pending_review" : "inbox",
@@ -267,23 +271,21 @@ function ocrMessage(document: ImportedDocument): string {
     : "No extractable document content was found.";
 }
 
-function savedRoutingRuleSignal(policy: WorkspaceRoutingPolicyFile, haystack: string): ClassificationSignal | undefined {
+function savedRoutingRuleSignals(policy: WorkspaceRoutingPolicyFile, haystack: string): ClassificationSignal[] {
   const normalizedHaystack = haystack.toLocaleLowerCase();
-  const rule = policy.rules
+  // The merger keeps the first same-priority signal, making policy order the durable tie-breaker.
+  return policy.rules
     ?.map(parseSavedImportRule)
-    .find((candidate): candidate is SavedImportRule => candidate !== undefined && normalizedHaystack.includes(candidate.pattern.toLocaleLowerCase()));
-  if (rule === undefined) {
-    return undefined;
-  }
-
-  return {
-    source: "saved_user_policy",
-    ...(rule.category === undefined ? {} : { category: rule.category }),
-    ...(rule.sensitivity === undefined ? {} : { sensitivity: rule.sensitivity }),
-    destination: rule.destination,
-    ...(rule.id === undefined ? {} : { ruleId: rule.id }),
-    evidence: [`Saved routing rule: ${truncate(rule.pattern, 240)}`],
-  };
+    .filter((candidate): candidate is SavedImportRule => candidate !== undefined)
+    .filter((rule) => normalizedHaystack.includes(rule.pattern.toLocaleLowerCase()))
+    .map((rule) => ({
+      source: "saved_user_policy",
+      ...(rule.category === undefined ? {} : { category: rule.category }),
+      ...(rule.sensitivity === undefined ? {} : { sensitivity: rule.sensitivity }),
+      destination: rule.destination,
+      ...(rule.id === undefined ? {} : { ruleId: rule.id }),
+      evidence: [`Saved routing rule: ${truncate(rule.pattern, 240)}`],
+    })) ?? [];
 }
 
 function parseSavedImportRule(value: unknown): SavedImportRule | undefined {

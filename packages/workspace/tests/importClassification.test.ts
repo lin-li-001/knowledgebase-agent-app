@@ -151,6 +151,57 @@ describe("mergeImportClassification", () => {
 });
 
 describe("saved import rules", () => {
+  it("merges every matching saved policy before selecting the deterministic first destination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-source-"));
+    const sourcePath = path.join(sourceDir, "Project Brief.txt");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(sourcePath, "Product planning notes", "utf8");
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({
+        rules: [
+          {
+            id: "resource-brief",
+            pattern: "project brief",
+            category: "resource",
+            sensitivity: "normal",
+            destination: "03-Knowledge/Project Brief.md",
+          },
+          {
+            id: "restricted-project",
+            pattern: "project",
+            category: "project.document",
+            sensitivity: "restricted",
+            destination: "01-Projects/default/Project Brief.md",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Project Brief",
+      files: [sourcePath],
+      now: "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      destination: "03-Knowledge/Project Brief.md",
+      routeStatus: "pending_review",
+      classification: {
+        primaryCategory: "resource",
+        sensitivity: "restricted",
+        conflict: true,
+      },
+    });
+    expect(job.notes[0]!.classification.signals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "resource-brief" }),
+      expect.objectContaining({ ruleId: "restricted-project" }),
+    ]));
+  });
+
   it("keeps saved user policies in Review even when their classification is normal", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-source-"));
