@@ -12,10 +12,27 @@ export interface ParsedMarkdownNote {
   contentHash: string;
 }
 
+export interface MarkdownDocument {
+  frontmatter: NoteFrontmatter;
+  content: string;
+}
+
+export function parseMarkdownDocument(raw: string): MarkdownDocument {
+  const parsed = matter(raw);
+  return {
+    frontmatter: parseFrontmatter(parsed.data),
+    content: parsed.content,
+  };
+}
+
+export function serializeMarkdownDocument(document: MarkdownDocument): string {
+  return matter.stringify(document.content, document.frontmatter);
+}
+
 export async function parseMarkdownNote(filePath: string): Promise<ParsedMarkdownNote> {
   const raw = await readFile(filePath, "utf8");
-  const parsed = matter(raw);
-  const frontmatter = parseFrontmatter(parsed.data);
+  const parsed = parseMarkdownDocument(raw);
+  const frontmatter = parsed.frontmatter;
   const body = parsed.content.trim();
 
   return {

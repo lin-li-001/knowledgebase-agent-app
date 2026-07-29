@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CostEstimate, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent } from "@kb-agent/model";
 import { appendMessage } from "@kb-agent/storage";
+import { parseMarkdownNote } from "@kb-agent/workspace";
 import { allowedChannels, handleIpcRequest, isAllowedChannel, restoreWorkspaceFromSettings, type IpcServices } from "../electron/ipc";
 import { readDesktopSettings } from "../electron/secureSettings";
 
@@ -746,10 +747,13 @@ January bill.
     ).resolves.toEqual({ ok: true, data: { id: "review-import-source-note", state: "applied" } });
 
     const promotedBody = await readFile(path.join(root, destination), "utf8");
+    const promotedNote = await parseMarkdownNote(path.join(root, destination));
     expect(promotedBody).toContain("## Document\n\nElectric bill corrected during Review.");
     expect(promotedBody).not.toContain("Electric bill January 2026.");
-    expect(promotedBody).toContain("content_category: resource");
-    expect(promotedBody).toContain('classification_evidence: ["Amount: $123.45","Due: 2026-01-15"');
+    expect(promotedNote.frontmatter.content_category).toBe("resource");
+    expect(promotedNote.frontmatter.classification_evidence).toEqual(
+      expect.arrayContaining(["Amount: $123.45", "Due: 2026-01-15"]),
+    );
     expect(promotedBody).toContain("route_status: approved");
     expect(promotedBody).toContain(`route_destination: ${destination}`);
     expect(promotedBody).toContain("source_file: ../../06-Attachments/Imports/Utility Bill/Utility Bill.pdf");
@@ -764,6 +768,70 @@ January bill.
     ).resolves.toEqual({ ok: true, data: { id: "review-import-source-note", state: "applied" } });
     await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(promotedBody);
     await expect(readFile(path.join(root, "04-Resources/Approved/Do Not Write.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("atomically claims a Review item before concurrent approvals touch staging", async () => {
+    const setup = await setupImportedReview();
+    const readStarted = deferred<void>();
+    const releaseRead = deferred<void>();
+    let reads = 0;
+    setup.services.reviewImportFileOps = {
+      readFile: async (targetPath) => {
+        reads += 1;
+        if (reads === 1) {
+          readStarted.resolve();
+          await releaseRead.promise;
+        }
+        return readFile(targetPath);
+      },
+    };
+    const request = {
+      id: "review-import-source-note",
+      targetPathOverride: "04-Resources/Approved/Utility Bill.md",
+      categoryOverride: "resource",
+    };
+
+    const firstApproval = handleIpcRequest(setup.services, "review:approve", request);
+    await readStarted.promise;
+    await expect(handleIpcRequest(setup.services, "review:approve", request)).resolves.toEqual({
+      ok: false,
+      error: "Review item is currently applying",
+    });
+    releaseRead.resolve();
+    await expect(firstApproval).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    expect(reads).toBe(1);
+  });
+
+  it("prevents rejection after approval has atomically claimed the proposal", async () => {
+    const setup = await setupImportedReview();
+    const readStarted = deferred<void>();
+    const releaseRead = deferred<void>();
+    setup.services.reviewImportFileOps = {
+      readFile: async (targetPath) => {
+        readStarted.resolve();
+        await releaseRead.promise;
+        return readFile(targetPath);
+      },
+    };
+
+    const firstApproval = handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: "04-Resources/Approved/Utility Bill.md",
+      categoryOverride: "resource",
+    });
+    await readStarted.promise;
+    await expect(handleIpcRequest(setup.services, "review:reject", { id: "review-import-source-note" })).resolves.toEqual({
+      ok: false,
+      error: "Review item is currently applying",
+    });
+    releaseRead.resolve();
+    await expect(firstApproval).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
   });
 
   it("blocks a reviewed import collision during approval and preserves the staged authority", async () => {
@@ -790,6 +858,119 @@ January bill.
     await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(existingDestination);
   });
 
+  it("retries a failed approval from preserved staging with a corrected destination", async () => {
+    const existingDestination = activeResourceNote("Existing Utility Bill");
+    const { root, services, sourceNotePath } = await setupImportedReview({ existingDestination });
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-import-source-note" })).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining("DESTINATION_EXISTS"),
+    });
+    const correctedDestination = "04-Resources/Approved/Corrected Utility Bill.md";
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: correctedDestination,
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    await expect(readFile(path.join(root, correctedDestination), "utf8")).resolves.toContain("Electric bill January 2026.");
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toThrow();
+  });
+
+  it("reconciles a crash after promotion without rewriting the destination", async () => {
+    const { root, services, sourceNotePath } = await setupImportedReview();
+    const destination = "04-Resources/Approved/Utility Bill.md";
+    let interrupt = true;
+    services.reviewApplyHooks = {
+      afterPromotion: async () => {
+        if (interrupt) {
+          interrupt = false;
+          throw new Error("simulated interruption after promotion");
+        }
+      },
+    };
+    const request = {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource" as const,
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", request)).resolves.toEqual({
+      ok: false,
+      error: "simulated interruption after promotion",
+    });
+    const promotedBody = await readFile(path.join(root, destination), "utf8");
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toThrow();
+    services.db?.sqlite
+      .prepare(
+        "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ? WHERE id = ?",
+      )
+      .run("interrupted-process", "2000-01-01T00:00:00.000Z", "review-import-source-note");
+    services.reviewImportFileOps = {
+      writeFile: async (targetPath, contents, exclusive) => {
+        if (targetPath === path.join(root, destination)) {
+          throw new Error("destination must not be rewritten");
+        }
+        await writeFile(targetPath, contents, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
+      },
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", request)).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(promotedBody);
+  });
+
+  it("finishes post-move work before applied and replays it without duplicates", async () => {
+    const { root, services } = await setupImportedReview();
+    const destination = "04-Resources/Approved/Utility Bill.md";
+    let interrupt = true;
+    services.reviewApplyHooks = {
+      beforeApplied: async () => {
+        if (interrupt) {
+          interrupt = false;
+          throw new Error("simulated interruption before applied");
+        }
+      },
+    };
+    const request = {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource" as const,
+      saveAsRoutingRule: true,
+      routingRulePattern: "utility bill",
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", request)).resolves.toEqual({
+      ok: false,
+      error: "simulated interruption before applied",
+    });
+    await expect(handleIpcRequest(services, "review:list", {})).resolves.toEqual(
+      expect.objectContaining({
+        data: expect.arrayContaining([
+          expect.objectContaining({ id: "review-import-source-note", state: "failed" }),
+        ]),
+      }),
+    );
+
+    await expect(handleIpcRequest(services, "review:approve", request)).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    const policy = JSON.parse(await readFile(path.join(root, ".vault/routing-policy.json"), "utf8")) as {
+      rules: Array<{ id: string }>;
+    };
+    expect(policy.rules.filter((rule) => rule.id === "routing-rule-review-import-source-note")).toHaveLength(1);
+    expect(
+      services.db?.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM activity_events WHERE id = ?")
+        .get("review-applied-review-import-source-note"),
+    ).toEqual({ count: 1 });
+  });
+
   it("keeps workspace escapes blocked after approval and preserves staging", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
 
@@ -804,6 +985,84 @@ January bill.
     });
     await expect(readFile(path.join(root, sourceNotePath), "utf8")).resolves.toContain("route_status: pending_review");
     await expect(readFile(path.resolve(root, "../outside.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("rejects a staged note symlink whose real path escapes the workspace", async () => {
+    const { root, services, sourceNotePath } = await setupImportedReview();
+    const outside = path.join(await mkdtemp(path.join(tmpdir(), "kb-agent-outside-")), "Staged.md");
+    const stagedBody = await readFile(path.join(root, sourceNotePath), "utf8");
+    await writeFile(outside, stagedBody, "utf8");
+    await unlink(path.join(root, sourceNotePath));
+    await symlink(outside, path.join(root, sourceNotePath));
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-import-source-note" })).resolves.toEqual({
+      ok: false,
+      error: "Path resolves outside workspace",
+    });
+    await expect(readFile(outside, "utf8")).resolves.toBe(stagedBody);
+  });
+
+  it("rejects a destination whose nearest existing parent symlink escapes the workspace", async () => {
+    const { root, services, sourceNotePath } = await setupImportedReview();
+    const outside = await mkdtemp(path.join(tmpdir(), "kb-agent-outside-"));
+    await mkdir(path.join(root, "04-Resources"), { recursive: true });
+    await symlink(outside, path.join(root, "04-Resources/Approved"), "dir");
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: "04-Resources/Approved/Utility Bill.md",
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: false,
+      error: "Path resolves outside workspace",
+    });
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).resolves.toContain("route_status: pending_review");
+    await expect(readFile(path.join(outside, "Utility Bill.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("migrates a legacy Task 3 imported-source payload from staged frontmatter", async () => {
+    const { root, services, sourceNotePath, destination } = await setupImportedReview();
+    services.db?.sqlite
+      .prepare("UPDATE review_items SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify({ sourceNotePath, destination }), "review-import-source-note");
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: "04-Resources/Approved/Legacy Utility Bill.md",
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    await expect(readFile(path.join(root, "04-Resources/Approved/Legacy Utility Bill.md"), "utf8")).resolves.toContain(
+      "Electric bill January 2026.",
+    );
+  });
+
+  it("round-trips YAML-sensitive route and source filenames during approval", async () => {
+    const { root, services, sourceNotePath } = await setupImportedReview();
+    const stagedPath = path.join(root, sourceNotePath);
+    const sourceFile = "../../../06-Attachments/Imports/Bill #1: July.pdf";
+    const staged = (await readFile(stagedPath, "utf8"))
+      .replace(/^source_file: .+$/mu, `source_file: ${JSON.stringify(sourceFile)}`)
+      .replace(/(- \[Original file\]\()[^)]+(\))/u, `$1${sourceFile}$2`);
+    await writeFile(stagedPath, staged, "utf8");
+    const destination = "04-Resources/Approved/Bill #1: July.md";
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+
+    const promoted = await parseMarkdownNote(path.join(root, destination));
+    expect(promoted.frontmatter.route_destination).toBe(destination);
+    expect(promoted.frontmatter.source_file).toBe("../../06-Attachments/Imports/Bill #1: July.pdf");
+    expect(promoted.frontmatter.content_category).toBe("resource");
+    expect(promoted.frontmatter.status).toBe("approved");
   });
 
   it("does not approve a Review item whose safety decision is blocked", async () => {
@@ -875,8 +1134,9 @@ January bill.
       data: { id: "review-import-source-note", state: "rejected" },
     });
     const rejectedBody = await readFile(path.join(root, sourceNotePath), "utf8");
+    const rejectedNote = await parseMarkdownNote(path.join(root, sourceNotePath));
     expect(rejectedBody).toContain("status: rejected");
-    expect(rejectedBody).toContain("tags: [imported, rejected]");
+    expect(rejectedNote.frontmatter.tags).toEqual(["imported", "rejected"]);
     expect(rejectedBody).toContain("route_status: rejected");
     expect(rejectedBody).toContain("- Status: rejected");
     expect(rejectedBody).toContain("Electric bill January 2026.");
@@ -1156,6 +1416,17 @@ tags: []
 
 # ${title}
 `;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {

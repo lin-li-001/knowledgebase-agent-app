@@ -6,11 +6,11 @@ export async function createReviewItem(db: AppDatabase, item: ReviewItem): Promi
       `INSERT INTO review_items (
         id, workspace_id, state, risk, proposal_type, target_path, payload_json,
         reason, source_session_id, source_turn_id, created_at, applied_at,
-        superseded_by, failure_reason
+        superseded_by, failure_reason, claim_token, claim_started_at, application_json
       ) VALUES (
         @id, @workspaceId, @state, @risk, @proposalType, @targetPath, @payloadJson,
         @reason, @sourceSessionId, @sourceTurnId, @createdAt, @appliedAt,
-        @supersededBy, @failureReason
+        @supersededBy, @failureReason, @claimToken, @claimStartedAt, @applicationJson
       )`,
     )
     .run({
@@ -20,7 +20,80 @@ export async function createReviewItem(db: AppDatabase, item: ReviewItem): Promi
       appliedAt: item.appliedAt ?? null,
       supersededBy: item.supersededBy ?? null,
       failureReason: item.failureReason ?? null,
+      claimToken: item.claimToken ?? null,
+      claimStartedAt: item.claimStartedAt ?? null,
+      applicationJson: item.application === undefined ? null : JSON.stringify(item.application),
     });
+}
+
+export async function claimReviewItem(
+  db: AppDatabase,
+  id: string,
+  claim: {
+    from: ReviewState[];
+    to: "applying" | "rejecting";
+    token: string;
+    startedAt: string;
+    application?: unknown;
+    staleBefore?: string;
+  },
+): Promise<boolean> {
+  if (claim.from.length === 0) {
+    return false;
+  }
+  const placeholders = claim.from.map(() => "?").join(", ");
+  const staleClause = claim.staleBefore
+    ? " OR (state = ? AND claim_started_at < ?)"
+    : "";
+  const result = db.sqlite
+    .prepare(
+      `UPDATE review_items
+       SET state = ?, claim_token = ?, claim_started_at = ?, application_json = ?,
+           failure_reason = NULL
+       WHERE id = ? AND (state IN (${placeholders})${staleClause})`,
+    )
+    .run(
+      claim.to,
+      claim.token,
+      claim.startedAt,
+      claim.application === undefined ? null : JSON.stringify(claim.application),
+      id,
+      ...claim.from,
+      ...(claim.staleBefore ? [claim.to, claim.staleBefore] : []),
+    );
+  return result.changes === 1;
+}
+
+export async function updateReviewItemApplication(
+  db: AppDatabase,
+  id: string,
+  claimToken: string,
+  application: unknown,
+): Promise<void> {
+  const result = db.sqlite
+    .prepare(
+      "UPDATE review_items SET application_json = ? WHERE id = ? AND state = 'applying' AND claim_token = ?",
+    )
+    .run(JSON.stringify(application), id, claimToken);
+  if (result.changes !== 1) {
+    throw new Error("Review application claim was lost");
+  }
+}
+
+export async function updateReviewItemPayload(
+  db: AppDatabase,
+  id: string,
+  claimToken: string,
+  payload: unknown,
+): Promise<void> {
+  const result = db.sqlite
+    .prepare(
+      "UPDATE review_items SET payload_json = ? WHERE id = ? AND state = 'applying' AND claim_token = ?",
+    )
+    .run(JSON.stringify(payload), id, claimToken);
+  if (result.changes !== 1) {
+    throw new Error("Review application claim was lost");
+  }
 }
 
 export async function transitionReviewItem(
@@ -31,7 +104,11 @@ export async function transitionReviewItem(
   options: { appliedAt?: string; failureReason?: string | null } = {},
 ): Promise<void> {
   const result = db.sqlite
-    .prepare("UPDATE review_items SET state = ?, applied_at = ?, failure_reason = ? WHERE id = ? AND state = ?")
+    .prepare(
+      `UPDATE review_items
+       SET state = ?, applied_at = ?, failure_reason = ?, claim_token = NULL, claim_started_at = NULL
+       WHERE id = ? AND state = ?`,
+    )
     .run(to, options.appliedAt ?? null, options.failureReason ?? null, id, from);
 
   if (result.changes !== 1) {
@@ -64,11 +141,14 @@ export async function getReviewItem(db: AppDatabase, id: string): Promise<Review
         created_at as createdAt,
         applied_at as appliedAt,
         superseded_by as supersededBy,
-        failure_reason as failureReason
+        failure_reason as failureReason,
+        claim_token as claimToken,
+        claim_started_at as claimStartedAt,
+        application_json as applicationJson
       FROM review_items
       WHERE id = ?`,
     )
-    .get(id) as (ReviewItem & { payloadJson: string | null }) | undefined;
+    .get(id) as (ReviewItem & { payloadJson: string | null; applicationJson: string | null }) | undefined;
 
   return row ? parseReviewRow(row) : null;
 }
@@ -96,18 +176,26 @@ export async function listReviewItems(
         created_at as createdAt,
         applied_at as appliedAt,
         superseded_by as supersededBy,
-        failure_reason as failureReason
+        failure_reason as failureReason,
+        claim_token as claimToken,
+        claim_started_at as claimStartedAt,
+        application_json as applicationJson
       FROM review_items
       WHERE workspace_id = @workspaceId ${stateClause}
       ORDER BY created_at DESC
       LIMIT @limit`,
     )
-    .all({ workspaceId, state, limit }) as Array<ReviewItem & { payloadJson: string | null }>;
+    .all({ workspaceId, state, limit }) as Array<ReviewItem & { payloadJson: string | null; applicationJson: string | null }>;
 
   return rows.map(parseReviewRow);
 }
 
-function parseReviewRow({ payloadJson, ...row }: ReviewItem & { payloadJson: string | null }): ReviewItem {
+function parseReviewRow(
+  { payloadJson, applicationJson, ...row }: ReviewItem & {
+    payloadJson: string | null;
+    applicationJson: string | null;
+  },
+): ReviewItem {
   const item: ReviewItem = {
     id: row.id,
     workspaceId: row.workspaceId,
@@ -131,6 +219,15 @@ function parseReviewRow({ payloadJson, ...row }: ReviewItem & { payloadJson: str
   }
   if (row.failureReason) {
     item.failureReason = row.failureReason;
+  }
+  if (row.claimToken) {
+    item.claimToken = row.claimToken;
+  }
+  if (row.claimStartedAt) {
+    item.claimStartedAt = row.claimStartedAt;
+  }
+  if (applicationJson) {
+    item.application = JSON.parse(applicationJson);
   }
   return item;
 }

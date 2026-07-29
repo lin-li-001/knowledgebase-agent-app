@@ -4,11 +4,15 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   appendMessage,
+  claimReviewItem,
+  createReviewItem,
+  getReviewItem,
   latestMigrationVersion,
   openAppDatabase,
   searchNotes,
   searchSessions,
   type AppDatabase,
+  type ReviewItem,
 } from "../src/index";
 
 let opened: AppDatabase[] = [];
@@ -55,6 +59,11 @@ describe("migrations", () => {
     );
     expect(db.sqlite.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(db.sqlite.pragma("user_version", { simple: true })).toBe(latestMigrationVersion);
+    const reviewColumns = db.sqlite
+      .prepare("PRAGMA table_info(review_items)")
+      .all()
+      .map((row) => (row as { name: string }).name);
+    expect(reviewColumns).toEqual(expect.arrayContaining(["claim_token", "claim_started_at", "application_json"]));
   });
 
   it("cascades workspace-owned runtime records", async () => {
@@ -115,6 +124,50 @@ describe("migrations", () => {
     for (const table of ["notes", "sessions", "review_items", "activity_events", "import_jobs"]) {
       expect(db.sqlite.prepare(`SELECT COUNT(*) as count FROM ${table}`).get()).toEqual({ count: 0 });
     }
+  });
+});
+
+describe("Review item claims", () => {
+  it("allows only one durable application claimant", async () => {
+    const db = await openTempDb();
+    const now = new Date().toISOString();
+    db.sqlite
+      .prepare("INSERT INTO workspaces (id, root_path, created_at, updated_at) VALUES (?, ?, ?, ?)")
+      .run("workspace-claim", "/tmp/workspace-claim", now, now);
+    const item: ReviewItem = {
+      id: "review-claim",
+      workspaceId: "workspace-claim",
+      state: "proposed",
+      risk: "high",
+      proposalType: "propose_create_note",
+      payload: { path: "Note.md", body: "body" },
+      reason: "test",
+      sourceSessionId: "session-claim",
+      sourceTurnId: "turn-claim",
+      createdAt: now,
+    };
+    await createReviewItem(db, item);
+
+    await expect(claimReviewItem(db, item.id, {
+      from: ["proposed", "failed"],
+      to: "applying",
+      token: "claim-1",
+      startedAt: now,
+      application: { destination: "Note.md" },
+    })).resolves.toBe(true);
+    await expect(claimReviewItem(db, item.id, {
+      from: ["proposed", "failed"],
+      to: "applying",
+      token: "claim-2",
+      startedAt: now,
+    })).resolves.toBe(false);
+    await expect(getReviewItem(db, item.id)).resolves.toEqual(
+      expect.objectContaining({
+        state: "applying",
+        claimToken: "claim-1",
+        application: { destination: "Note.md" },
+      }),
+    );
   });
 });
 

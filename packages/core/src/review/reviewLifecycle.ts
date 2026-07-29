@@ -2,7 +2,15 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { assertInsideWorkspace } from "@kb-agent/workspace";
 
-export type ReviewState = "proposed" | "approved" | "applied" | "rejected" | "superseded" | "failed";
+export type ReviewState =
+  | "proposed"
+  | "approved"
+  | "applying"
+  | "applied"
+  | "rejecting"
+  | "rejected"
+  | "superseded"
+  | "failed";
 
 export type ProposalPatch =
   | {
@@ -27,11 +35,20 @@ export interface ReviewItem {
 
 const validTransitions = new Set([
   "proposed->approved",
+  "proposed->applying",
+  "proposed->rejecting",
   "proposed->rejected",
   "proposed->superseded",
   "approved->applied",
   "approved->failed",
+  "approved->applying",
+  "applying->applied",
+  "applying->failed",
+  "rejecting->rejected",
+  "rejecting->failed",
   "failed->proposed",
+  "failed->applying",
+  "failed->rejecting",
 ]);
 
 export function transitionReviewState(from: ReviewState, to: ReviewState): ReviewState {

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { schemaSql } from "./schema";
 
-export const latestMigrationVersion = 1;
+export const latestMigrationVersion = 2;
 
 export function runMigrations(db: Database.Database): void {
   db.pragma("foreign_keys = ON");
@@ -12,10 +12,22 @@ export function runMigrations(db: Database.Database): void {
   }
 
   const migrate = db.transaction(() => {
-    db.exec(schemaSql);
+    const now = new Date().toISOString();
+    if (currentVersion === 0) {
+      db.exec(schemaSql);
+      db.prepare(
+        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+      ).run(1, "initial_schema", now);
+    } else {
+      db.exec(`
+        ALTER TABLE review_items ADD COLUMN claim_token TEXT;
+        ALTER TABLE review_items ADD COLUMN claim_started_at TEXT;
+        ALTER TABLE review_items ADD COLUMN application_json TEXT;
+      `);
+    }
     db.prepare(
       "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-    ).run(latestMigrationVersion, "initial_schema", new Date().toISOString());
+    ).run(2, "review_application_claims", now);
     db.pragma(`user_version = ${latestMigrationVersion}`);
   });
 

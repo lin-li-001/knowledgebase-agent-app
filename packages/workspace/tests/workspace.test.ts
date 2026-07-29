@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { assertInsideWorkspace, createWorkspace } from "../src/index";
+import { assertInsideWorkspace, assertRealPathInsideWorkspace, createWorkspace } from "../src/index";
 
 async function exists(targetPath: string): Promise<boolean> {
   try {
@@ -132,5 +132,26 @@ describe("assertInsideWorkspace", () => {
     const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
 
     expect(() => assertInsideWorkspace(rootPath, "../outside.md")).toThrow("Path escapes workspace");
+  });
+});
+
+describe("assertRealPathInsideWorkspace", () => {
+  it("accepts a nonexistent target under a real workspace parent", async () => {
+    const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
+    await mkdir(path.join(rootPath, "00-Inbox"), { recursive: true });
+
+    await expect(assertRealPathInsideWorkspace(rootPath, "00-Inbox/New.md")).resolves.toBe(
+      path.join(rootPath, "00-Inbox/New.md"),
+    );
+  });
+
+  it("rejects a nonexistent target under a symlinked parent outside the workspace", async () => {
+    const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
+    const outsidePath = await mkdtemp(path.join(tmpdir(), "kb-agent-outside-"));
+    await symlink(outsidePath, path.join(rootPath, "escaped"), "dir");
+
+    await expect(assertRealPathInsideWorkspace(rootPath, "escaped/New.md")).rejects.toThrow(
+      "Path resolves outside workspace",
+    );
   });
 });

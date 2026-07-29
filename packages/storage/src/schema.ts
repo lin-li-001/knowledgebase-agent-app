@@ -128,6 +128,9 @@ CREATE TABLE IF NOT EXISTS review_items (
   applied_at TEXT,
   superseded_by TEXT,
   failure_reason TEXT,
+  claim_token TEXT,
+  claim_started_at TEXT,
+  application_json TEXT,
   FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
 );
 

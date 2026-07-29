@@ -12,6 +12,11 @@ describe("review lifecycle", () => {
     expect(transitionReviewState("proposed", "superseded")).toBe("superseded");
     expect(transitionReviewState("approved", "applied")).toBe("applied");
     expect(transitionReviewState("approved", "failed")).toBe("failed");
+    expect(transitionReviewState("proposed", "applying")).toBe("applying");
+    expect(transitionReviewState("applying", "applied")).toBe("applied");
+    expect(transitionReviewState("proposed", "rejecting")).toBe("rejecting");
+    expect(transitionReviewState("rejecting", "rejected")).toBe("rejected");
+    expect(transitionReviewState("failed", "applying")).toBe("applying");
     expect(transitionReviewState("failed", "proposed")).toBe("proposed");
   });
 

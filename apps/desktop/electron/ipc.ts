@@ -1,12 +1,30 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { createReviewItem, getReviewItem, listActivity, listReviewItems, openAppDatabase, recordActivity, searchNotes, searchSessions, transitionReviewItem, type ActivityEvent, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
+import {
+  claimReviewItem,
+  createReviewItem,
+  getReviewItem,
+  listActivity,
+  listReviewItems,
+  openAppDatabase,
+  recordActivity,
+  recordActivityOnce,
+  searchNotes,
+  searchSessions,
+  transitionReviewItem,
+  updateReviewItemApplication,
+  updateReviewItemPayload,
+  type ActivityEvent,
+  type AppDatabase,
+  type ReviewItem,
+} from "@kb-agent/storage";
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import {
   assertInsideWorkspace,
+  assertRealPathInsideWorkspace,
   auditWorkspace,
   createWorkspace,
   defaultRoutingPolicy,
@@ -14,7 +32,10 @@ import {
   fingerprintImportClassification,
   indexWorkspace,
   mergeImportClassification,
+  parseMarkdownDocument,
+  serializeMarkdownDocument,
   syncWorkspaceContract,
+  type ClassificationSignal,
   workspaceIdForRoot,
   type ContentCategory,
   type ImportClassification,
@@ -37,6 +58,10 @@ export interface IpcServices {
   modelProvider?: ModelProvider;
   debugLogPath?: string;
   reviewImportFileOps?: Partial<ReviewImportFileOps>;
+  reviewApplyHooks?: {
+    afterPromotion?(reviewItemId: string): Promise<void>;
+    beforeApplied?(reviewItemId: string): Promise<void>;
+  };
 }
 
 export interface ReviewImportFileOps {
@@ -413,6 +438,8 @@ interface ReviewApproveOptions {
   routingRulePattern?: string | undefined;
 }
 
+const reviewClaimLeaseMs = 5 * 60 * 1000;
+
 async function approveReviewItem(services: IpcServices, id: string, options: ReviewApproveOptions = {}): Promise<IpcResult> {
   const db = requireDatabase(services);
   const item = await getReviewItem(db, id);
@@ -422,7 +449,17 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
   if (item.state === "applied") {
     return { ok: true, data: { id, state: "applied" } };
   }
-  if (item.state !== "proposed" && item.state !== "approved") {
+  const claimStartedAt = item.claimStartedAt ? Date.parse(item.claimStartedAt) : Number.NaN;
+  const claimIsStale = item.state === "applying"
+    && Number.isFinite(claimStartedAt)
+    && claimStartedAt < Date.now() - reviewClaimLeaseMs;
+  if (item.state === "applying" && !claimIsStale) {
+    return { ok: false, error: "Review item is currently applying" };
+  }
+  if (item.state === "rejecting") {
+    return { ok: false, error: "Review item is currently rejecting" };
+  }
+  if (item.state !== "proposed" && item.state !== "approved" && item.state !== "failed" && !claimIsStale) {
     return { ok: false, error: `Review item is already ${item.state}` };
   }
   if (isImportedSourceNotePayload(item.payload) && item.payload.safetyDecision.decision === "blocked") {
@@ -430,45 +467,91 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
   }
 
   if (item.proposalType === "propose_create_note" || item.proposalType === "propose_decision") {
-    if (item.state === "proposed") {
-      await transitionReviewItem(db, id, "proposed", "approved");
+    const claimToken = randomUUID();
+    const claimed = await claimReviewItem(db, id, {
+      from: ["proposed", "approved", "failed"],
+      to: "applying",
+      token: claimToken,
+      startedAt: new Date().toISOString(),
+      application: reviewApplicationIntent(item, options),
+      staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
+    });
+    if (!claimed) {
+      return reviewClaimConflict(db, id);
+    }
+
+    let claimedItem = item;
+    if (
+      item.proposalType === "propose_create_note"
+      && hasImportedSourceReference(item.payload)
+      && !isImportedSourceNotePayload(item.payload)
+    ) {
+      try {
+        const importedPayload = await reconstructImportedSourcePayload(
+          requireWorkspaceRoot(services),
+          item.payload,
+          reviewImportFileOps(services),
+        );
+        if (importedPayload.safetyDecision.decision === "blocked") {
+          throw new Error("Blocked import artifacts cannot be approved");
+        }
+        await updateReviewItemPayload(db, id, claimToken, importedPayload);
+        claimedItem = { ...item, payload: importedPayload };
+      } catch (error) {
+        await transitionReviewItem(db, id, "applying", "failed", {
+          failureReason: error instanceof Error ? error.message : "Failed to migrate imported Review item",
+        });
+        throw error;
+      }
     }
 
     let entityPath: string;
     try {
-      entityPath = await applyKnowledgeProposal(services, item, options);
+      entityPath = await applyKnowledgeProposal(services, claimedItem, options, {
+        previousApplication: item.application,
+        onPrepared: async (application) => {
+          await updateReviewItemApplication(db, id, claimToken, application);
+        },
+      });
+      await services.reviewApplyHooks?.afterPromotion?.(id);
     } catch (error) {
-      if (isImportedSourceNotePayload(item.payload)) {
-        await transitionReviewItem(db, id, "approved", "failed", {
-          failureReason: error instanceof Error ? error.message : "Failed to move imported source note",
-        });
-      }
+      await transitionReviewItem(db, id, "applying", "failed", {
+        failureReason: error instanceof Error ? error.message : "Failed to apply Review item",
+      });
       throw error;
     }
     const appliedAt = new Date().toISOString();
-    await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
-    await recordActivity(db, {
-      id: randomUUID(),
-      workspaceId: item.workspaceId,
-      kind: "review",
-      title: item.proposalType === "propose_decision" ? "Decision saved" : "Note created",
-      message: `Approved ${item.proposalType} proposal was saved.`,
-      entityPath,
-      reviewItemId: id,
-      createdAt: appliedAt,
-    });
-    const routingDestination = routingDestinationFor(item, options);
-    if (options.saveAsRoutingRule && routingDestination) {
-      const routingCategory = routingCategoryFor(item, options);
-      await saveUserRoutingRule(services, item, {
-        destination: routingDestination,
-        pattern: options.routingRulePattern?.trim() || routingPatternFor(item),
-        ...(routingCategory === undefined ? {} : { category: routingCategory }),
+    try {
+      const routingDestination = routingDestinationFor(item, options);
+      if (options.saveAsRoutingRule && routingDestination) {
+        const routingCategory = routingCategoryFor(item, options);
+        await saveUserRoutingRule(services, item, {
+          destination: routingDestination,
+          pattern: options.routingRulePattern?.trim() || routingPatternFor(item),
+          ...(routingCategory === undefined ? {} : { category: routingCategory }),
+          createdAt: appliedAt,
+        });
+      }
+      if (item.proposalType === "propose_create_note") {
+        await indexWorkspace(requireWorkspaceRoot(services), db);
+      }
+      await recordActivityOnce(db, {
+        id: `review-applied-${id}`,
+        workspaceId: item.workspaceId,
+        kind: "review",
+        title: item.proposalType === "propose_decision" ? "Decision saved" : "Note created",
+        message: `Approved ${item.proposalType} proposal was saved.`,
+        entityPath,
+        reviewItemId: id,
         createdAt: appliedAt,
       });
-    }
-    if (item.proposalType === "propose_create_note") {
-      await indexWorkspace(requireWorkspaceRoot(services), db);
+      await services.reviewApplyHooks?.beforeApplied?.(id);
+      await transitionReviewItem(db, id, "applying", "applied", { appliedAt });
+    } catch (error) {
+      await transitionReviewItem(db, id, "applying", "failed", {
+        failureReason: error instanceof Error ? error.message : "Failed to finish Review application",
+      });
+      throw error;
     }
 
     return { ok: true, data: { id, state: "applied" } };
@@ -483,24 +566,41 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     return { ok: true, data: { id, state: "approved" } };
   }
 
-  if (item.state === "proposed") {
-    await transitionReviewItem(db, id, "proposed", "approved");
+  const claimToken = randomUUID();
+  const claimed = await claimReviewItem(db, id, {
+    from: ["proposed", "approved", "failed"],
+    to: "applying",
+    token: claimToken,
+    startedAt: new Date().toISOString(),
+    application: { options },
+    staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
+  });
+  if (!claimed) {
+    return reviewClaimConflict(db, id);
   }
 
-  await applyMemoryProposal(services, item);
-  const appliedAt = new Date().toISOString();
-  await transitionReviewItem(db, id, "approved", "applied", { appliedAt });
-  await recordActivity(db, {
-    id: randomUUID(),
-    workspaceId: item.workspaceId,
-    kind: "review",
-    title: "Memory saved",
-    message: "Approved memory proposal was saved.",
-    entityPath: defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services)),
-    reviewItemId: id,
-    createdAt: appliedAt,
-  });
-  await indexWorkspace(requireWorkspaceRoot(services), db);
+  try {
+    await applyMemoryProposal(services, item);
+    const appliedAt = new Date().toISOString();
+    const entityPath = defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services));
+    await indexWorkspace(requireWorkspaceRoot(services), db);
+    await recordActivityOnce(db, {
+      id: `review-applied-${id}`,
+      workspaceId: item.workspaceId,
+      kind: "review",
+      title: "Memory saved",
+      message: "Approved memory proposal was saved.",
+      entityPath,
+      reviewItemId: id,
+      createdAt: appliedAt,
+    });
+    await transitionReviewItem(db, id, "applying", "applied", { appliedAt });
+  } catch (error) {
+    await transitionReviewItem(db, id, "applying", "failed", {
+      failureReason: error instanceof Error ? error.message : "Failed to apply memory",
+    });
+    throw error;
+  }
 
   return { ok: true, data: { id, state: "applied" } };
 }
@@ -514,19 +614,55 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
   if (item.state === "rejected") {
     return { ok: true, data: { id, state: "rejected" } };
   }
-  if (item.state !== "proposed") {
+  if (item.state === "applying") {
+    return { ok: false, error: "Review item is currently applying" };
+  }
+  if (item.state === "rejecting") {
+    return { ok: false, error: "Review item is currently rejecting" };
+  }
+  if (item.state !== "proposed" && item.state !== "failed") {
     return { ok: false, error: `Review item is already ${item.state}` };
   }
-  if (isImportedSourceNotePayload(item.payload)) {
-    await rejectImportedSourceNote(
-      requireWorkspaceRoot(services),
-      item.payload.sourceNotePath,
-      reviewImportFileOps(services),
-    );
+  const claimed = await claimReviewItem(db, id, {
+    from: ["proposed", "failed"],
+    to: "rejecting",
+    token: randomUUID(),
+    startedAt: new Date().toISOString(),
+  });
+  if (!claimed) {
+    return reviewClaimConflict(db, id);
   }
 
-  await transitionReviewItem(db, id, "proposed", "rejected");
+  try {
+    if (hasImportedSourceReference(item.payload)) {
+      await rejectImportedSourceNote(
+        requireWorkspaceRoot(services),
+        item.payload.sourceNotePath,
+        reviewImportFileOps(services),
+      );
+    }
+    await transitionReviewItem(db, id, "rejecting", "rejected");
+  } catch (error) {
+    await transitionReviewItem(db, id, "rejecting", "failed", {
+      failureReason: error instanceof Error ? error.message : "Failed to reject Review item",
+    });
+    throw error;
+  }
   return { ok: true, data: { id, state: "rejected" } };
+}
+
+async function reviewClaimConflict(db: AppDatabase, id: string): Promise<IpcResult> {
+  const current = await getReviewItem(db, id);
+  if (current?.state === "applied") {
+    return { ok: true, data: { id, state: "applied" } };
+  }
+  if (current?.state === "applying") {
+    return { ok: false, error: "Review item is currently applying" };
+  }
+  if (current?.state === "rejecting") {
+    return { ok: false, error: "Review item is currently rejecting" };
+  }
+  return { ok: false, error: `Review item is already ${current?.state ?? "missing"}` };
 }
 
 async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Promise<void> {
@@ -566,7 +702,15 @@ tags: []
   await writeFile(targetPath, `${current.trimEnd()}\n\n${bullet}\n`, "utf8");
 }
 
-async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, options: ReviewApproveOptions = {}): Promise<string> {
+async function applyKnowledgeProposal(
+  services: IpcServices,
+  item: ReviewItem,
+  options: ReviewApproveOptions = {},
+  application: {
+    previousApplication?: unknown;
+    onPrepared?(application: ImportMoveApplication): Promise<void>;
+  } = {},
+): Promise<string> {
   if (item.proposalType === "propose_create_note") {
     if (isImportedSourceNotePayload(item.payload)) {
       return moveImportedSourceNote(
@@ -575,6 +719,7 @@ async function applyKnowledgeProposal(services: IpcServices, item: ReviewItem, o
         item.payload,
         options,
         reviewImportFileOps(services),
+        application,
       );
     }
     const payload = createNotePayload(item.payload);
@@ -605,6 +750,22 @@ interface ImportedSourceNotePayload {
   sourceFile: string;
 }
 
+interface ImportMoveApplication {
+  kind: "import_move";
+  reviewItemId: string;
+  sourceNotePath: string;
+  destination: string;
+  classificationFingerprint: string;
+  promotedContentHash: string;
+  options: ReviewApproveOptions;
+}
+
+function hasImportedSourceReference(payload: unknown): payload is { sourceNotePath: string; destination?: string } {
+  return isRecord(payload)
+    && typeof payload.sourceNotePath === "string"
+    && (payload.destination === undefined || typeof payload.destination === "string");
+}
+
 function isImportedSourceNotePayload(payload: unknown): payload is ImportedSourceNotePayload {
   if (!isRecord(payload) || !isRecord(payload.classification) || !isRecord(payload.safetyDecision)) {
     return false;
@@ -630,19 +791,40 @@ async function moveImportedSourceNote(
   payload: ImportedSourceNotePayload,
   options: ReviewApproveOptions,
   fileOps: ReviewImportFileOps,
+  application: {
+    previousApplication?: unknown;
+    onPrepared?(application: ImportMoveApplication): Promise<void>;
+  },
 ): Promise<string> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
-  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
-  if (yamlField(body, "status") !== "pending_review" || yamlField(body, "route_status") !== "pending_review") {
-    throw new Error("Imported source note is no longer pending review");
-  }
-
   const destination = options.targetPathOverride?.trim()
     || payload.destination?.trim()
     || payload.classification.suggestedDestination?.trim()
     || "";
   const destinationPath = safeReviewDestination(workspaceRoot, destination);
   const classification = classificationWithCurrentOverrides(item, payload.classification, destination, options);
+  const classificationFingerprint = fingerprintImportClassification(classification);
+  if (destinationPath !== undefined) {
+    await assertRealPathInsideWorkspace(workspaceRoot, destinationPath);
+  }
+  if (!await fileOps.pathExists(sourcePath)) {
+    return reconcileImportedMove(
+      workspaceRoot,
+      item,
+      payload,
+      destination,
+      classificationFingerprint,
+      application.previousApplication,
+      fileOps,
+    );
+  }
+
+  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
+  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const document = parseMarkdownDocument(body);
+  if (document.frontmatter.status !== "pending_review" || document.frontmatter.route_status !== "pending_review") {
+    throw new Error("Imported source note is no longer pending review");
+  }
   const safetyDecision = evaluateImportSafety({
     workspaceRoot,
     operation: "move",
@@ -653,7 +835,7 @@ async function moveImportedSourceNote(
     approval: {
       reviewItemId: item.id,
       destination,
-      classificationFingerprint: fingerprintImportClassification(classification),
+      classificationFingerprint,
     },
   });
   if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
@@ -661,6 +843,7 @@ async function moveImportedSourceNote(
   }
 
   const approvedDestinationPath = safetyDecision.allowedDestination;
+  await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);
   const updatedBody = updateImportedSourceNoteRoute(
     body,
     sourcePath,
@@ -668,12 +851,25 @@ async function moveImportedSourceNote(
     destination,
     classification,
   );
+  const preparedApplication: ImportMoveApplication = {
+    kind: "import_move",
+    reviewItemId: item.id,
+    sourceNotePath: payload.sourceNotePath,
+    destination,
+    classificationFingerprint,
+    promotedContentHash: hashContents(updatedBody),
+    options,
+  };
+  await application.onPrepared?.(preparedApplication);
   await fileOps.mkdir(path.dirname(approvedDestinationPath));
+  await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);
   await fileOps.writeFile(approvedDestinationPath, updatedBody, true);
   try {
+    await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
     await fileOps.unlink(sourcePath);
   } catch (error) {
     try {
+      await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath, { mustExist: true });
       await fileOps.unlink(approvedDestinationPath);
     } catch (rollbackError) {
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
@@ -683,6 +879,59 @@ async function moveImportedSourceNote(
   }
 
   return destination;
+}
+
+async function reconcileImportedMove(
+  workspaceRoot: string,
+  item: ReviewItem,
+  payload: ImportedSourceNotePayload,
+  destination: string,
+  classificationFingerprint: string,
+  previousApplication: unknown,
+  fileOps: ReviewImportFileOps,
+): Promise<string> {
+  if (!isImportMoveApplication(previousApplication)
+    || previousApplication.reviewItemId !== item.id
+    || previousApplication.sourceNotePath !== payload.sourceNotePath
+    || previousApplication.destination !== destination
+    || previousApplication.classificationFingerprint !== classificationFingerprint) {
+    throw new Error("Imported source note is missing and cannot be reconciled");
+  }
+  const destinationPath = assertInsideWorkspace(workspaceRoot, destination);
+  await assertRealPathInsideWorkspace(workspaceRoot, destinationPath, { mustExist: true });
+  const destinationBody = (await fileOps.readFile(destinationPath)).toString("utf8");
+  if (hashContents(destinationBody) !== previousApplication.promotedContentHash) {
+    throw new Error("Promoted import no longer matches the claimed application");
+  }
+  const document = parseMarkdownDocument(destinationBody);
+  if (document.frontmatter.status !== "approved"
+    || document.frontmatter.route_status !== "approved"
+    || document.frontmatter.route_destination !== destination) {
+    throw new Error("Promoted import does not match current Review intent");
+  }
+  return destination;
+}
+
+function isImportMoveApplication(value: unknown): value is ImportMoveApplication {
+  return isRecord(value)
+    && value.kind === "import_move"
+    && typeof value.reviewItemId === "string"
+    && typeof value.sourceNotePath === "string"
+    && typeof value.destination === "string"
+    && typeof value.classificationFingerprint === "string"
+    && typeof value.promotedContentHash === "string"
+    && isRecord(value.options);
+}
+
+function reviewApplicationIntent(item: ReviewItem, options: ReviewApproveOptions): unknown {
+  if (isImportMoveApplication(item.application)) {
+    return { ...item.application, options };
+  }
+  return { options };
+}
+
+function hashContents(contents: string): string {
+  return createHash("sha256").update(contents).digest("hex");
 }
 
 function classificationWithCurrentOverrides(
@@ -717,28 +966,32 @@ function updateImportedSourceNoteRoute(
   destination: string,
   classification: ImportClassification,
 ): string {
-  const currentSourceLink = yamlField(body, "source_file");
+  const document = parseMarkdownDocument(body);
+  const currentSourceLink = document.frontmatter.source_file;
   const nextSourceLink = currentSourceLink
     ? path.relative(path.dirname(destinationPath), path.resolve(path.dirname(sourcePath), currentSourceLink)).split(path.sep).join("/")
     : undefined;
-  let updated = body
-    .replace(/^status: .+$/mu, "status: approved")
-    .replace(/^tags: .+$/mu, "tags: [imported, approved]")
-    .replace(/^content_category: .+$/mu, `content_category: ${classification.primaryCategory}`)
-    .replace(/^classification_confidence: .+$/mu, `classification_confidence: ${classification.confidence}`)
-    .replace(/^classification_evidence: .+$/mu, `classification_evidence: ${JSON.stringify(classification.evidence)}`)
-    .replace(/^route_status: .+$/mu, "route_status: approved")
-    .replace(/^route_destination: .+$/mu, `route_destination: ${destination}`)
+  document.frontmatter = {
+    ...document.frontmatter,
+    status: "approved",
+    tags: ["imported", "approved"],
+    content_category: classification.primaryCategory,
+    classification_confidence: classification.confidence,
+    classification_evidence: classification.evidence,
+    route_status: "approved",
+    route_destination: destination,
+    ...(nextSourceLink ? { source_file: nextSourceLink } : {}),
+  };
+  document.content = document.content
     .replace(/^- Status: .+$/mu, "- Status: approved")
     .replace(/^- Destination: .+$/mu, `- Destination: ${destination}`);
 
   if (nextSourceLink) {
-    updated = updated
-      .replace(/^source_file: .+$/mu, `source_file: ${nextSourceLink}`)
+    document.content = document.content
       .replace(/(- \[Original file\]\()[^)]+(\))/u, `$1${nextSourceLink}$2`);
   }
 
-  return updated;
+  return serializeMarkdownDocument(document);
 }
 
 async function rejectImportedSourceNote(
@@ -747,13 +1000,89 @@ async function rejectImportedSourceNote(
   fileOps: ReviewImportFileOps,
 ): Promise<void> {
   const sourcePath = importStagingPath(workspaceRoot, sourceNotePath);
+  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
   const body = (await fileOps.readFile(sourcePath)).toString("utf8");
-  const rejectedBody = body
-    .replace(/^status: .+$/mu, "status: rejected")
-    .replace(/^tags: .+$/mu, "tags: [imported, rejected]")
-    .replace(/^route_status: .+$/mu, "route_status: rejected")
-    .replace(/^- Status: .+$/mu, "- Status: rejected");
+  const document = parseMarkdownDocument(body);
+  document.frontmatter = {
+    ...document.frontmatter,
+    status: "rejected",
+    tags: ["imported", "rejected"],
+    route_status: "rejected",
+  };
+  document.content = document.content.replace(/^- Status: .+$/mu, "- Status: rejected");
+  const rejectedBody = serializeMarkdownDocument(document);
+  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
   await fileOps.writeFile(sourcePath, rejectedBody, false);
+}
+
+async function reconstructImportedSourcePayload(
+  workspaceRoot: string,
+  payload: { sourceNotePath: string; destination?: string },
+  fileOps: ReviewImportFileOps,
+): Promise<ImportedSourceNotePayload> {
+  const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
+  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
+  const body = (await fileOps.readFile(sourcePath)).toString("utf8");
+  const { frontmatter } = parseMarkdownDocument(body);
+  const category = contentCategoryFrom(frontmatter.content_category);
+  const evidence = frontmatter.classification_evidence ?? [];
+  const sensitivity = frontmatter.sensitivity === "private" || frontmatter.sensitivity === "sensitive"
+    ? "private"
+    : frontmatter.safety_reason_codes?.includes("SENSITIVITY_REQUIRES_REVIEW")
+      ? "personal"
+      : "normal";
+  const signal: ClassificationSignal = {
+    source: "detector",
+    category,
+    sensitivity,
+    confidence: frontmatter.classification_confidence ?? 0,
+    evidence,
+    ...(frontmatter.route_destination ? { destination: frontmatter.route_destination } : {}),
+  };
+  const classification: ImportClassification = {
+    primaryCategory: category,
+    alternativeCategories: [],
+    sensitivity,
+    confidence: frontmatter.classification_confidence ?? 0,
+    evidence,
+    signals: [signal],
+    ...((frontmatter.route_destination ?? payload.destination)
+      ? { suggestedDestination: frontmatter.route_destination ?? payload.destination }
+      : {}),
+    conflict: frontmatter.safety_reason_codes?.includes("CLASSIFIER_CONFLICT") ?? false,
+  };
+  const decision = frontmatter.review_decision ?? "review_required";
+  const destination = payload.destination ?? frontmatter.route_destination;
+  return {
+    sourceNotePath: payload.sourceNotePath,
+    ...(destination ? { destination } : {}),
+    classification,
+    safetyDecision: {
+      decision,
+      reasonCodes: (frontmatter.safety_reason_codes ?? []) as SafetyDecision["reasonCodes"],
+    },
+    sourceFile: path.basename(frontmatter.source_file ?? payload.sourceNotePath),
+  };
+}
+
+function contentCategoryFrom(value: string | undefined): ContentCategory {
+  const categories = new Set<ContentCategory>([
+    "finance.utility",
+    "finance.insurance",
+    "finance.tax",
+    "finance.statement",
+    "profile.career",
+    "profile.personal_fact",
+    "memory.candidate",
+    "decision.record",
+    "project.document",
+    "resource",
+    "unknown",
+  ]);
+  if (value && categories.has(value as ContentCategory)) {
+    return value as ContentCategory;
+  }
+  return "unknown";
 }
 
 function importStagingPath(workspaceRoot: string, sourceNotePath: string): string {
@@ -798,11 +1127,6 @@ const defaultReviewImportFileOps: ReviewImportFileOps = {
     { encoding: "utf8", flag: exclusive ? "wx" : "w" },
   ),
 };
-
-function yamlField(body: string, key: string): string | undefined {
-  const match = new RegExp(`^${key}:\\s*(.+)$`, "mu").exec(body);
-  return match?.[1]?.trim().replace(/^(["'])(.*)\1$/u, "$2");
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -877,9 +1201,7 @@ async function appendAgentsRoutingRule(workspaceRoot: string, rule: UserRoutingR
 async function writeRoutingRuleAdr(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
   const adrPath = assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.decisionPath(rule.id));
   await mkdir(path.dirname(adrPath), { recursive: true });
-  await writeFile(
-    adrPath,
-    `# User-defined routing rule
+  const contents = `# User-defined routing rule
 
 **Date:** ${rule.createdAt.slice(0, 10)}
 **Status:** Accepted
@@ -907,9 +1229,18 @@ ${rule.destination}
 - The workspace routing policy records this rule in \`.vault/routing-policy.json\`.
 - The workspace contract records the user-readable rule in \`AGENTS.md\`.
 - The source Review item is \`${rule.sourceReviewItemId}\`.
-`,
-    { encoding: "utf8", flag: "wx" },
-  );
+`;
+  try {
+    await writeFile(adrPath, contents, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
+      throw error;
+    }
+    const existing = await readFile(adrPath, "utf8");
+    if (!existing.includes(`The source Review item is \`${rule.sourceReviewItemId}\`.`)) {
+      throw new Error("Saved routing rule ADR conflicts with an existing file");
+    }
+  }
 }
 
 function routingPatternFor(item: ReviewItem): string {

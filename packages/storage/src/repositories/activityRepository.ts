@@ -16,6 +16,22 @@ export async function recordActivity(db: AppDatabase, event: ActivityEvent): Pro
     });
 }
 
+export async function recordActivityOnce(db: AppDatabase, event: ActivityEvent): Promise<void> {
+  db.sqlite
+    .prepare(
+      `INSERT OR IGNORE INTO activity_events (
+        id, workspace_id, kind, title, message, entity_path, review_item_id, created_at
+      ) VALUES (
+        @id, @workspaceId, @kind, @title, @message, @entityPath, @reviewItemId, @createdAt
+      )`,
+    )
+    .run({
+      ...event,
+      entityPath: event.entityPath ?? null,
+      reviewItemId: event.reviewItemId ?? null,
+    });
+}
+
 export async function listActivity(
   db: AppDatabase,
   workspaceId: string,

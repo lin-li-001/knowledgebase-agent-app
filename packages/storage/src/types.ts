@@ -1,6 +1,14 @@
 import type Database from "better-sqlite3";
 
-export type ReviewState = "proposed" | "approved" | "applied" | "rejected" | "superseded" | "failed";
+export type ReviewState =
+  | "proposed"
+  | "approved"
+  | "applying"
+  | "applied"
+  | "rejecting"
+  | "rejected"
+  | "superseded"
+  | "failed";
 
 export interface AppDatabase {
   sqlite: Database.Database;
@@ -33,6 +41,9 @@ export interface ReviewItem {
   appliedAt?: string;
   supersededBy?: string;
   failureReason?: string;
+  claimToken?: string;
+  claimStartedAt?: string;
+  application?: unknown;
 }
 
 export interface SessionMessage {
