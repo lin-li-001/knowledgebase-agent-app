@@ -154,11 +154,14 @@ function auditImporterSafetyKernel(relativePath: string, source: string, result:
   }
 
   const promotionWriters = writerFunctions(sourceFile, isFinalImportPromotionWrite);
-  if (!promotionWriters.length || !promotionWriters.every(({ declaration }) => functionContains(declaration, isSafetyKernelCall))) {
+  if (!promotionWriters.length || !promotionWriters.every(({ declaration }) => safetyDecisionBinding(declaration) !== undefined)) {
     result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!promotionWriters.every(({ declaration, writes }) => writes.every((write) => hasAcceptedAutoWriteShape(declaration, write)))) {
+  if (!promotionWriters.every(({ declaration, writes }) => {
+    const binding = safetyDecisionBinding(declaration);
+    return binding !== undefined && writes.every((write) => hasAcceptedAutoWriteShape(declaration, write, binding));
+  })) {
     result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
     return;
   }
@@ -173,11 +176,14 @@ function auditReviewSafetyKernel(relativePath: string, source: string, result: P
   }
 
   const reviewWriters = writerFunctions(sourceFile, isReviewImportPromotionWrite);
-  if (!reviewWriters.length || !reviewWriters.every(({ declaration }) => functionContains(declaration, isSafetyKernelCall))) {
+  if (!reviewWriters.length || !reviewWriters.every(({ declaration }) => safetyDecisionBinding(declaration) !== undefined)) {
     result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!reviewWriters.every(({ declaration, writes }) => writes.every((write) => hasAcceptedAutoWriteShape(declaration, write)))) {
+  if (!reviewWriters.every(({ declaration, writes }) => {
+    const binding = safetyDecisionBinding(declaration);
+    return binding !== undefined && writes.every((write) => hasAcceptedAutoWriteShape(declaration, write, binding));
+  })) {
     result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
     return;
   }
@@ -196,21 +202,28 @@ function importsNamedBinding(sourceFile: ts.SourceFile, moduleSpecifier: string,
   });
 }
 
-function isSafetyKernelCall(node: ts.Node): boolean {
-  return ts.isCallExpression(node) && calledName(node) === "evaluateImportSafety";
+function safetyDecisionBinding(declaration: ts.FunctionDeclaration): ts.VariableDeclaration | undefined {
+  return nodesInFunction(declaration).find((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
+    && ts.isIdentifier(node.name)
+    && isDirectSafetyKernelCall(node.initializer));
 }
 
-function hasAcceptedAutoWriteShape(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
-  return isInsideAutoWriteBranch(declaration, finalWrite) || isAfterTerminatingAutoWriteGuard(declaration, finalWrite);
+function isDirectSafetyKernelCall(initializer: ts.Expression | undefined): boolean {
+  const expression = initializer !== undefined && ts.isAwaitExpression(initializer) ? initializer.expression : initializer;
+  return expression !== undefined && ts.isCallExpression(expression) && calledName(expression) === "evaluateImportSafety";
 }
 
-function isInsideAutoWriteBranch(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
+function hasAcceptedAutoWriteShape(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression, binding: ts.VariableDeclaration): boolean {
+  return isInsideAutoWriteBranch(declaration, finalWrite, binding) || isAfterTerminatingAutoWriteGuard(declaration, finalWrite, binding);
+}
+
+function isInsideAutoWriteBranch(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression, binding: ts.VariableDeclaration): boolean {
   let current: ts.Node | undefined = finalWrite;
   while (current !== undefined && current !== declaration) {
     const parent: ts.Node = current.parent;
     if (ts.isIfStatement(parent)
       && parent.thenStatement === current
-      && isExactSafetyDecisionComparison(parent.expression, ts.SyntaxKind.EqualsEqualsEqualsToken)) {
+      && isExactSafetyDecisionComparison(declaration, parent.expression, ts.SyntaxKind.EqualsEqualsEqualsToken, binding)) {
       return true;
     }
     current = parent;
@@ -218,14 +231,14 @@ function isInsideAutoWriteBranch(declaration: ts.FunctionDeclaration, finalWrite
   return false;
 }
 
-function isAfterTerminatingAutoWriteGuard(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression): boolean {
+function isAfterTerminatingAutoWriteGuard(declaration: ts.FunctionDeclaration, finalWrite: ts.CallExpression, binding: ts.VariableDeclaration): boolean {
   let current: ts.Node | undefined = finalWrite;
   while (current !== undefined && current !== declaration) {
     const block = current.parent;
     if (ts.isBlock(block) && ts.isStatement(current)) {
       const statementIndex = block.statements.indexOf(current);
       if (block.statements.slice(0, statementIndex).some((statement) => ts.isIfStatement(statement)
-        && isExactSafetyDecisionComparison(statement.expression, ts.SyntaxKind.ExclamationEqualsEqualsToken)
+        && isExactSafetyDecisionComparison(declaration, statement.expression, ts.SyntaxKind.ExclamationEqualsEqualsToken, binding)
         && terminatesDirectly(statement.thenStatement))) {
         return true;
       }
@@ -235,14 +248,54 @@ function isAfterTerminatingAutoWriteGuard(declaration: ts.FunctionDeclaration, f
   return false;
 }
 
-function isExactSafetyDecisionComparison(expression: ts.Expression, operator: ts.SyntaxKind): boolean {
+function isExactSafetyDecisionComparison(
+  declaration: ts.FunctionDeclaration,
+  expression: ts.Expression,
+  operator: ts.SyntaxKind,
+  binding: ts.VariableDeclaration,
+): boolean {
   return ts.isBinaryExpression(expression)
     && expression.operatorToken.kind === operator
     && ts.isPropertyAccessExpression(expression.left)
-    && isIdentifierNamed(expression.left.expression, "safetyDecision")
+    && ts.isIdentifier(expression.left.expression)
+    && resolvesToBinding(declaration, expression.left.expression) === binding
     && expression.left.name.text === "decision"
     && ts.isStringLiteral(expression.right)
     && expression.right.text === "auto_write";
+}
+
+function resolvesToBinding(declaration: ts.FunctionDeclaration, reference: ts.Identifier): ts.VariableDeclaration | undefined {
+  const candidates = nodesInFunction(declaration).filter((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
+    && ts.isIdentifier(node.name)
+    && node.name.text === reference.text
+    && node.pos < reference.pos
+    && nodeIsInside(reference, declarationScope(node, declaration)));
+  return candidates.sort((left, right) => scopeDepth(declarationScope(right, declaration)) - scopeDepth(declarationScope(left, declaration)))[0];
+}
+
+function declarationScope(variable: ts.VariableDeclaration, declaration: ts.FunctionDeclaration): ts.Node {
+  let current: ts.Node | undefined = variable.parent;
+  while (current !== undefined && current !== declaration) {
+    if (ts.isBlock(current)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return declaration;
+}
+
+function nodeIsInside(node: ts.Node, container: ts.Node): boolean {
+  return container.pos <= node.pos && node.end <= container.end;
+}
+
+function scopeDepth(node: ts.Node): number {
+  let depth = 0;
+  let current: ts.Node | undefined = node.parent;
+  while (current !== undefined) {
+    depth += 1;
+    current = current.parent;
+  }
+  return depth;
 }
 
 function terminatesDirectly(statement: ts.Statement): boolean {
@@ -347,10 +400,6 @@ function nodesInFunction(functionDeclaration: ts.FunctionDeclaration): ts.Node[]
   return nodes;
 }
 
-function functionContains(functionDeclaration: ts.FunctionDeclaration, predicate: (node: ts.Node) => boolean): boolean {
-  return nodesInFunction(functionDeclaration).some(predicate);
-}
-
 function expectContractText(result: ProductAuditResult, source: string, expectedRoute: string, label: string): void {
   if (!source.includes(expectedRoute)) {
     result.failures.push(`workspace contract is missing ${label} route ${expectedRoute}`);
@@ -388,7 +437,7 @@ async function auditImportStagingExclusion(repoRoot: string, sourceOverrides: Ma
     : nodesInFunction(traversal).filter((node): node is ts.CallExpression => ts.isCallExpression(node)
       && calledName(node) === "collectMarkdownFiles"
       && isIdentifierNamed(node.arguments[0], "fullPath"));
-  const predicateSkipsApp = skipPredicate !== undefined && functionContains(skipPredicate, isExactAppDirectoryCheck);
+  const predicateSkipsApp = skipPredicate !== undefined && returnsTrueForAppDirectory(skipPredicate);
   const recursiveCallsAreGuarded = traversal !== undefined && recursiveCalls.length > 0 && recursiveCalls.every((recursiveCall) => isRecursiveIndexCallGuarded(traversal, recursiveCall));
   if (!predicateSkipsApp || !recursiveCallsAreGuarded) {
     result.failures.push("indexer does not exclude runtime staging from indexing");
@@ -427,6 +476,24 @@ function isSkipDirectoryGuard(node: ts.IfStatement): boolean {
     && ts.isIdentifier(node.expression.expression)
     && node.expression.expression.text === "shouldSkipDirectory"
     && isPropertyAccessNamed(node.expression.arguments[0], "entry", "name");
+}
+
+function returnsTrueForAppDirectory(predicate: ts.FunctionDeclaration): boolean {
+  const body = predicate.body;
+  return body !== undefined && body.statements.some((statement) => (ts.isReturnStatement(statement) && returnExpressionIsTrueForApp(statement.expression))
+    || (ts.isIfStatement(statement) && isExactAppDirectoryCheck(statement.expression) && returnsTrueDirectly(statement.thenStatement)));
+}
+
+function returnExpressionIsTrueForApp(expression: ts.Expression | undefined): boolean {
+  return expression !== undefined && (isExactAppDirectoryCheck(expression)
+    || (ts.isBinaryExpression(expression)
+      && expression.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      && (returnExpressionIsTrueForApp(expression.left) || returnExpressionIsTrueForApp(expression.right))));
+}
+
+function returnsTrueDirectly(statement: ts.Statement): boolean {
+  const statements = ts.isBlock(statement) ? statement.statements : [statement];
+  return statements.some((child) => ts.isReturnStatement(child) && child.expression?.kind === ts.SyntaxKind.TrueKeyword);
 }
 
 function isExactAppDirectoryCheck(node: ts.Node): boolean {

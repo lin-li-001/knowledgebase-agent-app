@@ -252,6 +252,27 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
     expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
   });
 
+  it("rejects an importer guard bound to a fabricated decision", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource.replace(
+      "const safetyDecision = evaluateImportSafety({",
+      "const safetyDecision = fabricatedSafetyDecision(routed.destination);\n  const unusedSafetyDecision = evaluateImportSafety({",
+    )}
+function fabricatedSafetyDecision(destination: string): SafetyDecision {
+  return { decision: "auto_write", reasonCodes: [], allowedDestination: destination };
+}
+`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
   it("rejects an executable importer decoy when the real promotion writer is ungated", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
@@ -351,6 +372,27 @@ async function decoyReviewPromotion(
     );
 
     expect(brokenReviewSource).toContain('if (safetyDecision.decision === "auto_write")');
+    expectSourceOverrideToCompile(reviewPath, brokenReviewSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: apps/desktop/electron/ipc.ts");
+  });
+
+  it("rejects a Review guard bound to a fabricated decision", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = `${reviewSource.replace(
+      "const safetyDecision = evaluateImportSafety({",
+      "const safetyDecision = fabricatedSafetyDecision(destination);\n  const unusedSafetyDecision = evaluateImportSafety({",
+    )}
+function fabricatedSafetyDecision(destination: string): SafetyDecision {
+  return { decision: "auto_write", reasonCodes: [], allowedDestination: destination };
+}
+`;
+
     expectSourceOverrideToCompile(reviewPath, brokenReviewSource);
     const result = await auditProductContracts({
       repoRoot,
@@ -611,6 +653,23 @@ void shouldSkipDirectory(".app");
     const brokenIndexerSource = indexerSource.replace(
       "      if (shouldSkipDirectory(entry.name)) {\n        continue;\n      }",
       "      shouldSkipDirectory(entry.name);",
+    );
+
+    expectSourceOverrideToCompile(indexerPath, brokenIndexerSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
+    });
+
+    expect(result.failures).toContain("indexer does not exclude runtime staging from indexing");
+  });
+
+  it("rejects a no-op .app comparison in the skip predicate", async () => {
+    const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
+    const indexerSource = await readFile(indexerPath, "utf8");
+    const brokenIndexerSource = indexerSource.replace(
+      'return name === ".app" || name === "06-Attachments" || name === "node_modules" || name.startsWith(".");',
+      'name === ".app";\n  return name === "06-Attachments" || name === "node_modules" || name.startsWith(".");',
     );
 
     expectSourceOverrideToCompile(indexerPath, brokenIndexerSource);
