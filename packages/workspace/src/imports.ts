@@ -1,7 +1,13 @@
 import { access, copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
+import {
+  detectImportSignals,
+  mergeImportClassification,
+  type SavedImportRule,
+} from "./importClassification";
 import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
+import type { ClassificationSignal, ContentCategory, ImportSensitivity } from "./importSafety";
 import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
@@ -37,10 +43,7 @@ interface ImportedDocument extends ExtractedDocument {
 }
 
 interface WorkspaceRoutingPolicyFile {
-  rules?: Array<{
-    pattern?: string;
-    destination?: string;
-  }>;
+  rules?: unknown[];
 }
 
 interface RoutedDocument {
@@ -173,19 +176,28 @@ function routeDocument(
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
 ): RoutedDocument {
-  const isFinance = /\b(bill|utility|utilities|electric|water|gas|amount|due)\b/iu.test(`${batchName}\n${document.text}`)
-    && /\$\d|\bamount\b|\bdue\b/iu.test(document.text);
-  const hasPersonalFacts = extractEmploymentFacts(document).length > 0;
+  const detectorSignals = detectImportSignals({
+    batchName,
+    fileName: document.fileName,
+    text: document.text,
+  });
   const year = firstYear(document.text) ?? firstYear(batchName);
-  const defaultDestination = isFinance
+  const isFinance = detectorSignals.some((signal) => signal.category === "finance.utility");
+  const hasPersonalFacts = detectorSignals.some((signal) => signal.category === "profile.career");
+  const fallbackDestination = isFinance
     ? importCandidateRoutingPolicy.financeUtilitiesDestination(
       year === undefined ? { batchName: title } : { batchName: title, year },
     )
     : hasPersonalFacts
       ? importCandidateRoutingPolicy.profileMemoryDestination("default")
       : importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
-  const destination = routingRuleDestination(policy, `${title}\n${document.fileName}\n${document.text}`) ?? defaultDestination;
-  const risk: ImportSourceNote["risk"] = isFinance || hasPersonalFacts ? "high" : "low";
+  const savedRuleSignal = savedRoutingRuleSignal(policy, `${title}\n${document.fileName}\n${document.text}`);
+  const classification = mergeImportClassification({
+    signals: savedRuleSignal === undefined ? detectorSignals : [...detectorSignals, savedRuleSignal],
+    fallbackDestination,
+  });
+  const destination = classification.suggestedDestination ?? fallbackDestination;
+  const risk: ImportSourceNote["risk"] = requiresReview(classification.signals) ? "high" : "low";
 
   return {
     destination,
@@ -255,9 +267,88 @@ function ocrMessage(document: ImportedDocument): string {
     : "No extractable document content was found.";
 }
 
-function routingRuleDestination(policy: WorkspaceRoutingPolicyFile, haystack: string): string | undefined {
+function savedRoutingRuleSignal(policy: WorkspaceRoutingPolicyFile, haystack: string): ClassificationSignal | undefined {
   const normalizedHaystack = haystack.toLocaleLowerCase();
-  return policy.rules?.find((rule) => rule.pattern && rule.destination && normalizedHaystack.includes(rule.pattern.toLocaleLowerCase()))?.destination;
+  const rule = policy.rules
+    ?.map(parseSavedImportRule)
+    .find((candidate): candidate is SavedImportRule => candidate !== undefined && normalizedHaystack.includes(candidate.pattern.toLocaleLowerCase()));
+  if (rule === undefined) {
+    return undefined;
+  }
+
+  return {
+    source: "saved_user_policy",
+    ...(rule.category === undefined ? {} : { category: rule.category }),
+    ...(rule.sensitivity === undefined ? {} : { sensitivity: rule.sensitivity }),
+    destination: rule.destination,
+    ...(rule.id === undefined ? {} : { ruleId: rule.id }),
+    evidence: [`Saved routing rule: ${truncate(rule.pattern, 240)}`],
+  };
+}
+
+function parseSavedImportRule(value: unknown): SavedImportRule | undefined {
+  if (!isRecord(value) || !nonEmptyString(value.pattern) || !nonEmptyString(value.destination)) {
+    return undefined;
+  }
+
+  return {
+    pattern: value.pattern,
+    destination: value.destination,
+    ...(isContentCategory(value.category) ? { category: value.category } : {}),
+    ...(isImportSensitivity(value.sensitivity) ? { sensitivity: value.sensitivity } : {}),
+    ...(nonEmptyString(value.id) ? { id: value.id } : {}),
+  };
+}
+
+function requiresReview(signals: ClassificationSignal[]): boolean {
+  return signals.some((signal) =>
+    signal.source === "saved_user_policy" ||
+    signal.sensitivity !== undefined && signal.sensitivity !== "normal" ||
+    signal.category !== undefined && protectedCategories.has(signal.category),
+  );
+}
+
+const protectedCategories = new Set<ContentCategory>([
+  "finance.utility",
+  "finance.insurance",
+  "finance.tax",
+  "finance.statement",
+  "profile.career",
+  "profile.personal_fact",
+  "memory.candidate",
+  "decision.record",
+]);
+
+const contentCategories = new Set<ContentCategory>([
+  "finance.utility",
+  "finance.insurance",
+  "finance.tax",
+  "finance.statement",
+  "profile.career",
+  "profile.personal_fact",
+  "memory.candidate",
+  "decision.record",
+  "project.document",
+  "resource",
+  "unknown",
+]);
+
+const importSensitivities = new Set<ImportSensitivity>(["normal", "personal", "private", "restricted"]);
+
+function isContentCategory(value: unknown): value is ContentCategory {
+  return typeof value === "string" && contentCategories.has(value as ContentCategory);
+}
+
+function isImportSensitivity(value: unknown): value is ImportSensitivity {
+  return typeof value === "string" && importSensitivities.has(value as ImportSensitivity);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
 }
 
 async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<WorkspaceRoutingPolicyFile> {
@@ -307,11 +398,6 @@ async function pathExists(targetPath: string): Promise<boolean> {
 
 function isMissingPath(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function extractEmploymentFacts(document: ImportedDocument): string[] {
-  const employmentPattern = /^.{2,120}?\s+\|\s+[A-Z][a-z]{2,8}\s+\d{4}\s*[–-]\s*(Present|[A-Z][a-z]{2,8}\s+\d{4})$/u;
-  return document.text.split(/\r?\n/u).filter((line) => employmentPattern.test(line.replace(/\s+/gu, " ").trim()));
 }
 
 function documentBlocks(markdownBody: string): string[] {
