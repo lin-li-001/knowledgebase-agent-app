@@ -1,5 +1,5 @@
 import { test, expect, _electron as electron, type Locator } from "@playwright/test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -32,8 +32,8 @@ test("imports a PDF document through the desktop UI", async () => {
   const window = await app.firstWindow();
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-workspace-"));
   const sourceRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-e2e-import-"));
-  const pdfPath = path.join(sourceRoot, "Resume-Lin Li-2026.pdf");
-  await writeFile(pdfPath, minimalPdf("Resume Lin Li PDF Import Test"));
+  const pdfPath = path.join(sourceRoot, "Generic-Document.pdf");
+  await writeFile(pdfPath, minimalPdf("Generic PDF Import Test"));
 
   await window.getByRole("button", { name: "Settings" }).click();
   await setInputValue(window.getByLabel("Workspace Root"), workspaceRoot);
@@ -41,14 +41,20 @@ test("imports a PDF document through the desktop UI", async () => {
   await expect(window.getByText("Workspace active")).toBeVisible();
 
   await window.getByRole("button", { name: "Knowledge" }).click();
-  await window.getByLabel("Batch name").fill("resume");
+  await window.getByLabel("Batch name").fill("generic");
   await window.locator('input[type="file"]').setInputFiles(pdfPath);
   await window.getByRole("button", { name: "Import Documents" }).click();
 
   await expect(window.getByText("Import completed")).toBeVisible();
-  await expect(readFile(path.join(workspaceRoot, "04-Resources/Imports/resume.md"), "utf8")).resolves.toContain(
-    "Resume Lin Li PDF Import Test",
-  );
+  const stagingRoot = path.join(workspaceRoot, ".app/import-staging");
+  const [jobDirectory] = await readdir(stagingRoot);
+  const [stagedNote] = await readdir(path.join(stagingRoot, jobDirectory));
+  await expect(readFile(path.join(stagingRoot, jobDirectory, stagedNote), "utf8")).resolves.toContain("Generic PDF Import Test");
+  await expect(readFile(path.join(workspaceRoot, "04-Resources/Imports/generic.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+  await window.getByRole("button", { name: "Review" }).click();
+  await expect(window.getByText("Category: unknown")).toBeVisible();
+  await expect(window.getByText("Reasons: CLASSIFICATION_UNKNOWN")).toBeVisible();
 
   await app.close();
 });

@@ -3,11 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createWorkspace } from "../src/index";
 import {
   auditProductContracts as auditProductContractsImplementation,
-  createWorkspace,
   type ProductAuditInput,
-} from "../src/index";
+} from "../src/productAudit";
 
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
 let workspaceRoot: string;
