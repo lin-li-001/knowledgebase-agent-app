@@ -24,6 +24,7 @@ describe("importDocumentBatch", () => {
     await expect(readFile(path.join(root, job.notes[0]!.attachmentPath), "utf8")).resolves.toContain("Handbook import test");
     const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
     expect(note).toContain("summary:");
+    expect(note).not.toContain("## Summary");
     expect(note).toContain("<!-- Page 1 -->");
     expect(note).toContain("## Source");
     expect(note).toContain("## Routing");
@@ -130,7 +131,7 @@ describe("importDocumentBatch", () => {
     });
 
     const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
-    const summary = markdownSection(note, "Summary");
+    const summary = frontmatterField(note, "summary");
     const document = markdownSection(note, "Document");
 
     expect(document).toContain("Opening policy paragraph that must remain only in the document body.");
@@ -248,6 +249,11 @@ describe("importDocumentBatch", () => {
     });
   });
 });
+
+function frontmatterField(note: string, field: string): string {
+  const match = new RegExp(`^${field}:\\s*(.+)$`, "mu").exec(note);
+  return match?.[1]?.trim().replace(/^"|"$/gu, "") ?? "";
+}
 
 function markdownSection(note: string, heading: string): string {
   const match = new RegExp(`## ${heading}\\n\\n([\\s\\S]*?)(?=\\n## |$)`, "u").exec(note);

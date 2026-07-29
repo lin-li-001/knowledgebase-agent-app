@@ -217,10 +217,6 @@ ${input.document.pageCount ? `page_count: ${input.document.pageCount}\n` : ""}${
 
 # ${input.title}
 
-## Summary
-
-${input.summary}
-
 ## Document
 
 ${documentBody}
