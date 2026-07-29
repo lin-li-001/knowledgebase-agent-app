@@ -1,4 +1,19 @@
 import { useState } from "react";
+import type { ContentCategory } from "@kb-agent/workspace";
+
+const contentCategories = [
+  "finance.utility",
+  "finance.insurance",
+  "finance.tax",
+  "finance.statement",
+  "profile.career",
+  "profile.personal_fact",
+  "memory.candidate",
+  "decision.record",
+  "project.document",
+  "resource",
+  "unknown",
+] as const satisfies readonly ContentCategory[];
 
 export interface ReviewCardItem {
   id: string;
@@ -14,6 +29,7 @@ export interface ReviewCardItem {
 }
 
 export interface ReviewApprovalOptions {
+  categoryOverride?: ContentCategory;
   targetPathOverride?: string;
   saveAsRoutingRule?: boolean;
   routingRulePattern?: string;
@@ -28,27 +44,29 @@ export function ReviewItemCard({
   onApprove?(id: string, options?: ReviewApprovalOptions): Promise<void>;
   onReject?(id: string): Promise<void>;
 }) {
-  const canApprove = item.state === undefined || item.state === "proposed" || item.state === "approved";
-  const canReject = item.state === undefined || item.state === "proposed";
+  const canApprove = item.state === undefined || item.state === "proposed" || item.state === "approved" || item.state === "failed";
+  const canReject = item.state === undefined || item.state === "proposed" || item.state === "failed";
   const source = reviewSource(item);
   const editableDestination = destinationPath(item);
+  const importDetails = importReviewDetails(item);
   const [destination, setDestination] = useState(editableDestination ?? "");
+  const [category, setCategory] = useState<ContentCategory | undefined>(importDetails?.category);
   const [saveAsRoutingRule, setSaveAsRoutingRule] = useState(false);
   const [routingRulePattern, setRoutingRulePattern] = useState("");
 
   function approve() {
-    if (!editableDestination) {
-      void onApprove?.(item.id);
-      return;
-    }
-
-    const trimmedDestination = destination.trim();
-    const trimmedPattern = routingRulePattern.trim();
     const options: ReviewApprovalOptions = {};
-    if (trimmedDestination && trimmedDestination !== editableDestination) {
-      options.targetPathOverride = trimmedDestination;
+    if (importDetails && category && category !== importDetails.category) {
+      options.categoryOverride = category;
+    }
+    if (editableDestination) {
+      const trimmedDestination = destination.trim();
+      if (trimmedDestination && trimmedDestination !== editableDestination) {
+        options.targetPathOverride = trimmedDestination;
+      }
     }
     if (saveAsRoutingRule) {
+      const trimmedPattern = routingRulePattern.trim();
       options.saveAsRoutingRule = true;
       if (trimmedPattern) {
         options.routingRulePattern = trimmedPattern;
@@ -67,6 +85,17 @@ export function ReviewItemCard({
       </div>
       <h3>{reviewTitle(item)}</h3>
       <p>{item.reason}</p>
+      {importDetails ? (
+        <div className="review-classification">
+          <ul aria-label="Import classification">
+            <li>Category: {importDetails.category}</li>
+            <li>Sensitivity: {importDetails.sensitivity}</li>
+            <li>Confidence: {importDetails.confidence}</li>
+            {importDetails.evidence.map((evidence) => <li key={evidence}>Evidence: {evidence}</li>)}
+            {importDetails.reasonCodes.map((reasonCode) => <li key={reasonCode}>Reasons: {reasonCode}</li>)}
+          </ul>
+        </div>
+      ) : null}
       {item.sourceSessionId && item.sourceTurnId ? (
         <p className="review-source">From session {item.sourceSessionId}, turn {item.sourceTurnId}</p>
       ) : null}
@@ -94,6 +123,14 @@ export function ReviewItemCard({
       ) : null}
       {editableDestination ? (
         <div className="routing-review">
+          {importDetails ? (
+            <label>
+              Category
+              <select value={category} onChange={(event) => setCategory(event.currentTarget.value as ContentCategory)}>
+                {contentCategories.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}
+              </select>
+            </label>
+          ) : null}
           <label>
             Destination
             <input value={destination} onChange={(event) => setDestination(event.currentTarget.value)} />
@@ -210,6 +247,52 @@ function reviewSource(item: ReviewCardItem): { reason?: string; userMessage?: st
     result.assistantMessage = assistantMessage;
   }
   return result;
+}
+
+function importReviewDetails(item: ReviewCardItem): {
+  category: ContentCategory;
+  sensitivity: string;
+  confidence: string;
+  evidence: string[];
+  reasonCodes: string[];
+} | null {
+  const payload = item.payload;
+  if (!isRecord(payload) || !isRecord(payload.classification) || !isRecord(payload.safetyDecision)) {
+    return null;
+  }
+
+  const category = payload.classification.primaryCategory;
+  const sensitivity = payload.classification.sensitivity;
+  const confidence = payload.classification.confidence;
+  const evidence = payload.classification.evidence;
+  const reasonCodes = payload.safetyDecision.reasonCodes;
+  if (
+    !isContentCategory(category)
+    || typeof sensitivity !== "string"
+    || typeof confidence !== "number"
+    || !Array.isArray(evidence)
+    || !evidence.every((value) => typeof value === "string")
+    || !Array.isArray(reasonCodes)
+    || !reasonCodes.every((value) => typeof value === "string")
+  ) {
+    return null;
+  }
+
+  return {
+    category,
+    sensitivity,
+    confidence: String(confidence),
+    evidence,
+    reasonCodes,
+  };
+}
+
+function isContentCategory(value: unknown): value is ContentCategory {
+  return typeof value === "string" && (contentCategories as readonly string[]).includes(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function stringField(source: object, key: string): string | undefined {

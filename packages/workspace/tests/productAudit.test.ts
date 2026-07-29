@@ -14,6 +14,8 @@ describe("product audit", () => {
     expect(result.passes).toContain("routing policy paths are documented in the workspace contract");
     expect(result.passes).toContain("import routing precedence is documented in the workspace contract");
     expect(result.passes).toContain("import candidate routing precedence is implemented");
+    expect(result.passes).toContain("final import writes invoke the Safety Kernel");
+    expect(result.passes).toContain("import staging is documented as non-indexed");
     expect(result.passes).toContain("filesystem writers use routingPolicy instead of route literals");
     expect(result.passes).toContain("implementation repo has a docs/decisions decision mirror");
     expect(result.warnings).toEqual([]);
@@ -85,14 +87,77 @@ describe("product audit", () => {
   it("fails when the workspace contract omits import routing precedence", async () => {
     const contractPath = path.join(repoRoot, "packages/workspace/src/templates.ts");
     const contractSource = await readFile(contractPath, "utf8");
-    const brokenContractSource = contractSource.replace("Review target override", "Manual path");
+    const brokenContractSource = contractSource.replace("Current Review category and destination overrides", "Manual path");
 
     const result = await auditProductContracts({
       repoRoot,
       sourceOverrides: new Map([[contractPath, brokenContractSource]]),
     });
 
-    expect(result.failures).toContain("workspace contract is missing import routing precedence terms: Review target override");
+    expect(result.failures).toContain("workspace contract is missing import routing precedence terms: Current Review category and destination overrides");
+  });
+
+  it("fails when the workspace contract omits current user precedence", async () => {
+    const contractPath = path.join(repoRoot, "packages/workspace/src/templates.ts");
+    const contractSource = await readFile(contractPath, "utf8");
+    const brokenContractSource = contractSource.replace("Current Review category and destination overrides", "Semantic category and destination routing");
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[contractPath, brokenContractSource]]),
+    });
+
+    expect(result.failures).toContain("workspace contract is missing import routing precedence terms: Current Review category and destination overrides");
+  });
+
+  it("fails when the workspace contract documents staging as indexed", async () => {
+    const contractPath = path.join(repoRoot, "packages/workspace/src/templates.ts");
+    const contractSource = await readFile(contractPath, "utf8");
+    const brokenContractSource = contractSource.replace(
+      "Pending import notes are non-indexed",
+      "Pending import notes are indexed",
+    );
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[contractPath, brokenContractSource]]),
+    });
+
+    expect(result.failures).toContain("workspace contract documents pending imports as indexed");
+  });
+
+  it("fails when final import writes do not invoke the Safety Kernel", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importsSource.replace(
+      "const safetyDecision = evaluateImportSafety({",
+      "const safetyDecision = missingSafetyKernel({",
+    );
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writes do not invoke the Safety Kernel: packages/workspace/src/imports.ts");
+  });
+
+  it("treats import staging literals as routing-policy bypasses", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importsSource.replace(
+      "defaultRoutingPolicy.importStagingNotePath(importId, title)",
+      "\".app/import-staging/unsafe.md\"",
+    );
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "filesystem writers bypass routingPolicy: packages/workspace/src/imports.ts: .app/import-staging/unsafe.md",
+    );
   });
 
   it("fails when the import candidate routing implementation omits the inbox fallback precedence", async () => {
@@ -116,10 +181,13 @@ describe("product audit", () => {
       const importsSource = await readFile(path.join(repoRoot, "packages/workspace/src/imports.ts"), "utf8");
       const importRoutingSource = await readFile(path.join(repoRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), "utf8");
       const workspaceSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspace.ts"), "utf8");
+      const ipcSource = await readFile(path.join(repoRoot, "apps/desktop/electron/ipc.ts"), "utf8");
       await writeFile(path.join(tempRoot, "packages/workspace/src/templates.ts"), contractSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/imports.ts"), importsSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), importRoutingSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/workspace.ts"), workspaceSource);
+      await mkdir(path.join(tempRoot, "apps/desktop/electron"), { recursive: true });
+      await writeFile(path.join(tempRoot, "apps/desktop/electron/ipc.ts"), ipcSource);
 
       const result = await auditProductContracts({ repoRoot: tempRoot });
 

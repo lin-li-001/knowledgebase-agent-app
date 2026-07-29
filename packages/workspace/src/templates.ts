@@ -4,6 +4,8 @@ The app uses a code-enforced routing policy for filesystem writes. This contract
 
 - Imported source Markdown notes go to \`04-Resources/Imports/<batch-name>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
 - Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
+- Pending import notes are non-indexed under \`.app/import-staging/\`.
+- The Safety Kernel must approve every final import write.
 - Imported original files go to \`06-Attachments/Imports/<batch-name>/\`.
 - Unclassified import candidates fall back to \`00-Inbox/Imports/<batch-name>.md\` for user organization.
 - Profile memory lives at \`02-Profiles/<profile-id>/Memory.md\`.
@@ -13,11 +15,13 @@ The app uses a code-enforced routing policy for filesystem writes. This contract
 - User-defined durable routing rules are recorded in \`.vault/routing-policy.json\`, summarized here for humans, and backed by ADR records.
 
 Import candidate routing precedence:
-1. Review target override from the current approval.
+1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.
 2. Saved workspace routing rule in \`.vault/routing-policy.json\`.
 3. Semantic import candidate policy for content type and risk.
 4. \`defaultRoutingPolicy\` base path fallback.
 5. \`00-Inbox/Imports/\` fallback when the app cannot classify the import.
+
+Saved workspace routing rules never bypass Review.
 
 Read tools may inspect notes and indexed sessions. Write tools must follow the risk policy:
 - low-risk new notes may auto-save and record activity

@@ -70,6 +70,18 @@ describe("createWorkspace", () => {
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "User-defined durable routing rules are recorded in `.vault/routing-policy.json`",
     );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "The Safety Kernel must approve every final import write.",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Current Review category and destination overrides take precedence",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Saved workspace routing rules never bypass Review.",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Pending import notes are non-indexed under `.app/import-staging/`.",
+    );
     await expect(readFile(path.join(rootPath, ".app/settings.json"), "utf8")).resolves.toContain(
       '"activeProfileId": "default"',
     );
@@ -80,13 +92,13 @@ describe("createWorkspace", () => {
     await writeFile(path.join(rootPath, "AGENTS.md"), "# Workspace Contract\n\n## User Routing Rules\n\n- bills -> 02-Personal/default/Finance/Utilities/\n");
 
     await createWorkspace(rootPath);
+    await createWorkspace(rootPath);
 
-    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
-      "- bills -> 02-Personal/default/Finance/Utilities/",
-    );
-    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
-      "Import candidate routing precedence:",
-    );
+    const contract = await readFile(path.join(rootPath, "AGENTS.md"), "utf8");
+    expect(contract).toContain("- bills -> 02-Personal/default/Finance/Utilities/");
+    expect(contract).toContain("Import candidate routing precedence:");
+    expect(contract.match(/The Safety Kernel must approve every final import write\./g)).toHaveLength(1);
+    expect(contract.match(/Pending import notes are non-indexed under `\.app\/import-staging\/`\./g)).toHaveLength(1);
   });
 
   it("upgrades a legacy routing section without duplicating its heading", async () => {
@@ -102,6 +114,29 @@ describe("createWorkspace", () => {
     const contract = await readFile(path.join(rootPath, "AGENTS.md"), "utf8");
     expect(contract.match(/^## Routing Policy$/gm)).toHaveLength(1);
     expect(contract).toContain("Import candidate routing precedence:");
+  });
+
+  it("replaces the legacy target-only precedence with category and destination precedence", async () => {
+    const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
+    await writeFile(
+      path.join(rootPath, "AGENTS.md"),
+      `# Workspace Contract
+
+## Routing Policy
+
+- Imported source Markdown notes go to \`04-Resources/Imports/<batch-name>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
+- Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
+
+Import candidate routing precedence:
+1. Review target override from the current approval.
+`,
+    );
+
+    await createWorkspace(rootPath);
+
+    const contract = await readFile(path.join(rootPath, "AGENTS.md"), "utf8");
+    expect(contract).not.toContain("Review target override from the current approval.");
+    expect(contract).toContain("Current Review category and destination overrides take precedence");
   });
 
   it("adds source note routing state to an existing source-first workspace contract", async () => {

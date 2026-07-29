@@ -81,10 +81,19 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
   const sourceNoteRoute = "04-Resources/Imports/<batch-name>/<source-stem>.md";
   const sourceNoteRouteLine = "- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
   const sourceNoteRouteStatusLine = "- Each imported source note records `route_status` and `route_destination`; a Review approval moves that same note to its final destination.";
+  const currentReviewOverrideLine = "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.";
+  const legacyReviewTargetOverrideLine = "1. Review target override from the current approval.";
+  const safetyContractLines = [
+    "- Pending import notes are non-indexed under `.app/import-staging/`.",
+    "- The Safety Kernel must approve every final import write.",
+    currentReviewOverrideLine,
+    "Saved workspace routing rules never bypass Review.",
+  ];
   const hasSourceNoteRoute = current.includes(sourceNoteRoute);
   const hasSourceNoteRouteStatus = current.includes("route_status") && current.includes("route_destination");
   const hasRoutingPrecedence = current.includes("Import candidate routing precedence:");
-  if (hasSourceNoteRoute && hasSourceNoteRouteStatus && hasRoutingPrecedence) {
+  const hasSafetyContract = safetyContractLines.every((line) => current.includes(line));
+  if (hasSourceNoteRoute && hasSourceNoteRouteStatus && hasRoutingPrecedence && hasSafetyContract) {
     return;
   }
 
@@ -107,6 +116,16 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     next = current.includes("## Routing Policy")
       ? `${next.trimEnd()}\n\n${routingPrecedence}`
       : `${next.trimEnd()}\n\n${contractTail}`;
+  }
+
+  if (next.includes(legacyReviewTargetOverrideLine) && !next.includes(currentReviewOverrideLine)) {
+    next = next.replace(legacyReviewTargetOverrideLine, currentReviewOverrideLine);
+  }
+
+  for (const line of safetyContractLines) {
+    if (!next.includes(line)) {
+      next = `${next.trimEnd()}\n${line}\n`;
+    }
   }
 
   await writeFile(contractPath, next, "utf8");

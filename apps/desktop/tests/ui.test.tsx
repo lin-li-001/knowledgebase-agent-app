@@ -80,7 +80,7 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
   });
 
-  it("lets users override review destination and save it as a future routing rule", () => {
+  it("renders import safety evidence and lets users override category, destination, and future routing", () => {
     const approve = vi.fn(async () => undefined);
     render(
       <ReviewItemCard
@@ -91,26 +91,82 @@ describe("desktop shell", () => {
           risk: "medium",
           targetPath: "04-Resources/Imports/Utility Bills.md",
           reason: "Model proposed a knowledge-base change.",
-          payload: { path: "04-Resources/Imports/Utility Bills.md", body: "# Utility Bills" },
+          payload: {
+            sourceNotePath: ".app/import-staging/import-1/Utility Bills.md",
+            destination: "04-Resources/Imports/Utility Bills.md",
+            sourceFile: "Utility Bills.pdf",
+            classification: {
+              primaryCategory: "finance.utility",
+              alternativeCategories: [],
+              sensitivity: "personal",
+              confidence: 0.92,
+              evidence: ["Amount due $184.27"],
+              signals: [],
+              suggestedDestination: "04-Resources/Imports/Utility Bills.md",
+              conflict: false,
+            },
+            safetyDecision: {
+              decision: "review_required",
+              reasonCodes: ["CATEGORY_REQUIRES_REVIEW"],
+            },
+            body: "# Utility Bills",
+          },
         }}
         onApprove={approve}
       />,
     );
 
+    expect(screen.getByText("Category: finance.utility")).toBeVisible();
+    expect(screen.getByText("Sensitivity: personal")).toBeVisible();
+    expect(screen.getByText("Confidence: 0.92")).toBeVisible();
+    expect(screen.getByText("Evidence: Amount due $184.27")).toBeVisible();
+    expect(screen.getByText("Reasons: CATEGORY_REQUIRES_REVIEW")).toBeVisible();
+    expect(screen.getByLabelText("Category")).toHaveValue("finance.utility");
+
+    fireEvent.change(screen.getByLabelText("Category"), { target: { value: "finance.insurance" } });
     fireEvent.change(screen.getByLabelText("Destination"), {
-      target: { value: "02-Personal/default/Finance/Utilities/2026/Utility Bills.md" },
+      target: { value: "02-Personal/default/Finance/Insurance/Policy.md" },
     });
     fireEvent.click(screen.getByLabelText("Save as future routing rule"));
     fireEvent.change(screen.getByLabelText("Routing rule pattern"), {
-      target: { value: "utility bills" },
+      target: { value: "policy number" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     expect(approve).toHaveBeenCalledWith("review-1", {
-      targetPathOverride: "02-Personal/default/Finance/Utilities/2026/Utility Bills.md",
+      categoryOverride: "finance.insurance",
+      targetPathOverride: "02-Personal/default/Finance/Insurance/Policy.md",
       saveAsRoutingRule: true,
-      routingRulePattern: "utility bills",
+      routingRulePattern: "policy number",
     });
+  });
+
+  it("allows failed Review items to be retried and disables claimed Review items", () => {
+    const approve = vi.fn(async () => undefined);
+    const reject = vi.fn(async () => undefined);
+    const item = {
+      id: "review-1",
+      proposalType: "propose_memory",
+      risk: "high",
+      reason: "Model proposed a knowledge-base change.",
+      payload: { body: "User's name is Lin Li." },
+    };
+    const { rerender } = render(<ReviewItemCard item={{ ...item, state: "failed" }} onApprove={approve} onReject={reject} />);
+
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(approve).toHaveBeenCalledWith("review-1", undefined);
+    expect(reject).toHaveBeenCalledWith("review-1");
+
+    rerender(<ReviewItemCard item={{ ...item, state: "applying" }} onApprove={approve} onReject={reject} />);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+
+    rerender(<ReviewItemCard item={{ ...item, state: "rejecting" }} onApprove={approve} onReject={reject} />);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
   });
 
   it("renders import controls for document batches", () => {
