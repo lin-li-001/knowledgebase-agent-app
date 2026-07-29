@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   auditProductContracts as auditProductContractsImplementation,
@@ -22,6 +23,36 @@ afterEach(async () => {
 
 function auditProductContracts(input: Omit<ProductAuditInput, "workspaceRoot">) {
   return auditProductContractsImplementation({ ...input, workspaceRoot });
+}
+
+function expectSourceOverrideToCompile(sourcePath: string, source: string): void {
+  const result = ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.NodeNext },
+    fileName: sourcePath,
+    reportDiagnostics: true,
+  });
+
+  expect(result.diagnostics ?? []).toEqual([]);
+}
+
+function expectSourceOverrideToTypecheck(sourcePath: string, source: string): void {
+  const configPath = sourcePath.includes(`${path.sep}apps${path.sep}desktop${path.sep}`)
+    ? path.join(repoRoot, "apps/desktop/tsconfig.json")
+    : path.join(repoRoot, "packages/workspace/tsconfig.json");
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath), undefined, configPath);
+  const compilerHost = ts.createCompilerHost(parsed.options);
+  const readFileFromDisk = compilerHost.readFile.bind(compilerHost);
+  const normalizedSourcePath = path.resolve(sourcePath);
+  compilerHost.readFile = (fileName) => path.resolve(fileName) === normalizedSourcePath ? source : readFileFromDisk(fileName);
+  const program = ts.createProgram({
+    rootNames: parsed.fileNames,
+    options: parsed.options,
+    projectReferences: parsed.projectReferences,
+    host: compilerHost,
+  });
+
+  expect(ts.getPreEmitDiagnostics(program)).toEqual([]);
 }
 
 describe("product audit", () => {
@@ -167,10 +198,16 @@ describe("product audit", () => {
   it("fails when final import writes do not invoke the Safety Kernel", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = importsSource.replace(
+    const brokenImportsSource = `${importsSource.replace(
       "const safetyDecision = evaluateImportSafety({",
       "const safetyDecision = missingSafetyKernel({",
-    );
+    )}
+function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0]): SafetyDecision {
+  return { decision: "blocked", reasonCodes: [] };
+}
+`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
 
     const result = await auditProductContracts({
       repoRoot,
@@ -183,10 +220,16 @@ describe("product audit", () => {
   it("does not accept a commented or unused Safety Kernel call as an implementation gate", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = importsSource.replace(
+    const brokenImportsSource = `${importsSource.replace(
       "const safetyDecision = evaluateImportSafety({",
       "const decoy = \"const safetyDecision = evaluateImportSafety({\";\n  // const safetyDecision = evaluateImportSafety({\n  const safetyDecision = missingSafetyKernel({",
-    );
+    )}
+function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0]): SafetyDecision {
+  return { decision: "blocked", reasonCodes: [] };
+}
+`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
 
     const result = await auditProductContracts({
       repoRoot,
@@ -214,13 +257,37 @@ describe("product audit", () => {
     const importsSource = await readFile(importsPath, "utf8");
     const brokenImportsSource = `${importsSource.replace("if (status === \"auto_written\")", "if (status === \"unsafe\")")}
 async function decoyPromotion(fileOps: ImportFileOps) {
-  const safetyDecision = evaluateImportSafety({} as never);
+  const workspaceRoot = "/workspace";
+  const routed: RoutedDocument = {
+    classification: {
+      primaryCategory: "resource",
+      alternativeCategories: [],
+      sensitivity: "normal",
+      confidence: 1,
+      evidence: [],
+      signals: [],
+      conflict: false,
+    },
+    destination: "00-Inbox/Imports/decoy.md",
+  };
+  const stagingTargetPath = assertInsideWorkspace(workspaceRoot, ".app/import-staging/decoy.md");
+  const safetyDecision = evaluateImportSafety({
+    workspaceRoot,
+    operation: "create",
+    destination: routed.destination,
+    destinationExists: false,
+    autoWriteThreshold: 0.95,
+    classification: routed.classification,
+  });
   const status = artifactStatusFor(safetyDecision);
   if (status === "auto_written") {
-    await fileOps.writeFile(finalTargetPath, Buffer.from("decoy"), true);
+    const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
   }
 }
 `;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
 
     const result = await auditProductContracts({
       repoRoot,
@@ -234,14 +301,39 @@ async function decoyPromotion(fileOps: ImportFileOps) {
     const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
     const reviewSource = await readFile(reviewPath, "utf8");
     const brokenReviewSource = `${reviewSource.replace("const safetyDecision = evaluateImportSafety({", "const safetyDecision = allowUnsafeMove({")}
-async function decoyReviewPromotion() {
-  const safetyDecision = evaluateImportSafety({} as never);
+function allowUnsafeMove(intent: Parameters<typeof evaluateImportSafety>[0]): SafetyDecision {
+  return evaluateImportSafety(intent);
+}
+
+async function decoyReviewPromotion(
+  workspaceRoot: string,
+  approvedDestinationPath: string,
+  approvedBody: string,
+  fileOps: ReviewImportFileOps,
+  application: { ioHooks?: IpcServices["reviewIoHooks"] },
+  classification: ImportClassification,
+) {
+  const safetyDecision = evaluateImportSafety({
+    workspaceRoot,
+    operation: "move",
+    destination: approvedDestinationPath,
+    destinationExists: false,
+    autoWriteThreshold: 0.95,
+    classification,
+    approval: {
+      reviewItemId: "decoy",
+      destination: approvedDestinationPath,
+      classificationFingerprint: "decoy",
+    },
+  });
   if (safetyDecision.decision !== "auto_write") {
     throw new Error("blocked");
   }
-  await secureWriteExclusive();
+  await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);
 }
 `;
+
+    expectSourceOverrideToCompile(reviewPath, brokenReviewSource);
 
     const result = await auditProductContracts({
       repoRoot,
@@ -249,6 +341,64 @@ async function decoyReviewPromotion() {
     });
 
     expect(result.failures).toContain("final import writer does not call the Safety Kernel: apps/desktop/electron/ipc.ts");
+  });
+
+  it("rejects a second unconditional importer promotion write", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importsSource
+      .replace(
+        "  if (status === \"auto_written\") {\n    const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);",
+        "  const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);\n  if (status === \"auto_written\") {",
+      )
+      .replace(
+        "\n  return {\n    sourceFile: document.fileName,\n    attachmentPath: document.attachmentRelativePath,\n    notePath,",
+        "\n  await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);\n\n  return {\n    sourceFile: document.fileName,\n    attachmentPath: document.attachmentRelativePath,\n    notePath,",
+      );
+
+    expect(brokenImportsSource.match(/fileOps\.writeFile\(finalTargetPath,/g)).toHaveLength(2);
+    expectSourceOverrideToTypecheck(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
+  it("rejects a second unconditional Review promotion write", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = reviewSource.replace(
+      `  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+    throw new Error(\`Import approval \${safetyDecision.decision}: \${safetyDecision.reasonCodes.join(", ")}\`);
+  }
+
+  const approvedDestinationPath = safetyDecision.allowedDestination;
+  await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);
+  const approvedBody = destinationPath === approvedDestinationPath
+    ? updatedBody
+    : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);`,
+      `  const approvedDestinationPath: string = safetyDecision.allowedDestination ?? destinationPath ?? sourcePath;
+  const approvedBody = destinationPath === approvedDestinationPath
+    ? updatedBody
+    : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);
+  await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);
+  if (safetyDecision.decision !== "auto_write" || safetyDecision.allowedDestination === undefined) {
+    throw new Error(\`Import approval \${safetyDecision.decision}: \${safetyDecision.reasonCodes.join(", ")}\`);
+  }
+
+  await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);`,
+    );
+
+    expect(brokenReviewSource).toContain("await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);");
+    expectSourceOverrideToTypecheck(reviewPath, brokenReviewSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: apps/desktop/electron/ipc.ts");
   });
 
   it("fails when source code declares an import Review bypass field", async () => {
@@ -262,6 +412,76 @@ async function decoyReviewPromotion() {
     });
 
     expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails for a quoted Review bypass property", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst unsafeRule = { "skipReview": true };\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails for a shorthand Review bypass property", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst skipReview = true;\nconst unsafeRule = { skipReview };\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails for an element-access Review bypass property", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst unsafeRule: Record<string, boolean> = {};\nunsafeRule["bypassReview"] = true;\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: bypassReview");
+  });
+
+  it("fails for a computed literal Review bypass property", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst unsafeRule = { ["skipReview"]: true };\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("follows a const string alias used as a computed Review bypass key", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst harmless = "skipReview";\nconst bypassKey = "bypassReview";\nconst unsafeRule = { [bypassKey]: true };\nvoid harmless;\n`;
+
+    expectSourceOverrideToCompile(importsPath, brokenImportsSource);
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: bypassReview");
   });
 
   it("fails when aliases, spreads, or string-key access carry a Review bypass", async () => {
@@ -308,6 +528,23 @@ function shouldSkipDirectory(name: string): boolean {
 void shouldSkipDirectory(".app");
 `;
 
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
+    });
+
+    expect(result.failures).toContain("indexer does not exclude runtime staging from indexing");
+  });
+
+  it("rejects a no-op staging predicate call before recursive indexing", async () => {
+    const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
+    const indexerSource = await readFile(indexerPath, "utf8");
+    const brokenIndexerSource = indexerSource.replace(
+      "      if (shouldSkipDirectory(entry.name)) {\n        continue;\n      }",
+      "      shouldSkipDirectory(entry.name);",
+    );
+
+    expectSourceOverrideToTypecheck(indexerPath, brokenIndexerSource);
     const result = await auditProductContracts({
       repoRoot,
       sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
