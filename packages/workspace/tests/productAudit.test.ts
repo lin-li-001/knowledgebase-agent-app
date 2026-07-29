@@ -456,6 +456,14 @@ function fabricatedSafetyDecision(destination: string): SafetyDecision {
     await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
   }`,
     ],
+    [
+      "a fabricated initializer after the guarded writer",
+      "",
+      `  if (safetyDecision.decision === "auto_write") {
+    await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+  }
+  var safetyDecision = fabricated;`,
+    ],
   ])("rejects a coalesced var binding with %s", async (_label, beforeKernel, guardBody) => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");

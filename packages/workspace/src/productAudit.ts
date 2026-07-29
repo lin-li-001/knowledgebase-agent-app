@@ -318,7 +318,6 @@ function isSoleInitializedVarDeclaration(
   kernelDeclaration: ts.VariableDeclaration,
 ): boolean {
   const initializedDeclarations = nodesInFunction(declaration).filter((node): node is ts.VariableDeclaration => ts.isVariableDeclaration(node)
-    && node.pos < reference.pos
     && node.initializer !== undefined
     && isSameFunctionScopedVarBinding(declaration, node, kernelDeclaration, reference.text));
   return initializedDeclarations.length === 1 && initializedDeclarations[0] === kernelDeclaration;
