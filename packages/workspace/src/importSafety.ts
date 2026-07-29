@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { assertInsideWorkspace } from "./pathGuard";
 
@@ -60,8 +61,14 @@ export interface ImportWriteIntent {
   destination?: string;
   destinationExists: boolean;
   autoWriteThreshold: number;
-  approvedByUser?: boolean;
+  approval?: ImportApprovalProof;
   classification?: ImportClassification;
+}
+
+export interface ImportApprovalProof {
+  reviewItemId: string;
+  destination: string;
+  classificationFingerprint: string;
 }
 
 export interface SafetyDecision {
@@ -128,6 +135,12 @@ export function evaluateImportSafety(intent: ImportWriteIntent): SafetyDecision 
   }
 }
 
+export function fingerprintImportClassification(classification: ImportClassification): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalize(classification)))
+    .digest("hex");
+}
+
 function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision {
   const blockedReasons: SafetyReasonCode[] = [];
   const operation = intent.operation as string;
@@ -184,12 +197,13 @@ function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision
     if (PROTECTED_CATEGORIES.has(classification.primaryCategory)) {
       reviewReasons.push("CATEGORY_REQUIRES_REVIEW");
     }
-    if (normalizedDestination && isProtectedDestination(intent.workspaceRoot, normalizedDestination)) {
-      reviewReasons.push("DESTINATION_REQUIRES_REVIEW");
-    }
-    if (hasConflictingSafetySignal(classification)) {
+    if (hasConflictingSafetySignal(classification, intent.autoWriteThreshold)) {
       reviewReasons.push("SAFETY_SIGNAL_REQUIRES_REVIEW");
     }
+  }
+
+  if (normalizedDestination && isProtectedDestination(intent.workspaceRoot, normalizedDestination)) {
+    reviewReasons.push("DESTINATION_REQUIRES_REVIEW");
   }
 
   if (!Number.isFinite(intent.autoWriteThreshold) || intent.autoWriteThreshold < 0 || intent.autoWriteThreshold > 1) {
@@ -197,9 +211,12 @@ function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision
   }
 
   const uniqueReviewReasons = uniqueReasons(reviewReasons);
-  const approvalClearsReview = intent.approvedByUser === true && !uniqueReviewReasons.includes("INTERNAL_EVALUATION_ERROR");
+  const approvalClearsReview =
+    validClassification !== undefined &&
+    isValidApprovalProof(intent, normalizedDestination, validClassification) &&
+    !uniqueReviewReasons.includes("INTERNAL_EVALUATION_ERROR");
   const remainingReviewReasons = approvalClearsReview ? [] : uniqueReviewReasons;
-  const isApprovedMove = operation === "move" && intent.approvedByUser === true;
+  const isApprovedMove = approvalClearsReview;
   const isNewFileOperation = operation === "create" || operation === "stage";
 
   if (remainingReviewReasons.length > 0 || (!isNewFileOperation && !isApprovedMove)) {
@@ -238,9 +255,17 @@ function normalizeDestination(workspaceRoot: string, destination: string | undef
 }
 
 function isProtectedDestination(workspaceRoot: string, normalizedDestination: string): boolean {
-  const relativeDestination = path.relative(path.resolve(workspaceRoot), normalizedDestination);
+  const relativeDestination = path
+    .relative(path.resolve(workspaceRoot), normalizedDestination)
+    .toLowerCase();
   return PROTECTED_DESTINATION_ROOTS.some(
-    (root) => relativeDestination === root || relativeDestination.startsWith(`${root}${path.sep}`),
+    (root) => {
+      const normalizedRoot = root.toLowerCase();
+      return (
+        relativeDestination === normalizedRoot ||
+        relativeDestination.startsWith(`${normalizedRoot}${path.sep}`)
+      );
+    },
   );
 }
 
@@ -290,17 +315,51 @@ function isClassificationSignal(signal: unknown): signal is ClassificationSignal
     (signal.ruleId === undefined || typeof signal.ruleId === "string");
 }
 
-function hasConflictingSafetySignal(classification: ImportClassification): boolean {
+function hasConflictingSafetySignal(
+  classification: ImportClassification,
+  autoWriteThreshold: number,
+): boolean {
   return classification.signals.some((signal) => {
-    if (signal.source !== "detector") {
-      return false;
-    }
-    const detectorIsHigherRisk =
-      (signal.category !== undefined && PROTECTED_CATEGORIES.has(signal.category)) ||
-      (signal.sensitivity !== undefined && signal.sensitivity !== "normal");
-    const detectorMatchesPrimary = signal.category === undefined || signal.category === classification.primaryCategory;
-    return detectorIsHigherRisk && !detectorMatchesPrimary;
+    const protectedOrUnknownCategory =
+      signal.category === "unknown" ||
+      (signal.category !== undefined && PROTECTED_CATEGORIES.has(signal.category));
+    const sensitiveSignal = signal.sensitivity !== undefined && signal.sensitivity !== "normal";
+    const belowThreshold =
+      signal.confidence !== undefined && signal.confidence < autoWriteThreshold;
+    return protectedOrUnknownCategory || sensitiveSignal || belowThreshold;
   });
+}
+
+function isValidApprovalProof(
+  intent: ImportWriteIntent,
+  normalizedDestination: string | undefined,
+  classification: ImportClassification,
+): boolean {
+  if (intent.operation !== "move" || normalizedDestination === undefined) {
+    return false;
+  }
+
+  const approval = intent.approval;
+  if (
+    !isRecord(approval) ||
+    typeof approval.reviewItemId !== "string" ||
+    approval.reviewItemId.trim() === "" ||
+    typeof approval.destination !== "string" ||
+    typeof approval.classificationFingerprint !== "string" ||
+    approval.classificationFingerprint === ""
+  ) {
+    return false;
+  }
+
+  const normalizedApprovalDestination = normalizeDestination(intent.workspaceRoot, approval.destination);
+  if (
+    normalizedApprovalDestination === undefined ||
+    normalizedApprovalDestination.toLowerCase() !== normalizedDestination.toLowerCase()
+  ) {
+    return false;
+  }
+
+  return approval.classificationFingerprint === fingerprintImportClassification(classification);
 }
 
 function isContentCategory(value: unknown): value is ContentCategory {
@@ -317,6 +376,22 @@ function isConfidence(value: unknown): value is number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (isRecord(value)) {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] !== undefined) {
+        sorted[key] = canonicalize(value[key]);
+      }
+    }
+    return sorted;
+  }
+  return value;
 }
 
 function uniqueReasons(reasonCodes: SafetyReasonCode[]): SafetyReasonCode[] {

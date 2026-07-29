@@ -1,8 +1,11 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   evaluateImportSafety,
+  fingerprintImportClassification,
   type ContentCategory,
   type ImportClassification,
+  type ImportApprovalProof,
   type ImportWriteIntent,
 } from "../src/index";
 
@@ -31,6 +34,19 @@ function validIntent(overrides: Partial<ImportWriteIntent> = {}): ImportWriteInt
     destinationExists: false,
     autoWriteThreshold: 0.9,
     classification: classification(),
+    ...overrides,
+  };
+}
+
+function approvalFor(
+  value: ImportClassification,
+  overrides: Partial<ImportApprovalProof> = {},
+): ImportApprovalProof {
+  const destination = overrides.destination ?? "04-Resources/Imports/A.md";
+  return {
+    reviewItemId: "review-123",
+    destination: path.resolve(workspaceRoot, destination),
+    classificationFingerprint: fingerprintImportClassification(value),
     ...overrides,
   };
 }
@@ -147,32 +163,92 @@ describe("evaluateImportSafety", () => {
     });
   });
 
-  it("requires Review when a detector exposes a higher-risk signal", () => {
-    const result = evaluateImportSafety(
-      validIntent({
-        classification: classification({
-          signals: [
-            {
-              source: "model",
-              category: "resource",
-              sensitivity: "normal",
-              confidence: 1,
-              evidence: ["model result"],
-            },
-            {
-              source: "detector",
-              category: "finance.utility",
-              sensitivity: "personal",
-              confidence: 1,
-              evidence: ["Amount due"],
-            },
-          ],
+  it.each(["detector", "model", "saved_user_policy", "current_user_override"] as const)(
+    "requires Review for protected evidence from %s",
+    (source) => {
+      const destination = "04-Resources/Imports/User Choice.md";
+      const result = evaluateImportSafety(
+        validIntent({
+          destination,
+          classification: classification({
+            signals: [
+              {
+                source,
+                category: "finance.utility",
+                evidence: ["protected signal"],
+                destination: "02-Personal/default/Finance/Unexpected.md",
+              },
+            ],
+          }),
         }),
-      }),
-    );
+      );
 
-    expect(result.decision).toBe("review_required");
-    expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+      expect(result).toMatchObject({
+        decision: "review_required",
+        allowedDestination: path.resolve(workspaceRoot, destination),
+      });
+      expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+    },
+  );
+
+  it.each(["detector", "model", "saved_user_policy", "current_user_override"] as const)(
+    "requires Review for unknown evidence from %s",
+    (source) => {
+      const result = evaluateImportSafety(
+        validIntent({
+          classification: classification({
+            signals: [{ source, category: "unknown", evidence: ["unknown signal"] }],
+          }),
+        }),
+      );
+
+      expect(result.decision).toBe("review_required");
+      expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+    },
+  );
+
+  it.each(["detector", "model", "saved_user_policy", "current_user_override"] as const)(
+    "requires Review for below-threshold evidence from %s",
+    (source) => {
+      const result = evaluateImportSafety(
+        validIntent({
+          classification: classification({
+            signals: [{ source, category: "resource", confidence: 0.5, evidence: ["low signal"] }],
+          }),
+        }),
+      );
+
+      expect(result.decision).toBe("review_required");
+      expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+    },
+  );
+
+  it.each(["detector", "model", "saved_user_policy", "current_user_override"] as const)(
+    "requires Review for sensitive evidence from %s",
+    (source) => {
+      const result = evaluateImportSafety(
+        validIntent({
+          classification: classification({
+            signals: [{ source, category: "resource", sensitivity: "private", evidence: ["private signal"] }],
+          }),
+        }),
+      );
+
+      expect(result.decision).toBe("review_required");
+      expect(result.reasonCodes).toContain("SAFETY_SIGNAL_REQUIRES_REVIEW");
+    },
+  );
+
+  it("fingerprints equivalent classification values deterministically", () => {
+    const value = classification({
+      signals: [{ source: "model", category: "resource", evidence: ["same value"] }],
+    });
+
+    expect(fingerprintImportClassification(value)).toMatch(/^[a-f0-9]{64}$/);
+    expect(fingerprintImportClassification({ ...value })).toBe(fingerprintImportClassification(value));
+    expect(fingerprintImportClassification({ ...value, confidence: 0.99 })).not.toBe(
+      fingerprintImportClassification(value),
+    );
   });
 
   it("auto-writes a safe resource create", () => {
@@ -206,17 +282,71 @@ describe("evaluateImportSafety", () => {
     });
   });
 
-  it("lets explicit approval clear Review-only reasons for one move", () => {
+  it.each(["create", "stage"] as const)("does not let a proof authorize %s", (operation) => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+      confidence: 0.5,
+    });
+    const result = evaluateImportSafety(
+      validIntent({
+        operation,
+        classification: value,
+        approval: approvalFor(value),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: expect.arrayContaining([
+        "CATEGORY_REQUIRES_REVIEW",
+        "SENSITIVITY_REQUIRES_REVIEW",
+      ]),
+    });
+  });
+
+  it.each([
+    ["missing proof", undefined],
+    ["empty review id", { reviewItemId: " " }],
+    ["destination mismatch", { destination: "04-Resources/Imports/Other.md" }],
+    ["classification mismatch", { classificationFingerprint: "not-the-current-fingerprint" }],
+  ])("does not clear Review reasons for %s", (_name, proofOverrides) => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+      confidence: 0.5,
+    });
+    const proof = proofOverrides === undefined ? undefined : approvalFor(value, proofOverrides);
     const result = evaluateImportSafety(
       validIntent({
         operation: "move",
-        destination: "02-Personal/default/Finance/Tax.md",
-        approvedByUser: true,
-        classification: classification({
-          primaryCategory: "finance.tax",
-          sensitivity: "personal",
-          confidence: 0.5,
-        }),
+        classification: value,
+        approval: proof,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: expect.arrayContaining([
+        "CATEGORY_REQUIRES_REVIEW",
+        "SENSITIVITY_REQUIRES_REVIEW",
+      ]),
+    });
+  });
+
+  it("lets a valid proof clear Review-only reasons for one move", () => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+      confidence: 0.5,
+    });
+    const destination = "02-Personal/default/Finance/Tax.md";
+    const result = evaluateImportSafety(
+      validIntent({
+        operation: "move",
+        destination,
+        classification: value,
+        approval: approvalFor(value, { destination }),
       }),
     );
 
@@ -226,11 +356,31 @@ describe("evaluateImportSafety", () => {
     });
   });
 
-  it("never lets approval clear blocked reasons", () => {
+  it("requires Review for case variants of protected destinations", () => {
+    for (const destination of [
+      "02-personal/default/Finance/Tax.md",
+      "02-PROFILES/default/Profile.md",
+      "07-private/Secret.md",
+      ".VAULT/DECISIONS/review.md",
+    ]) {
+      const result = evaluateImportSafety(validIntent({ destination }));
+
+      expect(result.decision).toBe("review_required");
+      expect(result.reasonCodes).toContain("DESTINATION_REQUIRES_REVIEW");
+    }
+  });
+
+  it("does not let an approval proof clear blocked reasons", () => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+    });
     const result = evaluateImportSafety(
       validIntent({
+        operation: "move",
         destination: "../outside.md",
-        approvedByUser: true,
+        classification: value,
+        approval: approvalFor(value, { destination: "../outside.md" }),
       }),
     );
 

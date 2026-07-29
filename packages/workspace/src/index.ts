@@ -1,5 +1,5 @@
 export { assertInsideWorkspace } from "./pathGuard";
-export { evaluateImportSafety } from "./importSafety";
+export { evaluateImportSafety, fingerprintImportClassification } from "./importSafety";
 export { exportLlmsFlat } from "./exporter";
 export { importDocumentBatch } from "./imports";
 export { parseFrontmatter } from "./frontmatter";
@@ -21,6 +21,7 @@ export type { ImportCandidateRoutingPrecedence, ImportCandidateRouteInput } from
 export type {
   ClassificationSignal,
   ContentCategory,
+  ImportApprovalProof,
   ImportClassification,
   ImportOperation,
   ImportSensitivity,
