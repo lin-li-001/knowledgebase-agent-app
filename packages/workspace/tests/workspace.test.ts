@@ -174,6 +174,38 @@ Import candidate routing precedence:
 5. \`00-Inbox/Imports/\` fallback when the app cannot classify the import.`);
   });
 
+  it("normalizes CRLF mixed legacy and current routing priorities into one LF block", async () => {
+    const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
+    await writeFile(
+      path.join(rootPath, "AGENTS.md"),
+      [
+        "# Workspace Contract",
+        "",
+        "Import candidate routing precedence:",
+        "1. Review target override from the current approval.",
+        "2. Saved workspace routing rule in `.vault/routing-policy.json`.",
+        "",
+        "User-authored routing note.",
+        "",
+        "Import candidate routing precedence:",
+        "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.",
+        "2. Saved workspace routing rule in `.vault/routing-policy.json`.",
+        "3. Semantic import candidate policy for content type and risk.",
+        "4. `defaultRoutingPolicy` base path fallback.",
+        "5. `00-Inbox/Imports/` fallback when the app cannot classify the import.",
+      ].join("\r\n").replace("User-authored routing note.\r\n", "User-authored routing note.\n"),
+      "utf8",
+    );
+
+    await createWorkspace(rootPath);
+    await createWorkspace(rootPath);
+
+    const contract = await readFile(path.join(rootPath, "AGENTS.md"), "utf8");
+    expect(contract).not.toContain("\r");
+    expect(contract.match(/^Import candidate routing precedence:$/gm)).toHaveLength(1);
+    expect(contract).toContain("User-authored routing note.");
+  });
+
   it("adds source note routing state to an existing source-first workspace contract", async () => {
     const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
     await writeFile(

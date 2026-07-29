@@ -140,29 +140,44 @@ async function auditImportSafetyKernel(repoRoot: string, sourceOverrides: Map<st
   const importerSource = await readSource(repoRoot, importerPath, sourceOverrides);
   const reviewSource = await readSource(repoRoot, reviewPath, sourceOverrides);
 
-  auditSafetyKernelArtifact(importerPath, importerSource, "./importSafety", "writeFile", hasImporterAutoWriteGate, result);
-  auditSafetyKernelArtifact(reviewPath, reviewSource, "@kb-agent/workspace", "secureWriteExclusive", hasReviewAutoWriteGate, result);
+  auditImporterSafetyKernel(importerPath, importerSource, result);
+  auditReviewSafetyKernel(reviewPath, reviewSource, result);
 }
 
-// These AST checks validate local source structure, not runtime behavior through dynamic dispatch or generated code.
-function auditSafetyKernelArtifact(
-  relativePath: string,
-  source: string,
-  moduleSpecifier: string,
-  finalWriterName: string,
-  hasAutoWriteGate: (sourceFile: ts.SourceFile) => boolean,
-  result: ProductAuditResult,
-): void {
+// These checks bind named safety data flow to the local function that performs each final write.
+// They cannot prove behavior through dynamic dispatch, runtime code generation, or aliased module imports.
+function auditImporterSafetyKernel(relativePath: string, source: string, result: ProductAuditResult): void {
   const sourceFile = ts.createSourceFile(relativePath, source, ts.ScriptTarget.Latest, true);
-  if (!importsNamedBinding(sourceFile, moduleSpecifier, "evaluateImportSafety")) {
+  if (!importsNamedBinding(sourceFile, "./importSafety", "evaluateImportSafety")) {
     result.failures.push(`final import writer does not import the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!hasCallNamed(sourceFile, "evaluateImportSafety")) {
+
+  const promotionFunctions = functionDeclarations(sourceFile).filter((declaration) => functionContains(declaration, isFinalImportPromotionWrite));
+  if (!promotionFunctions.length || !promotionFunctions.every((declaration) => functionContains(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety")))) {
     result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
     return;
   }
-  if (!hasCallNamed(sourceFile, finalWriterName) || !hasAutoWriteGate(sourceFile)) {
+  if (!promotionFunctions.every(hasImporterAutoWriteGate)) {
+    result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
+    return;
+  }
+  result.passes.push(`final import writer is Safety Kernel-gated: ${relativePath}`);
+}
+
+function auditReviewSafetyKernel(relativePath: string, source: string, result: ProductAuditResult): void {
+  const sourceFile = ts.createSourceFile(relativePath, source, ts.ScriptTarget.Latest, true);
+  if (!importsNamedBinding(sourceFile, "@kb-agent/workspace", "evaluateImportSafety")) {
+    result.failures.push(`final import writer does not import the Safety Kernel: ${relativePath}`);
+    return;
+  }
+
+  const reviewFunctions = functionDeclarations(sourceFile).filter((declaration) => functionContains(declaration, isReviewImportPromotionWrite));
+  if (!reviewFunctions.length || !reviewFunctions.every((declaration) => functionContains(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety")))) {
+    result.failures.push(`final import writer does not call the Safety Kernel: ${relativePath}`);
+    return;
+  }
+  if (!reviewFunctions.every(hasReviewAutoWriteGate)) {
     result.failures.push(`final import writer is not gated on Safety Kernel auto_write: ${relativePath}`);
     return;
   }
@@ -181,26 +196,53 @@ function importsNamedBinding(sourceFile: ts.SourceFile, moduleSpecifier: string,
   });
 }
 
-function hasCallNamed(sourceFile: ts.SourceFile, name: string): boolean {
-  return sourceContains(sourceFile, (node) => ts.isCallExpression(node) && calledName(node) === name);
-}
+function hasImporterAutoWriteGate(declaration: ts.FunctionDeclaration): boolean {
+  const finalWrite = findNodeInFunction(declaration, isFinalImportPromotionWrite);
+  if (!finalWrite || !ts.isCallExpression(finalWrite)) {
+    return false;
+  }
 
-function hasImporterAutoWriteGate(sourceFile: ts.SourceFile): boolean {
-  const hasSafetyDecision = sourceContains(sourceFile, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety"));
-  const hasStatusFromSafety = sourceContains(sourceFile, (node) => isVariableCall(node, "status", "artifactStatusFor", "safetyDecision"));
-  const hasGatedWrite = sourceContains(sourceFile, (node) => ts.isIfStatement(node)
+  const safetyDecision = findNodeInFunction(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety"));
+  const status = findNodeInFunction(declaration, (node) => isVariableCall(node, "status", "artifactStatusFor", "safetyDecision"));
+  const guard = findNodeInFunction(declaration, (node) => ts.isIfStatement(node)
     && isEqualityWithString(node.expression, "status", "auto_written")
-    && sourceContains(node.thenStatement, (child) => ts.isCallExpression(child) && calledName(child) === "writeFile"));
-  return hasSafetyDecision && hasStatusFromSafety && hasGatedWrite;
+    && containsOutsideNestedFunctions(node.thenStatement, isFinalImportPromotionWrite));
+  return safetyDecision !== undefined
+    && status !== undefined
+    && guard !== undefined
+    && safetyDecision.end < status.pos
+    && status.end < guard.pos
+    && guard.pos < finalWrite.pos;
 }
 
-function hasReviewAutoWriteGate(sourceFile: ts.SourceFile): boolean {
-  const gate = findNode(sourceFile, (node) => ts.isIfStatement(node)
+function hasReviewAutoWriteGate(declaration: ts.FunctionDeclaration): boolean {
+  const finalWrite = findNodeInFunction(declaration, isReviewImportPromotionWrite);
+  const safetyDecision = findNodeInFunction(declaration, (node) => isVariableCall(node, "safetyDecision", "evaluateImportSafety"));
+  const gate = findNodeInFunction(declaration, (node) => ts.isIfStatement(node)
     && isReviewAutoWriteGuard(node.expression)
     && sourceContains(node.thenStatement, ts.isThrowStatement));
-  return gate !== undefined && sourceContains(sourceFile, (node) => ts.isCallExpression(node)
+  return finalWrite !== undefined
+    && safetyDecision !== undefined
+    && gate !== undefined
+    && safetyDecision.end < gate.pos
+    && gate.end < finalWrite.pos;
+}
+
+function isFinalImportPromotionWrite(node: ts.Node): boolean {
+  return ts.isCallExpression(node)
+    && calledName(node) === "writeFile"
+    && node.arguments[0] !== undefined
+    && ts.isIdentifier(node.arguments[0])
+    && node.arguments[0].text === "finalTargetPath"
+    && node.arguments[2]?.kind === ts.SyntaxKind.TrueKeyword;
+}
+
+function isReviewImportPromotionWrite(node: ts.Node): boolean {
+  return ts.isCallExpression(node)
     && calledName(node) === "secureWriteExclusive"
-    && gate.end < node.pos);
+    && node.arguments[1] !== undefined
+    && ts.isIdentifier(node.arguments[1])
+    && node.arguments[1].text === "approvedDestinationPath";
 }
 
 function isVariableCall(node: ts.Node, variableName: string, callName: string, argumentName?: string): boolean {
@@ -236,6 +278,48 @@ function calledName(node: ts.CallExpression): string | undefined {
 
 function sourceContains(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
   return findNode(root, predicate) !== undefined;
+}
+
+function functionDeclarations(sourceFile: ts.SourceFile): ts.FunctionDeclaration[] {
+  const declarations: ts.FunctionDeclaration[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node)) {
+      declarations.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return declarations;
+}
+
+function functionContains(functionDeclaration: ts.FunctionDeclaration, predicate: (node: ts.Node) => boolean): boolean {
+  return findNodeInFunction(functionDeclaration, predicate) !== undefined;
+}
+
+function findNodeInFunction(functionDeclaration: ts.FunctionDeclaration, predicate: (node: ts.Node) => boolean): ts.Node | undefined {
+  const visit = (node: ts.Node): ts.Node | undefined => {
+    if (predicate(node)) {
+      return node;
+    }
+    if (node !== functionDeclaration && ts.isFunctionLike(node)) {
+      return undefined;
+    }
+    return ts.forEachChild(node, visit);
+  };
+  return visit(functionDeclaration);
+}
+
+function containsOutsideNestedFunctions(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
+  const visit = (node: ts.Node): ts.Node | undefined => {
+    if (predicate(node)) {
+      return node;
+    }
+    if (node !== root && ts.isFunctionLike(node)) {
+      return undefined;
+    }
+    return ts.forEachChild(node, visit);
+  };
+  return visit(root) !== undefined;
 }
 
 function findNode(root: ts.Node, predicate: (node: ts.Node) => boolean): ts.Node | undefined {
@@ -275,9 +359,11 @@ async function auditFilesystemWriters(repoRoot: string, sourceOverrides: Map<str
 async function auditImportStagingExclusion(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
   const source = await readSource(repoRoot, "packages/workspace/src/indexer.ts", sourceOverrides);
   const sourceFile = ts.createSourceFile("packages/workspace/src/indexer.ts", source, ts.ScriptTarget.Latest, true);
-  const skipsRuntimeDirectory = sourceContains(sourceFile, (node) => ts.isStringLiteral(node) && node.text === ".app");
-  const usesDirectoryGuard = hasCallNamed(sourceFile, "shouldSkipDirectory");
-  if (!skipsRuntimeDirectory || !usesDirectoryGuard) {
+  const traversal = functionDeclarations(sourceFile).find((declaration) => declaration.name?.text === "collectMarkdownFiles");
+  const skipPredicate = functionDeclarations(sourceFile).find((declaration) => declaration.name?.text === "shouldSkipDirectory");
+  const traversalUsesPredicate = traversal !== undefined && functionContains(traversal, (node) => ts.isCallExpression(node) && calledName(node) === "shouldSkipDirectory");
+  const predicateSkipsApp = skipPredicate !== undefined && functionContains(skipPredicate, (node) => ts.isExpression(node) && isEqualityWithString(node, "name", ".app"));
+  if (!traversalUsesPredicate || !predicateSkipsApp) {
     result.failures.push("indexer does not exclude runtime staging from indexing");
     return;
   }
@@ -287,13 +373,27 @@ async function auditImportStagingExclusion(repoRoot: string, sourceOverrides: Ma
 async function auditReviewBypassFields(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
   const source = await readSource(repoRoot, "packages/workspace/src/imports.ts", sourceOverrides);
   const sourceFile = ts.createSourceFile("packages/workspace/src/imports.ts", source, ts.ScriptTarget.Latest, true);
-  const bypassField = findNode(sourceFile, (node) => ts.isPropertyAssignment(node)
-    && (node.name.getText(sourceFile) === "skipReview" || node.name.getText(sourceFile) === "bypassReview"));
-  if (bypassField && ts.isPropertyAssignment(bypassField)) {
-    result.failures.push(`import routing source declares a Review bypass field: ${bypassField.name.getText(sourceFile)}`);
+  const bypassField = findNode(sourceFile, (node) => isReviewBypassIdentifier(node) || isReviewBypassStringKey(node));
+  if (bypassField) {
+    result.failures.push(`import routing source declares a Review bypass field: ${reviewBypassName(bypassField)}`);
     return;
   }
   result.passes.push("import routing source has no Review bypass field");
+}
+
+function isReviewBypassIdentifier(node: ts.Node): boolean {
+  return ts.isIdentifier(node) && (node.text === "skipReview" || node.text === "bypassReview");
+}
+
+function isReviewBypassStringKey(node: ts.Node): boolean {
+  return ts.isStringLiteral(node)
+    && (node.text === "skipReview" || node.text === "bypassReview")
+    && ((ts.isElementAccessExpression(node.parent) && node.parent.argumentExpression === node)
+      || (ts.isComputedPropertyName(node.parent) && node.parent.expression === node));
+}
+
+function reviewBypassName(node: ts.Node): string {
+  return ts.isIdentifier(node) || ts.isStringLiteral(node) ? node.text : "unknown";
 }
 
 async function auditDecisionMirror(repoRoot: string, result: ProductAuditResult): Promise<void> {

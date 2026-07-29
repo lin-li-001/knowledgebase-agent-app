@@ -77,6 +77,7 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     }
     throw error;
   });
+  const normalizedCurrent = current.replace(/\r\n?/gu, "\n");
 
   const sourceNoteRoute = "04-Resources/Imports/<batch-name>/<source-stem>.md";
   const sourceNoteRouteLine = "- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
@@ -93,15 +94,15 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.",
     "Saved workspace routing rules never bypass Review.",
   ];
-  const hasSourceNoteRoute = current.includes(sourceNoteRoute);
-  const hasSourceNoteRouteStatus = current.includes("route_status") && current.includes("route_destination");
+  const hasSourceNoteRoute = normalizedCurrent.includes(sourceNoteRoute);
+  const hasSourceNoteRouteStatus = normalizedCurrent.includes("route_status") && normalizedCurrent.includes("route_destination");
 
   const legacyRoute = "- Imported summary notes go to `04-Resources/Imports/<batch-name>.md`.";
   let next = hasSourceNoteRoute
-    ? current
-    : current.includes(legacyRoute)
-      ? current.replace(legacyRoute, sourceNoteRouteLine)
-      : `${current.trimEnd()}\n\n${sourceNoteRouteLine}\n`;
+    ? normalizedCurrent
+    : normalizedCurrent.includes(legacyRoute)
+      ? normalizedCurrent.replace(legacyRoute, sourceNoteRouteLine)
+      : `${normalizedCurrent.trimEnd()}\n\n${sourceNoteRouteLine}\n`;
 
   if (!hasSourceNoteRouteStatus) {
     next = `${next.trimEnd()}\n${sourceNoteRouteStatusLine}\n`;
@@ -112,7 +113,7 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
       .replace(`${sourceNoteRouteLine}\n`, "")
       .replace(`${sourceNoteRouteStatusLine}\n`, "");
     const routingPrecedence = contractTail.replace(/^## Routing Policy\n\n/, "");
-    next = current.includes("## Routing Policy")
+    next = normalizedCurrent.includes("## Routing Policy")
       ? `${next.trimEnd()}\n\n${routingPrecedence}`
       : `${next.trimEnd()}\n\n${contractTail}`;
   }

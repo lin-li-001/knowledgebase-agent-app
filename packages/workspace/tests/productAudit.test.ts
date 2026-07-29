@@ -209,6 +209,48 @@ describe("product audit", () => {
     expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
   });
 
+  it("rejects an executable importer decoy when the real promotion writer is ungated", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource.replace("if (status === \"auto_written\")", "if (status === \"unsafe\")")}
+async function decoyPromotion(fileOps: ImportFileOps) {
+  const safetyDecision = evaluateImportSafety({} as never);
+  const status = artifactStatusFor(safetyDecision);
+  if (status === "auto_written") {
+    await fileOps.writeFile(finalTargetPath, Buffer.from("decoy"), true);
+  }
+}
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
+  it("rejects an executable Review decoy when the real staged-note writer is ungated", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = `${reviewSource.replace("const safetyDecision = evaluateImportSafety({", "const safetyDecision = allowUnsafeMove({")}
+async function decoyReviewPromotion() {
+  const safetyDecision = evaluateImportSafety({} as never);
+  if (safetyDecision.decision !== "auto_write") {
+    throw new Error("blocked");
+  }
+  await secureWriteExclusive();
+}
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer does not call the Safety Kernel: apps/desktop/electron/ipc.ts");
+  });
+
   it("fails when source code declares an import Review bypass field", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
@@ -222,10 +264,49 @@ describe("product audit", () => {
     expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
   });
 
+  it("fails when aliases, spreads, or string-key access carry a Review bypass", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}
+const skipReview = true;
+const reviewAlias = { skipReview };
+const reviewRule = { ...reviewAlias, ["bypassReview"]: true };
+void reviewRule["skipReview"];
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
   it("fails when the indexer no longer excludes the runtime staging directory", async () => {
     const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
     const indexerSource = await readFile(indexerPath, "utf8");
     const brokenIndexerSource = indexerSource.replace('name === ".app"', 'name === ".runtime"');
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
+    });
+
+    expect(result.failures).toContain("indexer does not exclude runtime staging from indexing");
+  });
+
+  it("rejects a decoy runtime-directory guard when index traversal includes staging", async () => {
+    const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
+    const indexerSource = await readFile(indexerPath, "utf8");
+    const brokenIndexerSource = `${indexerSource
+      .replace("if (shouldSkipDirectory(entry.name))", "if (shouldSkipDirectoryForResources(entry.name))")
+      .replace("function shouldSkipDirectory(name", "function shouldSkipDirectoryForResources(name")
+      .replace('name === ".app"', 'name === ".runtime"')}
+function shouldSkipDirectory(name: string): boolean {
+  return name === ".app";
+}
+void shouldSkipDirectory(".app");
+`;
 
     const result = await auditProductContracts({
       repoRoot,
