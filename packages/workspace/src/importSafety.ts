@@ -354,7 +354,7 @@ function isValidApprovalProof(
   const normalizedApprovalDestination = normalizeDestination(intent.workspaceRoot, approval.destination);
   if (
     normalizedApprovalDestination === undefined ||
-    normalizedApprovalDestination.toLowerCase() !== normalizedDestination.toLowerCase()
+    normalizedApprovalDestination !== normalizedDestination
   ) {
     return false;
   }

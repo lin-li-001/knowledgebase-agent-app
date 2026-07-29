@@ -356,6 +356,25 @@ describe("evaluateImportSafety", () => {
     });
   });
 
+  it("does not match proof destinations that differ only by case", () => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+    });
+    const destination = "04-Resources/Imports/A.md";
+    const result = evaluateImportSafety(
+      validIntent({
+        operation: "move",
+        destination,
+        classification: value,
+        approval: approvalFor(value, { destination: "04-Resources/Imports/a.md" }),
+      }),
+    );
+
+    expect(result.decision).toBe("review_required");
+    expect(result.reasonCodes).toContain("CATEGORY_REQUIRES_REVIEW");
+  });
+
   it("requires Review for case variants of protected destinations", () => {
     for (const destination of [
       "02-personal/default/Finance/Tax.md",
