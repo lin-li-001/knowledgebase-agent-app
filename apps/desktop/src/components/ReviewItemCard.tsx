@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { ContentCategory } from "@kb-agent/workspace";
 
 const contentCategories = [
@@ -53,8 +53,14 @@ export function ReviewItemCard({
   const [category, setCategory] = useState<ContentCategory | undefined>(importDetails?.category);
   const [saveAsRoutingRule, setSaveAsRoutingRule] = useState(false);
   const [routingRulePattern, setRoutingRulePattern] = useState("");
+  const [requestPending, setRequestPending] = useState(false);
+  const requestInFlight = useRef(false);
 
-  function approve() {
+  async function approve() {
+    if (!onApprove || requestInFlight.current) {
+      return;
+    }
+
     const options: ReviewApprovalOptions = {};
     if (importDetails && category && category !== importDetails.category) {
       options.categoryOverride = category;
@@ -73,7 +79,28 @@ export function ReviewItemCard({
       }
     }
 
-    void onApprove?.(item.id, Object.keys(options).length ? options : undefined);
+    await runReviewRequest(() => onApprove(item.id, Object.keys(options).length ? options : undefined));
+  }
+
+  async function reject() {
+    if (!onReject || requestInFlight.current) {
+      return;
+    }
+
+    await runReviewRequest(() => onReject(item.id));
+  }
+
+  async function runReviewRequest(request: () => Promise<void>) {
+    requestInFlight.current = true;
+    setRequestPending(true);
+    try {
+      await request();
+    } catch {
+      // The app-level handler reports the failed request; the card remains retryable.
+    } finally {
+      requestInFlight.current = false;
+      setRequestPending(false);
+    }
   }
 
   return (
@@ -157,10 +184,10 @@ export function ReviewItemCard({
       ) : null}
       {item.failureReason ? <p className="error-text">{item.failureReason}</p> : null}
       <div className="button-row">
-        <button type="button" disabled={!canApprove} onClick={approve}>
+        <button type="button" disabled={requestPending || !canApprove} onClick={() => void approve()}>
           Approve
         </button>
-        <button type="button" className="secondary-button" disabled={!canReject} onClick={() => void onReject?.(item.id)}>
+        <button type="button" className="secondary-button" disabled={requestPending || !canReject} onClick={() => void reject()}>
           Reject
         </button>
       </div>

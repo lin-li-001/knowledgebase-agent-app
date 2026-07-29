@@ -81,21 +81,20 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
   const sourceNoteRoute = "04-Resources/Imports/<batch-name>/<source-stem>.md";
   const sourceNoteRouteLine = "- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
   const sourceNoteRouteStatusLine = "- Each imported source note records `route_status` and `route_destination`; a Review approval moves that same note to its final destination.";
-  const currentReviewOverrideLine = "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.";
-  const legacyReviewTargetOverrideLine = "1. Review target override from the current approval.";
+  const routingPriorityBlock = `Import candidate routing precedence:
+1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.
+2. Saved workspace routing rule in \`.vault/routing-policy.json\`.
+3. Semantic import candidate policy for content type and risk.
+4. \`defaultRoutingPolicy\` base path fallback.
+5. \`00-Inbox/Imports/\` fallback when the app cannot classify the import.`;
   const safetyContractLines = [
     "- Pending import notes are non-indexed under `.app/import-staging/`.",
     "- The Safety Kernel must approve every final import write.",
-    currentReviewOverrideLine,
+    "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.",
     "Saved workspace routing rules never bypass Review.",
   ];
   const hasSourceNoteRoute = current.includes(sourceNoteRoute);
   const hasSourceNoteRouteStatus = current.includes("route_status") && current.includes("route_destination");
-  const hasRoutingPrecedence = current.includes("Import candidate routing precedence:");
-  const hasSafetyContract = safetyContractLines.every((line) => current.includes(line));
-  if (hasSourceNoteRoute && hasSourceNoteRouteStatus && hasRoutingPrecedence && hasSafetyContract) {
-    return;
-  }
 
   const legacyRoute = "- Imported summary notes go to `04-Resources/Imports/<batch-name>.md`.";
   let next = hasSourceNoteRoute
@@ -108,7 +107,7 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     next = `${next.trimEnd()}\n${sourceNoteRouteStatusLine}\n`;
   }
 
-  if (!hasRoutingPrecedence) {
+  if (!next.includes("Import candidate routing precedence:")) {
     const contractTail = workspaceRoutingPolicyContract
       .replace(`${sourceNoteRouteLine}\n`, "")
       .replace(`${sourceNoteRouteStatusLine}\n`, "");
@@ -118,9 +117,7 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
       : `${next.trimEnd()}\n\n${contractTail}`;
   }
 
-  if (next.includes(legacyReviewTargetOverrideLine) && !next.includes(currentReviewOverrideLine)) {
-    next = next.replace(legacyReviewTargetOverrideLine, currentReviewOverrideLine);
-  }
+  next = synchronizeRoutingPriorityBlock(next, routingPriorityBlock);
 
   for (const line of safetyContractLines) {
     if (!next.includes(line)) {
@@ -128,7 +125,23 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     }
   }
 
-  await writeFile(contractPath, next, "utf8");
+  if (next !== current) {
+    await writeFile(contractPath, next, "utf8");
+  }
+}
+
+function synchronizeRoutingPriorityBlock(contract: string, routingPriorityBlock: string): string {
+  const priorityBlockPattern = /(?:^|\n)Import candidate routing precedence:\n(?:\d+\.[^\n]*(?:\n|$))*/gmu;
+  let inserted = false;
+  const synchronized = contract.replace(priorityBlockPattern, () => {
+    if (inserted) {
+      return "\n";
+    }
+    inserted = true;
+    return `\n${routingPriorityBlock}\n`;
+  });
+
+  return inserted ? synchronized : `${contract.trimEnd()}\n\n${routingPriorityBlock}\n`;
 }
 
 function ignoreExistingFile(error: unknown): void {

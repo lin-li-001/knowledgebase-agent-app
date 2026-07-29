@@ -1,10 +1,28 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { auditProductContracts } from "../src/index";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  auditProductContracts as auditProductContractsImplementation,
+  createWorkspace,
+  type ProductAuditInput,
+} from "../src/index";
 
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
+let workspaceRoot: string;
+
+beforeEach(async () => {
+  workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "kb-product-audit-workspace-"));
+  await createWorkspace(workspaceRoot);
+});
+
+afterEach(async () => {
+  await rm(workspaceRoot, { recursive: true, force: true });
+});
+
+function auditProductContracts(input: Omit<ProductAuditInput, "workspaceRoot">) {
+  return auditProductContractsImplementation({ ...input, workspaceRoot });
+}
 
 describe("product audit", () => {
   it("checks product contract drift in the current repo", async () => {
@@ -19,6 +37,26 @@ describe("product audit", () => {
     expect(result.passes).toContain("filesystem writers use routingPolicy instead of route literals");
     expect(result.passes).toContain("implementation repo has a docs/decisions decision mirror");
     expect(result.warnings).toEqual([]);
+  });
+
+  it("fails when the generated workspace AGENTS contract is changed after creation", async () => {
+    const agentsPath = path.join(workspaceRoot, "AGENTS.md");
+    const agents = await readFile(agentsPath, "utf8");
+    await writeFile(agentsPath, agents.replace("Saved workspace routing rules never bypass Review.", "Saved rules auto-approve imports."));
+
+    const result = await auditProductContracts({ repoRoot });
+
+    expect(result.failures).toContain("generated workspace AGENTS.md is missing import routing precedence terms: Saved workspace routing rules never bypass Review.");
+  });
+
+  it("fails when the generated workspace AGENTS contract omits the Safety Kernel requirement", async () => {
+    const agentsPath = path.join(workspaceRoot, "AGENTS.md");
+    const agents = await readFile(agentsPath, "utf8");
+    await writeFile(agentsPath, agents.replace("The Safety Kernel must approve every final import write.", "Final import writes are reviewed."));
+
+    const result = await auditProductContracts({ repoRoot });
+
+    expect(result.failures).toContain("generated workspace AGENTS.md is missing the Safety Kernel contract");
   });
 
   it("fails when the workspace contract disagrees with routing policy paths", async () => {
@@ -139,7 +177,62 @@ describe("product audit", () => {
       sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
     });
 
-    expect(result.failures).toContain("final import writes do not invoke the Safety Kernel: packages/workspace/src/imports.ts");
+    expect(result.failures).toContain("final import writer does not call the Safety Kernel: packages/workspace/src/imports.ts");
+  });
+
+  it("does not accept a commented or unused Safety Kernel call as an implementation gate", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importsSource.replace(
+      "const safetyDecision = evaluateImportSafety({",
+      "const decoy = \"const safetyDecision = evaluateImportSafety({\";\n  // const safetyDecision = evaluateImportSafety({\n  const safetyDecision = missingSafetyKernel({",
+    );
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer does not call the Safety Kernel: packages/workspace/src/imports.ts");
+  });
+
+  it("fails when an importer final write is not structurally gated on auto_write", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = importsSource.replace("if (status === \"auto_written\")", "if (status === \"unsafe\")");
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: packages/workspace/src/imports.ts");
+  });
+
+  it("fails when source code declares an import Review bypass field", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource}\nconst unsafeRule = { skipReview: true };\n`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain("import routing source declares a Review bypass field: skipReview");
+  });
+
+  it("fails when the indexer no longer excludes the runtime staging directory", async () => {
+    const indexerPath = path.join(repoRoot, "packages/workspace/src/indexer.ts");
+    const indexerSource = await readFile(indexerPath, "utf8");
+    const brokenIndexerSource = indexerSource.replace('name === ".app"', 'name === ".runtime"');
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[indexerPath, brokenIndexerSource]]),
+    });
+
+    expect(result.failures).toContain("indexer does not exclude runtime staging from indexing");
   });
 
   it("treats import staging literals as routing-policy bypasses", async () => {
@@ -181,11 +274,13 @@ describe("product audit", () => {
       const importsSource = await readFile(path.join(repoRoot, "packages/workspace/src/imports.ts"), "utf8");
       const importRoutingSource = await readFile(path.join(repoRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), "utf8");
       const workspaceSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspace.ts"), "utf8");
+      const indexerSource = await readFile(path.join(repoRoot, "packages/workspace/src/indexer.ts"), "utf8");
       const ipcSource = await readFile(path.join(repoRoot, "apps/desktop/electron/ipc.ts"), "utf8");
       await writeFile(path.join(tempRoot, "packages/workspace/src/templates.ts"), contractSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/imports.ts"), importsSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), importRoutingSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/workspace.ts"), workspaceSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/indexer.ts"), indexerSource);
       await mkdir(path.join(tempRoot, "apps/desktop/electron"), { recursive: true });
       await writeFile(path.join(tempRoot, "apps/desktop/electron/ipc.ts"), ipcSource);
 

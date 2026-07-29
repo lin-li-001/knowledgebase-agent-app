@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
@@ -141,7 +141,7 @@ describe("desktop shell", () => {
     });
   });
 
-  it("allows failed Review items to be retried and disables claimed Review items", () => {
+  it("allows failed Review items to be retried and disables claimed Review items", async () => {
     const approve = vi.fn(async () => undefined);
     const reject = vi.fn(async () => undefined);
     const item = {
@@ -156,8 +156,9 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     expect(approve).toHaveBeenCalledWith("review-1", undefined);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     expect(reject).toHaveBeenCalledWith("review-1");
 
     rerender(<ReviewItemCard item={{ ...item, state: "applying" }} onApprove={approve} onReject={reject} />);
@@ -167,6 +168,66 @@ describe("desktop shell", () => {
     rerender(<ReviewItemCard item={{ ...item, state: "rejecting" }} onApprove={approve} onReject={reject} />);
     expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+  });
+
+  it("disables Review actions while an approval is pending and prevents duplicate requests", async () => {
+    let resolveApproval: (() => void) | undefined;
+    const approve = vi.fn(() => new Promise<void>((resolve) => {
+      resolveApproval = resolve;
+    }));
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-1",
+          state: "failed",
+          proposalType: "propose_memory",
+          risk: "high",
+          reason: "Model proposed a knowledge-base change.",
+          payload: { body: "User's name is Lin Li." },
+        }}
+        onApprove={approve}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+
+    resolveApproval?.();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled());
+  });
+
+  it("restores Review actions after a rejected request", async () => {
+    let rejectRequest: ((error: Error) => void) | undefined;
+    const reject = vi.fn(() => new Promise<void>((_resolve, rejectPromise) => {
+      rejectRequest = rejectPromise;
+    }));
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-1",
+          state: "failed",
+          proposalType: "propose_memory",
+          risk: "high",
+          reason: "Model proposed a knowledge-base change.",
+          payload: { body: "User's name is Lin Li." },
+        }}
+        onReject={reject}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+
+    rejectRequest?.(new Error("request failed"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reject" })).toBeEnabled());
   });
 
   it("renders import controls for document batches", () => {
