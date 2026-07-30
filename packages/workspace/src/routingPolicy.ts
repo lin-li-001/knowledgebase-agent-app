@@ -6,6 +6,9 @@ export interface RoutingPolicy {
   importInboxDir(): string;
   importInboxNotePath(batchName: string): string;
   importInboxSourceNotePath(batchName: string, sourceStem: string): string;
+  importPromotionJournalDir(): string;
+  importPromotionJournalPath(journalId: string): string;
+  importStagingRoot(): string;
   importStagingDir(importId: string): string;
   importStagingNotePath(importId: string, sourceStem: string): string;
   importSourceNotePath(batchName: string, sourceStem: string): string;
@@ -20,6 +23,7 @@ const importAttachmentRoot = "06-Attachments/Imports";
 const importInboxDir = "00-Inbox/Imports";
 const importSummaryDir = "04-Resources/Imports";
 const importStagingRoot = ".app/import-staging";
+const importPromotionJournalRoot = ".app/import-promotion-journal";
 const exportDir = ".app/exports";
 const decisionDir = ".vault/decisions";
 
@@ -44,6 +48,15 @@ export const defaultRoutingPolicy: RoutingPolicy = {
   },
   importInboxSourceNotePath(batchName: string, sourceStem: string): string {
     return `${importInboxDir}/${batchName}/${sourceStem}.md`;
+  },
+  importPromotionJournalDir(): string {
+    return importPromotionJournalRoot;
+  },
+  importPromotionJournalPath(journalId: string): string {
+    return `${importPromotionJournalRoot}/${journalId}.json`;
+  },
+  importStagingRoot(): string {
+    return importStagingRoot;
   },
   importStagingDir(importId: string): string {
     return `${importStagingRoot}/${importId}`;

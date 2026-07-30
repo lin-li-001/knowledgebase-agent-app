@@ -1,5 +1,6 @@
 import type {
   ClassificationSignal,
+  ClassificationDiagnostic,
   ContentCategory,
   ImportClassification,
   ImportSensitivity,
@@ -11,6 +12,8 @@ export interface SavedImportRule {
   category?: ContentCategory;
   sensitivity?: ImportSensitivity;
   destination: string;
+  diagnostics?: ClassificationDiagnostic[];
+  diagnosticEvidence?: string[];
 }
 
 const sourcePriority: Record<ClassificationSignal["source"], number> = {
@@ -81,7 +84,7 @@ export function mergeImportClassification(input: {
     evidence: uniqueSnippets(signals.flatMap((signal) => signal.evidence)),
     signals,
     suggestedDestination: destinationSignal?.destination ?? input.fallbackDestination,
-    conflict: hasCategoryConflict(signals),
+    conflict: hasCategoryConflict(signals) || signals.some(hasDiagnostics),
   };
 }
 
@@ -152,6 +155,10 @@ function hasCategoryConflict(signals: ClassificationSignal[]): boolean {
     }
   }
   return false;
+}
+
+function hasDiagnostics(signal: ClassificationSignal): boolean {
+  return (signal.diagnostics?.length ?? 0) > 0;
 }
 
 function snippets(values: string[]): string[] {

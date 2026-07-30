@@ -22,7 +22,10 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   const result: ProductAuditResult = { passes: [], warnings: [], failures: [] };
   const workspaceContractSource = await readSource(repoRoot, "packages/workspace/src/templates.ts", input.sourceOverrides);
   const generatedWorkspaceContract = await readGeneratedWorkspaceContract(input.workspaceRoot, result);
-  const importSourceNoteRoute = `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>/<source-stem>.md`;
+  const importSourceNoteRoute = defaultRoutingPolicy.importStagingNotePath(
+    "<batch-name>",
+    "<source-stem>",
+  );
   const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`;
   const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`;
   const profileMemoryRoute = "02-Profiles/<profile-id>/Memory.md";
@@ -50,6 +53,11 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   if (!result.failures.some((failure) => failure.startsWith("final import writer"))) {
     result.passes.push("final import writes invoke the Safety Kernel");
   }
+  await auditInitialImportHardenedIo(
+    repoRoot,
+    input.sourceOverrides,
+    result,
+  );
   await auditImportStagingExclusion(repoRoot, input.sourceOverrides, result);
   await auditReviewBypassFields(repoRoot, input.sourceOverrides, result);
   await auditFilesystemWriters(repoRoot, input.sourceOverrides, result);
@@ -95,6 +103,10 @@ function auditImportRoutingPrecedence(source: string, result: ProductAuditResult
 }
 
 function auditImportStagingContract(source: string, result: ProductAuditResult): void {
+  if (documentsObsoletePendingImportRoute(source)) {
+    result.failures.push("workspace contract retains obsolete 04-Resources/Imports pending-note route");
+    return;
+  }
   if (source.includes("Pending import notes are indexed")) {
     result.failures.push("workspace contract documents pending imports as indexed");
     return;
@@ -111,7 +123,9 @@ function auditGeneratedWorkspaceContract(source: string, result: ProductAuditRes
   if (missingTerms.length) {
     result.failures.push(`generated workspace AGENTS.md is missing import routing precedence terms: ${missingTerms.join(", ")}`);
   }
-  if (source.includes("Pending import notes are indexed")) {
+  if (documentsObsoletePendingImportRoute(source)) {
+    result.failures.push("generated workspace AGENTS.md retains obsolete 04-Resources/Imports pending-note route");
+  } else if (source.includes("Pending import notes are indexed")) {
     result.failures.push("generated workspace AGENTS.md documents pending imports as indexed");
   } else if (!source.includes("Pending import notes are non-indexed") || !source.includes(".app/import-staging/")) {
     result.failures.push("generated workspace AGENTS.md is missing non-indexed import staging contract");
@@ -122,6 +136,14 @@ function auditGeneratedWorkspaceContract(source: string, result: ProductAuditRes
   if (!result.failures.some((failure) => failure.startsWith("generated workspace AGENTS.md"))) {
     result.passes.push("generated workspace AGENTS.md matches the import safety contract");
   }
+}
+
+function documentsObsoletePendingImportRoute(source: string): boolean {
+  return source.includes(
+    "04-Resources/Imports/<batch-name>/<source-stem>.md\\` while pending Review",
+  ) || source.includes(
+    "04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review",
+  );
 }
 
 async function auditImportRoutingPolicy(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
@@ -142,6 +164,218 @@ async function auditImportSafetyKernel(repoRoot: string, sourceOverrides: Map<st
 
   auditImporterSafetyKernel(importerPath, importerSource, result);
   auditReviewSafetyKernel(reviewPath, reviewSource, result);
+}
+
+async function auditInitialImportHardenedIo(
+  repoRoot: string,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const importerPath = "packages/workspace/src/imports.ts";
+  const promotionPath = "packages/workspace/src/importPromotion.ts";
+  const secureIoPath = "packages/workspace/src/secureWorkspaceIo.ts";
+  let importerSource: string;
+  let promotionSource: string;
+  let secureIoSource: string;
+  try {
+    [importerSource, promotionSource, secureIoSource] = await Promise.all([
+      readSource(repoRoot, importerPath, sourceOverrides),
+      readSource(repoRoot, promotionPath, sourceOverrides),
+      readSource(repoRoot, secureIoPath, sourceOverrides),
+    ]);
+  } catch {
+    result.failures.push("initial import hardened IO sources cannot be read");
+    return;
+  }
+  const importerFile = ts.createSourceFile(
+    importerPath,
+    importerSource,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const promotionFile = ts.createSourceFile(
+    promotionPath,
+    promotionSource,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const secureIoFile = ts.createSourceFile(
+    secureIoPath,
+    secureIoSource,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+
+  const importBatch = namedFunction(importerFile, "importDocumentBatch");
+  const persistSource = namedFunction(importerFile, "persistSourceNote");
+  const promoteArtifact = namedFunction(
+    promotionFile,
+    "promoteImportArtifact",
+  );
+  const attachmentIsHardened = importsNamedBinding(
+    importerFile,
+    "./secureWorkspaceIo",
+    "secureCopyFileIntoWorkspace",
+  ) && hasCallWithOperation(
+    importBatch,
+    "secureCopyFileIntoWorkspace",
+    "attachment_create",
+  );
+  const stagingIsHardened = importsNamedBinding(
+    importerFile,
+    "./secureWorkspaceIo",
+    "secureWriteWorkspaceFileExclusive",
+  ) && hasCallWithOperation(
+    persistSource,
+    "secureWriteWorkspaceFileExclusive",
+    "staging_create",
+  );
+  const finalIsHardened = importsNamedBinding(
+    importerFile,
+    "./importPromotion",
+    "promoteImportArtifact",
+  ) && hasDirectCall(persistSource, "promoteImportArtifact")
+    && importsNamedBinding(
+      promotionFile,
+      "./secureWorkspaceIo",
+      "secureWriteWorkspaceFileExclusive",
+    )
+    && hasCallWithOperation(
+      promoteArtifact,
+      "secureWriteWorkspaceFileExclusive",
+      "final_create",
+    );
+
+  if (!attachmentIsHardened) {
+    result.failures.push(
+      `initial import attachment write bypasses hardened workspace IO: ${importerPath}`,
+    );
+  }
+  if (!stagingIsHardened) {
+    result.failures.push(
+      `initial import staging write bypasses hardened workspace IO: ${importerPath}`,
+    );
+  }
+  if (!finalIsHardened) {
+    result.failures.push(
+      `initial import final write bypasses hardened workspace IO: ${promotionPath}`,
+    );
+  }
+  if (!isHardenedWorkspaceIoImplementation(secureIoFile)) {
+    result.failures.push(
+      `hardened workspace IO is missing real-path, ancestor, inode, or exclusive-open checks: ${secureIoPath}`,
+    );
+  }
+  if (
+    attachmentIsHardened
+    && stagingIsHardened
+    && finalIsHardened
+    && isHardenedWorkspaceIoImplementation(secureIoFile)
+  ) {
+    result.passes.push(
+      "initial import attachment, staging, and final writes use hardened workspace IO",
+    );
+  }
+}
+
+function isHardenedWorkspaceIoImplementation(
+  sourceFile: ts.SourceFile,
+): boolean {
+  const writer = namedFunction(
+    sourceFile,
+    "secureWriteWorkspaceFileExclusive",
+  );
+  const capture = namedFunction(sourceFile, "capturePathIdentity");
+  const revalidate = namedFunction(sourceFile, "revalidatePathIdentity");
+  const noFollow = namedFunction(sourceFile, "noFollowFlag");
+  return hasDirectCalls(writer, [
+    "capturePathIdentity",
+    "revalidatePathIdentity",
+    "open",
+    "noFollowFlag",
+  ])
+    && functionContainsProperty(writer, "constants", "O_EXCL")
+    && hasDirectCalls(capture, [
+      "assertNoSymlinkAncestors",
+      "lstat",
+      "realpath",
+    ])
+    && hasDirectCalls(revalidate, [
+      "assertNoSymlinkAncestors",
+      "lstat",
+      "realpath",
+    ])
+    && functionContainsProperty(capture, "parent", "dev")
+    && functionContainsProperty(capture, "parent", "ino")
+    && functionContainsProperty(noFollow, "constants", "O_NOFOLLOW");
+}
+
+function namedFunction(
+  sourceFile: ts.SourceFile,
+  name: string,
+): ts.FunctionDeclaration | undefined {
+  return functionDeclarations(sourceFile).find(
+    (declaration) => declaration.name?.text === name,
+  );
+}
+
+function hasDirectCall(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInFunction(declaration).some(
+      (node) => ts.isCallExpression(node) && calledName(node) === callName,
+    );
+}
+
+function hasDirectCalls(
+  declaration: ts.FunctionDeclaration | undefined,
+  callNames: string[],
+): boolean {
+  return callNames.every((callName) => hasDirectCall(declaration, callName));
+}
+
+function hasCallWithOperation(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+  operation: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInFunction(declaration).some(
+      (node) => ts.isCallExpression(node)
+        && calledName(node) === callName
+        && node.arguments.some((argument) => nodeContainsString(argument, operation)),
+    );
+}
+
+function nodeContainsString(node: ts.Node, value: string): boolean {
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (
+      (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current))
+      && current.text === value
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return found;
+}
+
+function functionContainsProperty(
+  declaration: ts.FunctionDeclaration | undefined,
+  receiver: string,
+  property: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInFunction(declaration).some(
+      (node) => ts.isPropertyAccessExpression(node)
+        && isIdentifierNamed(node.expression, receiver)
+        && node.name.text === property,
+    );
 }
 
 // These checks accept only explicit Safety Kernel control-flow shapes around final writes.
@@ -400,12 +634,17 @@ function terminatesDirectly(statement: ts.Statement): boolean {
 
 function isFinalImportPromotionWrite(node: ts.Node): boolean {
   return ts.isCallExpression(node)
-    && isMethodCall(node, "fileOps", "writeFile")
-    && node.arguments[0] !== undefined
-    && ts.isIdentifier(node.arguments[0])
-    && node.arguments[0].text === "finalTargetPath"
-    && isAwaitedMethodCall(node.arguments[1], "fileOps", "readFile", "stagingTargetPath")
-    && node.arguments[2]?.kind === ts.SyntaxKind.TrueKeyword;
+    && (
+      calledName(node) === "promoteImportArtifact"
+      || (
+        isMethodCall(node, "fileOps", "writeFile")
+        && node.arguments[0] !== undefined
+        && ts.isIdentifier(node.arguments[0])
+        && node.arguments[0].text === "finalTargetPath"
+        && isAwaitedMethodCall(node.arguments[1], "fileOps", "readFile", "stagingTargetPath")
+        && node.arguments[2]?.kind === ts.SyntaxKind.TrueKeyword
+      )
+    );
 }
 
 function isReviewImportPromotionWrite(node: ts.Node): boolean {

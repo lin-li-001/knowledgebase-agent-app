@@ -1,10 +1,18 @@
-import { constants } from "node:fs";
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { extractDocumentText } from "../src/importExtractors";
-import { importDocumentBatch, type ImportFileOps } from "../src/index";
+import { importDocumentBatch } from "../src/index";
 
 describe("importDocumentBatch", () => {
   it("creates one Markdown note with derived summary, body, source, and route metadata for one PDF", async () => {
@@ -277,20 +285,15 @@ describe("importDocumentBatch", () => {
     );
     await writeFile(source, "Handbook content that should remain unchanged during the move.", "utf8");
 
-    const writes: Array<{ path: string; bytes: Buffer }> = [];
-    const operations = testFileOps();
+    const secureOperations: string[] = [];
     const job = await importDocumentBatch({
       workspaceRoot: root,
       batchName: "Handbook",
       files: [source],
       now: "2026-07-21T00:00:00.000Z",
-      fileOps: {
-        ...operations,
-        writeFile: async (targetPath, contents, exclusive) => {
-          if (exclusive) {
-            writes.push({ path: targetPath, bytes: Buffer.from(contents) });
-          }
-          await operations.writeFile(targetPath, contents, exclusive);
+      ioHooks: {
+        afterPathSnapshot: async (operation) => {
+          secureOperations.push(operation);
         },
       },
     });
@@ -308,8 +311,8 @@ describe("importDocumentBatch", () => {
     await expect(
       readFile(path.join(root, ".app/import-staging", job.id, "Handbook.md"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
-    expect(writes).toHaveLength(2);
-    expect(writes[1]!.bytes.equals(writes[0]!.bytes)).toBe(true);
+    expect(secureOperations).toContain("staging_create");
+    expect(secureOperations).toContain("final_create");
   });
 
   it("does not overwrite an existing auto-write destination", async () => {
@@ -355,7 +358,7 @@ describe("importDocumentBatch", () => {
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("New handbook content.");
   });
 
-  it("cleans only artifacts created before a later source fails", async () => {
+  it("preserves copied source attachments while cleaning derived artifacts after a later source fails", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const first = path.join(sourceDir, "First.txt");
@@ -378,11 +381,171 @@ describe("importDocumentBatch", () => {
       now: "2026-07-29T00:00:00.000Z",
     });
 
-    expect(job).toMatchObject({ state: "failed", sourceFiles: [], notes: [] });
-    await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/First.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(job).toMatchObject({
+      state: "failed",
+      sourceFiles: [
+        "06-Attachments/Imports/Recovery/First.txt",
+        "06-Attachments/Imports/Recovery/Second.docx",
+      ],
+      notes: [],
+    });
+    await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/First.txt"), "utf8")).resolves.toBe("First source content.");
+    await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/Second.docx"), "utf8")).resolves.toBe("Unsupported source.");
     await expect(readFile(path.join(root, "00-Inbox/Imports/First.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(root, ".app/import-staging/Recovery-2026-07-29T00-00-00.000Z/First.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(root, "06-Attachments/Imports/Recovery/Existing.txt"), "utf8")).resolves.toBe("Pre-existing attachment.");
+  });
+
+  it("copies an unsupported source attachment before extraction fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const unsupported = path.join(sourceDir, "Report.docx");
+    await writeFile(unsupported, "Unsupported but preserved.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Unsupported",
+      files: [unsupported],
+      now: "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(job).toMatchObject({
+      state: "failed",
+      sourceFiles: ["06-Attachments/Imports/Unsupported/Report.docx"],
+      notes: [],
+    });
+    await expect(
+      readFile(path.join(root, "06-Attachments/Imports/Unsupported/Report.docx"), "utf8"),
+    ).resolves.toBe("Unsupported but preserved.");
+  });
+
+  it("extracts from the preserved attachment snapshot when the external source changes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Snapshot.txt");
+    await writeFile(source, "Original source snapshot.", "utf8");
+    let sourceChanged = false;
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Snapshot",
+      files: [source],
+      now: "2026-07-29T00:00:00.000Z",
+      ioHooks: {
+        afterPathSnapshot: async (operation) => {
+          if (operation === "attachment_create" && !sourceChanged) {
+            sourceChanged = true;
+            await writeFile(source, "Changed external source.", "utf8");
+          }
+        },
+      },
+    });
+
+    expect(job.state).toBe("completed");
+    await expect(
+      readFile(path.join(root, job.sourceFiles[0]!), "utf8"),
+    ).resolves.toBe("Original source snapshot.");
+    await expect(
+      readFile(path.join(root, job.notes[0]!.notePath), "utf8"),
+    ).resolves.toContain("Original source snapshot.");
+    await expect(
+      readFile(path.join(root, job.notes[0]!.notePath), "utf8"),
+    ).resolves.not.toContain("Changed external source.");
+  });
+
+  it.each([
+    {
+      name: "attachment",
+      symlinkPath: "06-Attachments",
+      batchName: "Attachment Static",
+      autoWrite: false,
+    },
+    {
+      name: "staging",
+      symlinkPath: ".app",
+      batchName: "Staging Static",
+      autoWrite: false,
+    },
+    {
+      name: "final destination",
+      symlinkPath: "00-Inbox",
+      batchName: "Handbook",
+      autoWrite: true,
+    },
+  ])("rejects a static symlink parent at the $name boundary", async (testCase) => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-symlink-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "kb-agent-import-outside-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    await writeFile(source, "Handbook source bytes must stay in the workspace.", "utf8");
+    if (testCase.autoWrite) {
+      await writeAutoWritePolicy(root);
+    }
+    await symlink(outside, path.join(root, testCase.symlinkPath), "dir");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: testCase.batchName,
+      files: [source],
+      now: "2026-07-29T01:00:00.000Z",
+    });
+
+    expect(job.state).toBe("failed");
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  it.each([
+    {
+      name: "attachment",
+      operation: "attachment_create",
+      batchName: "Attachment Race",
+      autoWrite: false,
+    },
+    {
+      name: "staging",
+      operation: "staging_create",
+      batchName: "Staging Race",
+      autoWrite: false,
+    },
+    {
+      name: "final destination",
+      operation: "final_create",
+      batchName: "Handbook",
+      autoWrite: true,
+    },
+  ])("rejects a parent swap race at the $name boundary", async (testCase) => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-race-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "kb-agent-import-outside-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Handbook.txt");
+    await writeFile(source, "Handbook source bytes must not escape.", "utf8");
+    if (testCase.autoWrite) {
+      await writeAutoWritePolicy(root);
+    }
+    let swapped = false;
+    const input = {
+      workspaceRoot: root,
+      batchName: testCase.batchName,
+      files: [source],
+      now: "2026-07-29T02:00:00.000Z",
+      ioHooks: {
+        afterPathSnapshot: async (operation: string, targetPath: string) => {
+          if (operation !== testCase.operation || swapped) {
+            return;
+          }
+          swapped = true;
+          const parent = path.dirname(targetPath);
+          await rename(parent, `${parent}.verified`);
+          await symlink(outside, parent, "dir");
+        },
+      },
+    };
+
+    const job = await importDocumentBatch(input);
+
+    expect(swapped).toBe(true);
+    expect(job.state).toBe("failed");
+    expect(await readdir(outside)).toEqual([]);
   });
 
   it("keeps a truthful blocked staging artifact when promotion races an existing destination", async () => {
@@ -392,20 +555,23 @@ describe("importDocumentBatch", () => {
     const finalPath = path.join(root, "00-Inbox/Imports/Handbook.md");
     await writeAutoWritePolicy(root);
     await writeFile(source, "Handbook source content.", "utf8");
-    const operations = testFileOps();
+    let destinationCreated = false;
 
     const job = await importDocumentBatch({
       workspaceRoot: root,
       batchName: "Handbook",
       files: [source],
       now: "2026-07-29T00:00:00.000Z",
-      fileOps: {
-        ...operations,
-        writeFile: async (targetPath, contents, exclusive) => {
-          if (exclusive && targetPath === finalPath) {
-            throw Object.assign(new Error("Destination appeared during promotion"), { code: "EEXIST" });
+      ioHooks: {
+        afterPathSnapshot: async (operation, targetPath) => {
+          if (
+            operation === "final_create"
+            && targetPath === finalPath
+            && !destinationCreated
+          ) {
+            destinationCreated = true;
+            await writeFile(finalPath, "Concurrent authoritative note.", "utf8");
           }
-          await operations.writeFile(targetPath, contents, exclusive);
         },
       },
     });
@@ -415,18 +581,18 @@ describe("importDocumentBatch", () => {
       notePath: expect.stringMatching(/^\.app\/import-staging\//),
       safetyDecision: { decision: "blocked", reasonCodes: ["DESTINATION_EXISTS"] },
     });
-    await expect(readFile(finalPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(finalPath, "utf8")).resolves.toBe("Concurrent authoritative note.");
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("status: blocked");
   });
 
-  it("rolls back a newly promoted final file when staging cleanup fails", async () => {
+  it("recovers a promoted final file when the first staging cleanup attempt fails", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const source = path.join(sourceDir, "Handbook.txt");
     const finalPath = path.join(root, "00-Inbox/Imports/Handbook.md");
     await writeAutoWritePolicy(root);
     await writeFile(source, "Handbook source content.", "utf8");
-    const operations = testFileOps();
+    let stagingUnlinkFailed = false;
 
     const job = await importDocumentBatch({
       workspaceRoot: root,
@@ -434,23 +600,31 @@ describe("importDocumentBatch", () => {
       files: [source],
       now: "2026-07-29T00:00:00.000Z",
       fileOps: {
-        ...operations,
         unlink: async (targetPath) => {
-          if (targetPath.includes("/.app/import-staging/")) {
+          if (
+            targetPath.includes("/.app/import-staging/")
+            && !stagingUnlinkFailed
+          ) {
+            stagingUnlinkFailed = true;
             throw new Error("Staging unlink failed");
           }
-          await operations.unlink(targetPath);
+          await unlink(targetPath);
         },
       },
     });
 
     expect(job.notes[0]).toMatchObject({
-      status: "blocked",
-      notePath: expect.stringMatching(/^\.app\/import-staging\//),
-      safetyDecision: { decision: "blocked", reasonCodes: ["INTERNAL_EVALUATION_ERROR"] },
+      status: "auto_written",
+      notePath: "00-Inbox/Imports/Handbook.md",
+      safetyDecision: { decision: "auto_write", reasonCodes: [] },
     });
-    await expect(readFile(finalPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("status: blocked");
+    await expect(readFile(finalPath, "utf8")).resolves.toContain("Handbook source content.");
+    await expect(
+      readFile(path.join(root, ".app/import-staging", job.id, "Handbook.md"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      readdir(path.join(root, ".app/import-promotion-journal")),
+    ).resolves.toEqual([]);
   });
 });
 
@@ -463,24 +637,6 @@ async function writeAutoWritePolicy(root: string): Promise<void> {
   );
 }
 
-function testFileOps(): ImportFileOps {
-  return {
-    copyFile: (sourcePath, targetPath) => copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL),
-    mkdir: async (directoryPath) => { await mkdir(directoryPath, { recursive: true }); },
-    pathExists: async (targetPath) => {
-      try {
-        await access(targetPath);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    readFile: (targetPath) => readFile(targetPath),
-    readdir: (directoryPath) => readdir(directoryPath),
-    unlink: (targetPath) => unlink(targetPath),
-    writeFile: (targetPath, contents, exclusive) => writeFile(targetPath, contents, exclusive ? { flag: "wx" } : undefined),
-  };
-}
 
 function frontmatterField(note: string, field: string): string {
   const match = new RegExp(`^${field}:\\s*(.+)$`, "mu").exec(note);

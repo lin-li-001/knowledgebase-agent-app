@@ -7,6 +7,7 @@ import {
   appendMessage,
   claimReviewItem,
   createReviewItem,
+  expireReviewItemClaims,
   getReviewItem,
   latestMigrationVersion,
   openAppDatabase,
@@ -178,6 +179,49 @@ describe("migrations", () => {
 });
 
 describe("Review item claims", () => {
+  it("normalizes expired applying and rejecting leases into retryable failures", async () => {
+    const db = await openTempDb();
+    const applying = await insertClaimableReview(db, "review-expired-applying");
+    const rejecting = await insertClaimableReview(db, "review-expired-rejecting");
+    await claimReviewItem(db, applying.id, {
+      from: ["proposed"],
+      to: "applying",
+      token: "old-applying",
+      startedAt: "2000-01-01T00:00:00.000Z",
+      application: { destination: "04-Resources/A.md" },
+    });
+    await claimReviewItem(db, rejecting.id, {
+      from: ["proposed"],
+      to: "rejecting",
+      token: "old-rejecting",
+      startedAt: "2000-01-01T00:00:00.000Z",
+    });
+
+    await expect(expireReviewItemClaims(
+      db,
+      applying.workspaceId,
+      "2026-07-29T00:00:00.000Z",
+    )).resolves.toBe(1);
+    await expect(expireReviewItemClaims(
+      db,
+      rejecting.workspaceId,
+      "2026-07-29T00:00:00.000Z",
+    )).resolves.toBe(1);
+    await expect(getReviewItem(db, applying.id)).resolves.toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failureReason: "Previous applying lease expired; retry is available.",
+        application: { destination: "04-Resources/A.md" },
+      }),
+    );
+    await expect(getReviewItem(db, rejecting.id)).resolves.toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failureReason: "Previous rejecting lease expired; retry is available.",
+      }),
+    );
+  });
+
   it("allows only one durable application claimant", async () => {
     const db = await openTempDb();
     const now = new Date().toISOString();

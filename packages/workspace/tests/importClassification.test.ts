@@ -267,10 +267,78 @@ describe("saved import rules", () => {
       notes: [expect.objectContaining({
         destination: "03-Knowledge/Utility Bills.md",
         status: "pending_review",
+        classification: expect.objectContaining({
+          conflict: true,
+          signals: expect.arrayContaining([
+            expect.objectContaining({
+              source: "saved_user_policy",
+              diagnostics: [
+                "INVALID_SAVED_RULE_CATEGORY",
+                "INVALID_SAVED_RULE_SENSITIVITY",
+              ],
+              evidence: expect.arrayContaining([
+                "Saved routing rule has invalid category: not-a-category",
+                "Saved routing rule has invalid sensitivity: very-private",
+              ]),
+            }),
+          ]),
+        }),
+        safetyDecision: expect.objectContaining({
+          decision: "review_required",
+          reasonCodes: expect.arrayContaining(["CLASSIFIER_CONFLICT"]),
+        }),
       })],
     });
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain(
       "Destination: 03-Knowledge/Utility Bills.md",
     );
+  });
+
+  it("forces Review when a matching resource rule has an invalid saved sensitivity", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-classification-source-"));
+    const sourcePath = path.join(sourceDir, "Project Brief.txt");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(sourcePath, "Product planning notes", "utf8");
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({
+        rules: [{
+          pattern: "project brief",
+          category: "resource",
+          sensitivity: "ordinary",
+          destination: "03-Knowledge/Project Brief.md",
+        }],
+      }),
+      "utf8",
+    );
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Project Brief",
+      files: [sourcePath],
+      now: "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(job.notes[0]).toMatchObject({
+      destination: "03-Knowledge/Project Brief.md",
+      status: "pending_review",
+      classification: {
+        primaryCategory: "resource",
+        sensitivity: "normal",
+        confidence: 1,
+        conflict: true,
+        signals: expect.arrayContaining([
+          expect.objectContaining({
+            source: "saved_user_policy",
+            diagnostics: ["INVALID_SAVED_RULE_SENSITIVITY"],
+          }),
+        ]),
+      },
+      safetyDecision: {
+        decision: "review_required",
+        reasonCodes: expect.arrayContaining(["CLASSIFIER_CONFLICT"]),
+      },
+    });
   });
 });

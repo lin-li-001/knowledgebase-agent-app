@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { exportLlmsFlat, importDocumentBatch, indexWorkspace, type ImportJob, type ImportSourceNote } from "@kb-agent/workspace";
+import {
+  assertInsideWorkspace,
+  exportLlmsFlat,
+  importDocumentBatch,
+  indexWorkspace,
+  secureReadWorkspaceText,
+  type ImportJob,
+  type ImportSourceNote,
+} from "@kb-agent/workspace";
 import { createReviewItem, recordActivity, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
 
 export interface StartImportBatchInput {
@@ -25,7 +33,13 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
   await recordImportJob(input.db, workspaceId, job, createdAt);
 
   if (job.state === "completed") {
-    await recordImportSafetyOutcomes(input.db, workspaceId, job, createdAt);
+    await recordImportSafetyOutcomes(
+      input.db,
+      workspaceId,
+      input.workspaceRoot,
+      job,
+      createdAt,
+    );
     await exportLlmsFlat(input.workspaceRoot, input.db);
   }
 
@@ -36,7 +50,7 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
     title: job.state === "completed" ? "Import completed" : "Import failed",
     message: job.state === "completed"
       ? `${job.notes.length} files imported.`
-      : job.failureReason ?? "Import failed.",
+      : failedImportActivityMessage(job),
     createdAt,
   };
   const primaryNotePath = job.notes[0]?.notePath;
@@ -50,10 +64,27 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
   return job;
 }
 
-async function recordImportSafetyOutcomes(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {
+async function recordImportSafetyOutcomes(
+  db: AppDatabase,
+  workspaceId: string,
+  workspaceRoot: string,
+  job: ImportJob,
+  createdAt: string,
+): Promise<void> {
   for (const note of job.notes) {
     if (note.safetyDecision.decision === "review_required") {
-      const reviewItem = reviewItemForImportSourceNote(workspaceId, job, note, createdAt);
+      const body = await secureReadWorkspaceText(
+        workspaceRoot,
+        assertInsideWorkspace(workspaceRoot, note.notePath),
+        { operation: "review_payload_read" },
+      );
+      const reviewItem = reviewItemForImportSourceNote(
+        workspaceId,
+        job,
+        note,
+        body,
+        createdAt,
+      );
       await createReviewItem(db, reviewItem);
       await recordActivity(db, {
         id: randomUUID(),
@@ -79,7 +110,13 @@ async function recordImportSafetyOutcomes(db: AppDatabase, workspaceId: string, 
   }
 }
 
-function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note: ImportSourceNote, createdAt: string): ReviewItem {
+function reviewItemForImportSourceNote(
+  workspaceId: string,
+  job: ImportJob,
+  note: ImportSourceNote,
+  body: string,
+  createdAt: string,
+): ReviewItem {
   return {
     id: `import-source-note:${job.id}:${note.notePath}`,
     workspaceId,
@@ -89,6 +126,7 @@ function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note
     targetPath: note.destination ?? note.notePath,
     payload: {
       sourceNotePath: note.notePath,
+      body,
       destination: note.destination,
       classification: note.classification,
       safetyDecision: note.safetyDecision,
@@ -99,6 +137,14 @@ function reviewItemForImportSourceNote(workspaceId: string, job: ImportJob, note
     sourceTurnId: note.notePath,
     createdAt,
   };
+}
+
+function failedImportActivityMessage(job: ImportJob): string {
+  const reason = job.failureReason ?? "Import failed.";
+  const suffix = job.sourceFiles.length === 1
+    ? "Preserved 1 source attachment."
+    : `Preserved ${job.sourceFiles.length} source attachments.`;
+  return `${reason.replace(/\.$/u, "")}. ${suffix}`;
 }
 
 async function recordImportJob(db: AppDatabase, workspaceId: string, job: ImportJob, createdAt: string): Promise<void> {

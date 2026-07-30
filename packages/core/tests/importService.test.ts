@@ -82,7 +82,8 @@ describe("startImportBatch", () => {
       }),
     ]);
     const sourceNotePath = job.notes[0]!.notePath;
-    await expect(readFile(path.join(root, sourceNotePath), "utf8")).resolves.toContain("route_status: pending_review");
+    const stagedBody = await readFile(path.join(root, sourceNotePath), "utf8");
+    expect(stagedBody).toContain("route_status: pending_review");
     await expect(readFile(path.join(root, "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md"), "utf8")).rejects.toThrow();
 
     expect(
@@ -103,6 +104,7 @@ describe("startImportBatch", () => {
     expect(payload).toEqual(
       expect.objectContaining({
         sourceNotePath,
+        body: stagedBody,
         destination: "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md",
         sourceFile: "2026-01 Electric.txt",
         classification: expect.objectContaining({
@@ -203,10 +205,21 @@ tags: []
     expect(job).toMatchObject({
       state: "failed",
       failureReason: "DOCX import requires the DOCX parser dependency",
+      sourceFiles: ["06-Attachments/Imports/Handbook/Handbook.docx"],
     });
+    await expect(
+      readFile(path.join(root, "06-Attachments/Imports/Handbook/Handbook.docx"), "utf8"),
+    ).resolves.toBe("not a real docx");
     expect(db.sqlite.prepare("SELECT state, summary_note_path as summaryNotePath FROM import_jobs WHERE id = ?").get(job.id)).toEqual({
       state: "failed",
       summaryNotePath: "",
+    });
+    expect(
+      db.sqlite
+        .prepare("SELECT message FROM activity_events WHERE title = 'Import failed' ORDER BY created_at DESC LIMIT 1")
+        .get(),
+    ).toEqual({
+      message: "DOCX import requires the DOCX parser dependency. Preserved 1 source attachment.",
     });
   });
 });

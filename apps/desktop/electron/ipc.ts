@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, lstat, mkdir, open, readdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
   claimReviewItem,
   createReviewItem,
+  expireReviewItemClaims,
   getReviewItem,
   listActivity,
   listReviewItems,
@@ -26,6 +27,7 @@ import {
 import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
 import {
+  assertApprovedImportFinalNotePath,
   assertInsideWorkspace,
   assertRealPathInsideWorkspace,
   auditWorkspace,
@@ -36,6 +38,7 @@ import {
   indexWorkspace,
   mergeImportClassification,
   parseMarkdownDocument,
+  recoverImportPromotions,
   serializeMarkdownDocument,
   syncWorkspaceContract,
   type ClassificationSignal,
@@ -239,9 +242,17 @@ export async function handleIpcRequest(
         result = { ok: true, data: { path: payload.path, content: await readFile(targetPath, "utf8") } };
         return result;
       }
-      case "review:list":
-        result = { ok: true, data: await listReviewItems(requireDatabase(services), requireWorkspaceId(services), "all") };
+      case "review:list": {
+        const db = requireDatabase(services);
+        const workspaceId = requireWorkspaceId(services);
+        await expireReviewItemClaims(
+          db,
+          workspaceId,
+          staleReviewClaimCutoff(),
+        );
+        result = { ok: true, data: await listReviewItems(db, workspaceId, "all") };
         return result;
+      }
       case "review:approve":
         result = await approveReviewItem(services, payload.id as string, {
           targetPathOverride: typeof payload.targetPathOverride === "string" ? payload.targetPathOverride : undefined,
@@ -449,6 +460,11 @@ const reviewClaimLeaseMs = 5 * 60 * 1000;
 
 async function approveReviewItem(services: IpcServices, id: string, options: ReviewApproveOptions = {}): Promise<IpcResult> {
   const db = requireDatabase(services);
+  await expireReviewItemClaims(
+    db,
+    requireWorkspaceId(services),
+    staleReviewClaimCutoff(),
+  );
   const item = await getReviewItem(db, id);
   if (!item) {
     return { ok: false, error: "Review item not found" };
@@ -533,7 +549,9 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     }
     const appliedAt = new Date().toISOString();
     try {
-      const routingDestination = routingDestinationFor(claimedItem, options);
+      const routingDestination = isImportedSourceNotePayload(claimedItem.payload)
+        ? entityPath
+        : routingDestinationFor(claimedItem, options);
       if (options.saveAsRoutingRule && routingDestination) {
         const routingCategory = routingCategoryFor(claimedItem, options);
         await saveUserRoutingRule(services, claimedItem, {
@@ -623,6 +641,11 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
 
 async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcResult> {
   const db = requireDatabase(services);
+  await expireReviewItemClaims(
+    db,
+    requireWorkspaceId(services),
+    staleReviewClaimCutoff(),
+  );
   const item = await getReviewItem(db, id);
   if (!item) {
     return { ok: false, error: "Review item not found" };
@@ -710,6 +733,10 @@ function reviewClaimFence(
       throw new Error("Review claim was lost");
     }
   };
+}
+
+function staleReviewClaimCutoff(): string {
+  return new Date(Date.now() - reviewClaimLeaseMs).toISOString();
 }
 
 async function applyMemoryProposal(services: IpcServices, item: ReviewItem): Promise<void> {
@@ -894,6 +921,18 @@ async function moveImportedSourceNote(
   },
 ): Promise<string> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
+  const persistedDestination = await reconcilePersistedImportedApplication(
+    workspaceRoot,
+    item,
+    payload,
+    application.previousApplication,
+    fileOps,
+    application.ioHooks,
+    application.claimFence,
+  );
+  if (persistedDestination !== undefined) {
+    return persistedDestination;
+  }
   const destination = options.targetPathOverride?.trim()
     || payload.destination?.trim()
     || payload.classification.suggestedDestination?.trim()
@@ -1080,9 +1119,64 @@ function isGenericWriteApplication(value: unknown): value is GenericWriteApplica
 
 function reviewApplicationIntent(item: ReviewItem, options: ReviewApproveOptions): unknown {
   if (isImportMoveApplication(item.application) || isGenericWriteApplication(item.application)) {
-    return { ...item.application, options };
+    return item.application;
   }
   return { options };
+}
+
+async function reconcilePersistedImportedApplication(
+  workspaceRoot: string,
+  item: ReviewItem,
+  payload: ImportedSourceNotePayload,
+  previousApplication: unknown,
+  fileOps: ReviewImportFileOps,
+  ioHooks?: IpcServices["reviewIoHooks"],
+  claimFence?: () => Promise<void>,
+): Promise<string | undefined> {
+  if (!isImportMoveApplication(previousApplication)) {
+    return undefined;
+  }
+  if (
+    previousApplication.reviewItemId !== item.id
+    || previousApplication.sourceNotePath !== payload.sourceNotePath
+  ) {
+    throw new Error("Persisted import application does not match its Review item");
+  }
+
+  const persistedPath = assertApprovedImportFinalNotePath(
+    workspaceRoot,
+    previousApplication.destination,
+  );
+  const persistedExists = await fileOps.pathExists(persistedPath);
+  const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
+  const sourceExists = await fileOps.pathExists(sourcePath);
+  if (!persistedExists) {
+    if (!sourceExists) {
+      throw new Error("Persisted import application has no remaining authority");
+    }
+    return undefined;
+  }
+
+  const existing = await secureReadExisting(
+    workspaceRoot,
+    persistedPath,
+    "persisted_destination_reconcile",
+    ioHooks,
+  );
+  if (hashContents(existing) !== previousApplication.promotedContentHash) {
+    throw new Error("Persisted import destination does not match its approved hash");
+  }
+  if (sourceExists) {
+    await secureUnlinkExisting(
+      workspaceRoot,
+      sourcePath,
+      "persisted_staging_unlink",
+      fileOps,
+      ioHooks,
+      claimFence,
+    );
+  }
+  return previousApplication.destination;
 }
 
 function genericWriteApplication(
@@ -1167,6 +1261,7 @@ function updateImportedSourceNoteRoute(
     status: "approved",
     tags: ["imported", "approved"],
     content_category: classification.primaryCategory,
+    sensitivity: classification.sensitivity,
     classification_confidence: classification.confidence,
     classification_evidence: classification.evidence,
     route_status: "approved",
@@ -1178,8 +1273,11 @@ function updateImportedSourceNoteRoute(
     .replace(/^- Destination: .+$/mu, `- Destination: ${destination}`);
 
   if (nextSourceLink) {
-    document.content = document.content
-      .replace(/(- \[Original file\]\()[^)]+(\))/u, `$1${nextSourceLink}$2`);
+    document.content = replaceMarkdownLinkDestination(
+      document.content,
+      "Original file",
+      nextSourceLink,
+    );
   }
 
   return serializeMarkdownDocument(document);
@@ -1224,8 +1322,12 @@ async function reconstructImportedSourcePayload(
   const { frontmatter } = parseMarkdownDocument(body);
   const category = contentCategoryFrom(frontmatter.content_category);
   const evidence = frontmatter.classification_evidence ?? [];
-  const sensitivity = frontmatter.sensitivity === "private" || frontmatter.sensitivity === "sensitive"
-    ? "private"
+  const sensitivity = frontmatter.sensitivity === "restricted"
+    ? "restricted"
+    : frontmatter.sensitivity === "private" || frontmatter.sensitivity === "sensitive"
+      ? "private"
+      : frontmatter.sensitivity === "personal"
+        ? "personal"
     : frontmatter.safety_reason_codes?.includes("SENSITIVITY_REQUIRES_REVIEW")
       ? "personal"
       : "normal";
@@ -1281,6 +1383,45 @@ function contentCategoryFrom(value: string | undefined): ContentCategory {
     return value as ContentCategory;
   }
   return "unknown";
+}
+
+function replaceMarkdownLinkDestination(
+  markdown: string,
+  label: string,
+  destination: string,
+): string {
+  const marker = `[${label}](`;
+  const markerIndex = markdown.indexOf(marker);
+  if (markerIndex < 0) {
+    return markdown;
+  }
+
+  const destinationStart = markerIndex + marker.length;
+  let depth = 1;
+  let escaped = false;
+  for (let index = destinationStart; index < markdown.length; index += 1) {
+    const character = markdown[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+      continue;
+    }
+    if (character !== ")") {
+      continue;
+    }
+    depth -= 1;
+    if (depth === 0) {
+      return `${markdown.slice(0, destinationStart)}${destination}${markdown.slice(index)}`;
+    }
+  }
+  return markdown;
 }
 
 function importStagingPath(workspaceRoot: string, sourceNotePath: string): string {
@@ -1670,6 +1811,8 @@ interface UserRoutingRule {
   createdAt: string;
 }
 
+const routingRuleWriteQueues = new Map<string, Promise<void>>();
+
 async function saveUserRoutingRule(
   services: IpcServices,
   item: ReviewItem,
@@ -1685,9 +1828,11 @@ async function saveUserRoutingRule(
     createdAt: input.createdAt,
   };
 
-  await appendRoutingPolicyRule(workspaceRoot, rule);
-  await appendAgentsRoutingRule(workspaceRoot, rule);
-  await writeRoutingRuleAdr(workspaceRoot, rule);
+  await withRoutingRuleWriteLock(workspaceRoot, async () => {
+    await appendRoutingPolicyRule(workspaceRoot, rule);
+    await appendAgentsRoutingRule(workspaceRoot, rule);
+    await writeRoutingRuleAdr(workspaceRoot, rule);
+  });
 }
 
 async function appendRoutingPolicyRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
@@ -1705,7 +1850,11 @@ async function appendRoutingPolicyRule(workspaceRoot: string, rule: UserRoutingR
   if (!rules.some((existingRule) => existingRule.id === rule.id)) {
     rules.push(rule);
   }
-  await writeFile(policyPath, `${JSON.stringify({ version: 1, rules }, null, 2)}\n`, "utf8");
+  await atomicWriteWorkspaceText(
+    workspaceRoot,
+    policyPath,
+    `${JSON.stringify({ version: 1, rules }, null, 2)}\n`,
+  );
 }
 
 async function appendAgentsRoutingRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
@@ -1724,7 +1873,69 @@ async function appendAgentsRoutingRule(workspaceRoot: string, rule: UserRoutingR
   const next = current.includes(heading)
     ? current.replace(heading, `${heading}\n${ruleLine}`)
     : `${current.trimEnd()}\n\n${heading}\n\n${ruleLine}\n`;
-  await writeFile(agentsPath, next, "utf8");
+  await atomicWriteWorkspaceText(workspaceRoot, agentsPath, next);
+}
+
+async function withRoutingRuleWriteLock(
+  workspaceRoot: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const key = path.resolve(workspaceRoot);
+  const previous = routingRuleWriteQueues.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(operation);
+  const tail = run.then(() => undefined, () => undefined);
+  routingRuleWriteQueues.set(key, tail);
+  try {
+    await run;
+  } finally {
+    if (routingRuleWriteQueues.get(key) === tail) {
+      routingRuleWriteQueues.delete(key);
+    }
+  }
+}
+
+async function atomicWriteWorkspaceText(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string,
+): Promise<void> {
+  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
+  const parentPath = path.dirname(normalizedTarget);
+  await mkdir(parentPath, { recursive: true });
+  const parentIdentity = await capturePathIdentity(
+    workspaceRoot,
+    normalizedTarget,
+    false,
+  );
+  const tempPath = path.join(
+    parentPath,
+    `.${path.basename(normalizedTarget)}.${randomUUID()}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      tempPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(),
+      0o600,
+    );
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await revalidatePathIdentity(workspaceRoot, parentIdentity, false);
+    await rename(tempPath, normalizedTarget);
+    const directoryHandle = await open(parentPath, constants.O_RDONLY);
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+    await revalidatePathIdentity(workspaceRoot, parentIdentity, false);
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function writeRoutingRuleAdr(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
@@ -1844,6 +2055,7 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
   services.db?.close();
   services.workspaceRoot = path.resolve(rootPath);
   await syncWorkspaceContract(services.workspaceRoot);
+  await recoverImportPromotions(services.workspaceRoot);
   if (services.settingsPath) {
     const settings = await readDesktopSettings(services.settingsPath);
     await writeDesktopSettings(services.settingsPath, { ...settings, workspaceRoot: services.workspaceRoot });

@@ -2,7 +2,7 @@ export const workspaceRoutingPolicyContract = `## Routing Policy
 
 The app uses a code-enforced routing policy for filesystem writes. This contract explains the default paths so users can inspect and audit where knowledge goes.
 
-- Imported source Markdown notes go to \`04-Resources/Imports/<batch-name>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
+- Imported source Markdown notes remain non-indexed under \`.app/import-staging/<batch-name>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
 - Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
 - Pending import notes are non-indexed under \`.app/import-staging/\`.
 - The Safety Kernel must approve every final import write.

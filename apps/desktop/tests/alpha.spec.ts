@@ -53,8 +53,8 @@ test("imports a PDF document through the desktop UI", async () => {
   await expect(readFile(path.join(workspaceRoot, "04-Resources/Imports/generic.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
   await window.getByRole("button", { name: "Review" }).click();
-  await expect(window.getByText("Category: unknown")).toBeVisible();
-  await expect(window.getByText("Reasons: CLASSIFICATION_UNKNOWN")).toBeVisible();
+  await expect(window.getByText("Category: unknown", { exact: true })).toBeVisible();
+  await expect(window.getByText("Reasons: CLASSIFICATION_UNKNOWN", { exact: true })).toBeVisible();
 
   await app.close();
 });

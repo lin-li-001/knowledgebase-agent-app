@@ -4,6 +4,7 @@ export { recordActivity, recordActivityOnce, listActivity } from "./repositories
 export {
   claimReviewItem,
   createReviewItem,
+  expireReviewItemClaims,
   getReviewItem,
   getReviewItemState,
   listReviewItems,

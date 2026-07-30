@@ -75,6 +75,39 @@ describe("evaluateImportSafety", () => {
     });
   });
 
+  it.each([
+    [".app runtime state", ".app/import-staging/job/A.md"],
+    ["vault memory", ".vault/memory/shared/a.md"],
+    ["template", "05-Templates/Imported.md"],
+    ["attachment", "06-Attachments/Imports/A.md"],
+    ["unknown top-level root", "09-Unknown/A.md"],
+    ["legacy profile root", "02-Profiles/default/Memory.md"],
+    ["non-Markdown file", "04-Resources/Imports/A.txt"],
+    ["Markdown-like directory", "04-Resources/Imports/A.md/child"],
+  ])("blocks %s as an unapproved final destination", (_name, destination) => {
+    const result = evaluateImportSafety(validIntent({ destination }));
+
+    expect(result).toEqual({
+      decision: "blocked",
+      reasonCodes: ["DESTINATION_NOT_APPROVED"],
+    });
+  });
+
+  it.each([
+    "00-Inbox/Imports/A.md",
+    "01-Projects/default/A.md",
+    "02-Personal/default/A.md",
+    "03-Knowledge/A.md",
+    "04-Resources/A.md",
+    "07-Private/A.md",
+    "08-Archive/A.md",
+    ".vault/decisions/A.md",
+  ])("recognizes %s as an approved final-note root", (destination) => {
+    const result = evaluateImportSafety(validIntent({ destination }));
+
+    expect(result.reasonCodes).not.toContain("DESTINATION_NOT_APPROVED");
+  });
+
   it("requires Review when classification is missing", () => {
     const result = evaluateImportSafety(validIntent({ classification: undefined }));
 
@@ -133,7 +166,6 @@ describe("evaluateImportSafety", () => {
   it("requires Review for protected destinations", () => {
     for (const destination of [
       "02-Personal/default/Finance/Tax.md",
-      "02-Profiles/default/Profile.md",
       "07-Private/Secret.md",
       ".vault/decisions/review.md",
     ]) {
@@ -375,7 +407,7 @@ describe("evaluateImportSafety", () => {
     expect(result.reasonCodes).toContain("CATEGORY_REQUIRES_REVIEW");
   });
 
-  it("requires Review for case variants of protected destinations", () => {
+  it("blocks case variants that are not canonical approved roots", () => {
     for (const destination of [
       "02-personal/default/Finance/Tax.md",
       "02-PROFILES/default/Profile.md",
@@ -384,8 +416,8 @@ describe("evaluateImportSafety", () => {
     ]) {
       const result = evaluateImportSafety(validIntent({ destination }));
 
-      expect(result.decision).toBe("review_required");
-      expect(result.reasonCodes).toContain("DESTINATION_REQUIRES_REVIEW");
+      expect(result.decision).toBe("blocked");
+      expect(result.reasonCodes).toContain("DESTINATION_NOT_APPROVED");
     }
   });
 
@@ -405,5 +437,26 @@ describe("evaluateImportSafety", () => {
 
     expect(result.decision).toBe("blocked");
     expect(result.reasonCodes).toContain("PATH_ESCAPES_WORKSPACE");
+  });
+
+  it("does not let an approval proof authorize an invalid final root", () => {
+    const value = classification({
+      primaryCategory: "finance.tax",
+      sensitivity: "personal",
+    });
+    const destination = ".vault/memory/private-import.md";
+    const result = evaluateImportSafety(
+      validIntent({
+        operation: "move",
+        destination,
+        classification: value,
+        approval: approvalFor(value, { destination }),
+      }),
+    );
+
+    expect(result).toEqual({
+      decision: "blocked",
+      reasonCodes: ["DESTINATION_NOT_APPROVED"],
+    });
   });
 });

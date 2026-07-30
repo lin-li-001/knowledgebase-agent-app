@@ -157,6 +157,29 @@ export async function renewReviewItemClaim(
   return result.changes === 1;
 }
 
+export async function expireReviewItemClaims(
+  db: AppDatabase,
+  workspaceId: string,
+  staleBefore: string,
+): Promise<number> {
+  const result = db.sqlite
+    .prepare(
+      `UPDATE review_items
+       SET state = 'failed',
+           failure_reason = CASE state
+             WHEN 'applying' THEN 'Previous applying lease expired; retry is available.'
+             ELSE 'Previous rejecting lease expired; retry is available.'
+           END,
+           claim_token = NULL,
+           claim_started_at = NULL
+       WHERE workspace_id = ?
+         AND state IN ('applying', 'rejecting')
+         AND (claim_started_at IS NULL OR claim_started_at < ?)`,
+    )
+    .run(workspaceId, staleBefore);
+  return result.changes;
+}
+
 export async function getReviewItemState(db: AppDatabase, id: string): Promise<ReviewState | null> {
   const row = db.sqlite
     .prepare("SELECT state FROM review_items WHERE id = ?")

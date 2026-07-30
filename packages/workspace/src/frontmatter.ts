@@ -14,7 +14,7 @@ export const noteFrontmatterSchema = z.object({
   status: z.string().min(1),
   owner: z.string().min(1),
   scope: z.enum(["personal", "shared"]),
-  sensitivity: z.enum(["normal", "private", "sensitive"]),
+  sensitivity: z.enum(["normal", "personal", "private", "restricted", "sensitive"]),
   created: frontmatterDate,
   updated: frontmatterDate.optional(),
   tags: z.array(z.string()),
@@ -29,6 +29,8 @@ export const noteFrontmatterSchema = z.object({
   safety_reason_codes: z.array(z.string()).optional(),
   route_status: z.string().min(1).optional(),
   route_destination: z.string().min(1).optional(),
+  page_count: z.number().int().positive().optional(),
+  requires_ocr: z.boolean().optional(),
 });
 
 export type NoteFrontmatter = z.infer<typeof noteFrontmatterSchema>;

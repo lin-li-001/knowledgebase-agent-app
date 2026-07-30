@@ -5,6 +5,7 @@ describe("defaultRoutingPolicy", () => {
   it("exposes base routing folders used when creating a workspace", () => {
     expect(defaultRoutingPolicy.importSummaryDir()).toBe("04-Resources/Imports");
     expect(defaultRoutingPolicy.importAttachmentRoot()).toBe("06-Attachments/Imports");
+    expect(defaultRoutingPolicy.importStagingRoot()).toBe(".app/import-staging");
     expect(defaultRoutingPolicy.exportDir()).toBe(".app/exports");
   });
 

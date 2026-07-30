@@ -52,6 +52,37 @@ staging.
 This rule replaces the previous runtime behavior that placed pending imported
 source notes in a user knowledge folder.
 
+Final import destinations must be normalized Markdown files under one of these
+approved knowledge roots:
+
+```text
+00-Inbox/
+01-Projects/
+02-Personal/
+03-Knowledge/
+04-Resources/
+07-Private/
+08-Archive/
+```
+
+`.vault/decisions/` is also an approved final root, but remains Review-protected.
+Internal runtime and source-preservation roots are distinct from final roots:
+`.app/`, `.vault/memory/`, `05-Templates/`, and `06-Attachments/` can never be
+final import destinations. Approval does not override an invalid final root.
+
+Attachment copy, staging creation, and final promotion share a hardened
+filesystem boundary that validates real paths and ancestors, rejects symlinks,
+revalidates device and inode identity, and uses no-follow exclusive creation.
+Auto-write promotion is source-bound and recorded in a durable journal under
+`.app/`; recovery runs on workspace activation and before later imports. A
+recovery accepts only the journaled source, staging path, final path, and
+content hash, then deterministically leaves one authoritative final file.
+
+Review promotion also binds recovery to its persisted application. If a prior
+application selected destination A, retries must finish or reconcile A before a
+new override B can be prepared. An exact approved hash completes A; a mismatch
+fails closed.
+
 ## Consequences
 
 - Unreviewed imports are physically and logically separate from accepted
@@ -64,6 +95,12 @@ source notes in a user knowledge folder.
 - Import promotion must preserve the staged note and attachment relationship,
   and must fail closed on collisions, stale approval proof, invalid paths, or
   internal evaluation errors.
+- Original source attachments are copied before extraction and remain available
+  when extraction or a later source in the batch fails.
+- Expired Review application and rejection leases become retryable without
+  discarding persisted application intent.
+- Concurrent durable routing-rule writes are serialized per workspace and
+  replace policy and contract files atomically.
 - Product audits and tests must cover every import writer and promotion path so
   new code cannot silently bypass safety evaluation.
 
@@ -91,6 +128,10 @@ validation remains deterministic code.
 - `packages/workspace/src/importSafety.ts` implements the safety decision floor.
 - `packages/workspace/src/importClassification.ts` combines classification
   signals conservatively.
+- `packages/workspace/src/secureWorkspaceIo.ts` implements the shared hardened
+  filesystem boundary.
+- `packages/workspace/src/importPromotion.ts` implements source-bound promotion
+  journaling and recovery.
 - `packages/workspace/src/routingPolicy.ts` defines the staging route and default
   destinations.
 - `packages/workspace/src/indexer.ts` excludes `.app/` content from knowledge

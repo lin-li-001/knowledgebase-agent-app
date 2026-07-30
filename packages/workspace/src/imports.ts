@@ -11,13 +11,30 @@ import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
 import {
   evaluateImportSafety,
   type ClassificationSignal,
+  type ClassificationDiagnostic,
   type ContentCategory,
   type ImportClassification,
   type ImportSensitivity,
   type SafetyDecision,
 } from "./importSafety";
+import {
+  discardImportPromotionJournal,
+  promoteImportArtifact,
+  recoverImportPromotions,
+} from "./importPromotion";
 import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
+import {
+  secureCopyFileIntoWorkspace,
+  secureEnsureWorkspaceDirectory,
+  secureReadWorkspaceDirectory,
+  secureReadWorkspaceText,
+  secureRewriteWorkspaceFile,
+  secureUnlinkWorkspaceFile,
+  secureWorkspacePathExists,
+  secureWriteWorkspaceFileExclusive,
+  type SecureWorkspaceIoHooks,
+} from "./secureWorkspaceIo";
 
 export interface ImportBatchInput {
   workspaceRoot: string;
@@ -25,6 +42,7 @@ export interface ImportBatchInput {
   files: string[];
   now?: string;
   fileOps?: Partial<ImportFileOps>;
+  ioHooks?: SecureWorkspaceIoHooks;
 }
 
 export type ImportArtifactStatus =
@@ -99,30 +117,65 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
   const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
   const fileOps: ImportFileOps = { ...defaultImportFileOps, ...input.fileOps };
-  const createdArtifacts = new Set<string>();
+  const createdDerivedArtifacts = new Set<string>();
+  const copiedSourceFiles: string[] = [];
 
   try {
-    await fileOps.mkdir(attachmentTargetDir);
+    await recoverImportPromotions(
+      input.workspaceRoot,
+      secureIoHookOptions(input.ioHooks),
+    );
+    assertImportAttachmentPath(input.workspaceRoot, attachmentDir);
+    await secureEnsureWorkspaceDirectory(input.workspaceRoot, attachmentTargetDir);
     const documents: ImportedDocument[] = [];
     const [attachmentNames, sourceStems] = await Promise.all([
-      existingNames(attachmentTargetDir, fileOps),
-      existingSourceStems(input.workspaceRoot, id, fileOps),
+      existingNames(
+        input.workspaceRoot,
+        attachmentTargetDir,
+        "attachment_list",
+        input.ioHooks,
+      ),
+      existingSourceStems(input.workspaceRoot, id, input.ioHooks),
     ]);
     for (const file of input.files) {
-      const extracted = await extractDocumentText(file);
-      const targetFileName = uniqueFileName(sanitizeFileName(extracted.fileName), attachmentNames);
-      const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
+      const targetFileName = uniqueFileName(
+        sanitizeFileName(path.basename(file)),
+        attachmentNames,
+      );
       const attachmentRelativePath = `${attachmentDir}/${targetFileName}`;
-      const attachmentTargetPath = assertInsideWorkspace(input.workspaceRoot, attachmentRelativePath);
-      await fileOps.copyFile(file, attachmentTargetPath);
-      createdArtifacts.add(attachmentTargetPath);
+      const attachmentTargetPath = assertImportAttachmentPath(
+        input.workspaceRoot,
+        attachmentRelativePath,
+      );
+      await secureCopyFileIntoWorkspace(
+        input.workspaceRoot,
+        file,
+        attachmentTargetPath,
+        secureIoOptions("attachment_create", input.ioHooks),
+      );
+      copiedSourceFiles.push(attachmentRelativePath);
+      const extracted = await extractDocumentText(attachmentTargetPath);
+      const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
       documents.push({ ...extracted, attachmentRelativePath, sourceStem });
     }
 
-    const policy = await readWorkspaceRoutingPolicy(input.workspaceRoot);
+    const policy = await readWorkspaceRoutingPolicy(
+      input.workspaceRoot,
+      input.ioHooks,
+    );
     const notes: ImportSourceNote[] = [];
     for (const document of documents) {
-      notes.push(await persistSourceNote(input.workspaceRoot, id, batchName, created, document, policy, fileOps, createdArtifacts));
+      notes.push(await persistSourceNote(
+        input.workspaceRoot,
+        id,
+        batchName,
+        created,
+        document,
+        policy,
+        fileOps,
+        createdDerivedArtifacts,
+        input.ioHooks,
+      ));
     }
 
     return {
@@ -130,17 +183,22 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
       batchName,
       state: "completed",
       attachmentDir,
-      sourceFiles: documents.map((document) => document.attachmentRelativePath),
+      sourceFiles: copiedSourceFiles,
       notes,
     };
   } catch (error) {
-    await cleanupCreatedArtifacts(fileOps, createdArtifacts);
+    await cleanupCreatedArtifacts(
+      input.workspaceRoot,
+      fileOps,
+      createdDerivedArtifacts,
+      input.ioHooks,
+    );
     return {
       id,
       batchName,
       state: "failed",
       attachmentDir,
-      sourceFiles: [],
+      sourceFiles: copiedSourceFiles,
       notes: [],
       failureReason: error instanceof Error ? error.message : "Unknown import failure",
     };
@@ -156,6 +214,7 @@ async function persistSourceNote(
   policy: WorkspaceRoutingPolicyFile,
   fileOps: ImportFileOps,
   createdArtifacts: Set<string>,
+  ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
   const routed = routeDocument(batchName, title, document, policy);
@@ -166,7 +225,9 @@ async function persistSourceNote(
     workspaceRoot,
     operation: "create",
     destination: routed.destination,
-    destinationExists: destinationTargetPath === undefined ? false : await fileOps.pathExists(destinationTargetPath),
+    destinationExists: destinationTargetPath === undefined
+      ? false
+      : await secureWorkspacePathExists(workspaceRoot, destinationTargetPath),
     autoWriteThreshold: 0.95,
     classification: routed.classification,
   });
@@ -185,31 +246,70 @@ async function persistSourceNote(
     title,
   });
 
-  await fileOps.mkdir(path.dirname(stagingTargetPath));
-  await fileOps.writeFile(stagingTargetPath, rendered, true);
+  assertImportStagingPath(workspaceRoot, stagingPath);
+  await secureWriteWorkspaceFileExclusive(
+    workspaceRoot,
+    stagingTargetPath,
+    rendered,
+    secureIoOptions("staging_create", ioHooks),
+  );
   createdArtifacts.add(stagingTargetPath);
 
   if (safetyDecision.decision === "auto_write") {
     const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
     try {
-      await fileOps.mkdir(path.dirname(finalTargetPath));
-      await fileOps.writeFile(finalTargetPath, await fileOps.readFile(stagingTargetPath), true);
+      await promoteImportArtifact({
+        workspaceRoot,
+        sourcePath: document.attachmentRelativePath,
+        stagingPath,
+        finalPath: routed.destination,
+        ...(ioHooks === undefined ? {} : { ioHooks }),
+        unlinkFile: fileOps.unlink,
+      });
       createdArtifacts.add(finalTargetPath);
-      await fileOps.unlink(stagingTargetPath);
       createdArtifacts.delete(stagingTargetPath);
     } catch (error) {
-      if (createdArtifacts.has(finalTargetPath)) {
-        try {
-          await fileOps.unlink(finalTargetPath);
-          createdArtifacts.delete(finalTargetPath);
-        } catch {
-          throw error;
+      try {
+        await recoverImportPromotions(
+          workspaceRoot,
+          secureIoHookOptions(ioHooks),
+        );
+        if (
+          await secureWorkspacePathExists(workspaceRoot, finalTargetPath)
+          && !await secureWorkspacePathExists(workspaceRoot, stagingTargetPath)
+        ) {
+          createdArtifacts.add(finalTargetPath);
+          createdArtifacts.delete(stagingTargetPath);
+          return sourceNoteResult(
+            document,
+            routed,
+            routed.destination,
+            "auto_written",
+            safetyDecision,
+          );
+        }
+      } catch (recoveryError) {
+        if (!isFileAlreadyExists(error)) {
+          createdArtifacts.delete(stagingTargetPath);
+          throw recoveryError;
         }
       }
 
+      if (!isFileAlreadyExists(error)) {
+        createdArtifacts.delete(stagingTargetPath);
+        throw error;
+      }
+      await discardImportPromotionJournal(
+        workspaceRoot,
+        document.attachmentRelativePath,
+        stagingPath,
+        routed.destination,
+        ioHooks,
+      );
       const blockedSafetyDecision = blockedPromotionSafetyDecision(error);
       const blockedNotePath = stagingPath;
-      await fileOps.writeFile(
+      await secureRewriteWorkspaceFile(
+        workspaceRoot,
         stagingTargetPath,
         renderImportedSourceNote({
           attachmentPath: document.attachmentRelativePath,
@@ -223,21 +323,29 @@ async function persistSourceNote(
           summary: summaryFor(document),
           title,
         }),
-        false,
+        secureIoOptions("staging_blocked_rewrite", ioHooks),
       );
 
-      return {
-        sourceFile: document.fileName,
-        attachmentPath: document.attachmentRelativePath,
-        notePath: blockedNotePath,
-        status: "blocked",
-        destination: routed.destination,
-        classification: routed.classification,
-        safetyDecision: blockedSafetyDecision,
-      };
+      return sourceNoteResult(
+        document,
+        routed,
+        blockedNotePath,
+        "blocked",
+        blockedSafetyDecision,
+      );
     }
   }
 
+  return sourceNoteResult(document, routed, notePath, status, safetyDecision);
+}
+
+function sourceNoteResult(
+  document: ImportedDocument,
+  routed: RoutedDocument,
+  notePath: string,
+  status: ImportArtifactStatus,
+  safetyDecision: SafetyDecision,
+): ImportSourceNote {
   return {
     sourceFile: document.fileName,
     attachmentPath: document.attachmentRelativePath,
@@ -294,7 +402,7 @@ type: resource
 status: ${input.status}
 owner: default
 scope: personal
-sensitivity: normal
+sensitivity: ${input.classification.sensitivity}
 created: ${input.created}
 tags: ${tags}
 source_type: import
@@ -362,7 +470,11 @@ function savedRoutingRuleSignals(policy: WorkspaceRoutingPolicyFile, haystack: s
       ...(rule.sensitivity === undefined ? {} : { sensitivity: rule.sensitivity }),
       destination: rule.destination,
       ...(rule.id === undefined ? {} : { ruleId: rule.id }),
-      evidence: [`Saved routing rule: ${truncate(rule.pattern, 240)}`],
+      ...(rule.diagnostics === undefined ? {} : { diagnostics: rule.diagnostics }),
+      evidence: [
+        `Saved routing rule: ${truncate(rule.pattern, 240)}`,
+        ...(rule.diagnosticEvidence ?? []),
+      ],
     })) ?? [];
 }
 
@@ -371,12 +483,28 @@ function parseSavedImportRule(value: unknown): SavedImportRule | undefined {
     return undefined;
   }
 
+  const diagnostics: ClassificationDiagnostic[] = [];
+  const diagnosticEvidence: string[] = [];
+  if (hasOwn(value, "category") && !isContentCategory(value.category)) {
+    diagnostics.push("INVALID_SAVED_RULE_CATEGORY");
+    diagnosticEvidence.push(
+      `Saved routing rule has invalid category: ${String(value.category)}`,
+    );
+  }
+  if (hasOwn(value, "sensitivity") && !isImportSensitivity(value.sensitivity)) {
+    diagnostics.push("INVALID_SAVED_RULE_SENSITIVITY");
+    diagnosticEvidence.push(
+      `Saved routing rule has invalid sensitivity: ${String(value.sensitivity)}`,
+    );
+  }
+
   return {
     pattern: value.pattern,
     destination: value.destination,
     ...(isContentCategory(value.category) ? { category: value.category } : {}),
     ...(isImportSensitivity(value.sensitivity) ? { sensitivity: value.sensitivity } : {}),
     ...(nonEmptyString(value.id) ? { id: value.id } : {}),
+    ...(diagnostics.length === 0 ? {} : { diagnostics, diagnosticEvidence }),
   };
 }
 
@@ -408,21 +536,53 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
 }
 
-async function readWorkspaceRoutingPolicy(workspaceRoot: string): Promise<WorkspaceRoutingPolicyFile> {
+async function readWorkspaceRoutingPolicy(
+  workspaceRoot: string,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<WorkspaceRoutingPolicyFile> {
+  const policyPath = assertInsideWorkspace(
+    workspaceRoot,
+    ".vault/routing-policy.json",
+  );
+  if (!await secureWorkspacePathExists(workspaceRoot, policyPath)) {
+    return {};
+  }
   try {
-    return JSON.parse(await readFile(assertInsideWorkspace(workspaceRoot, ".vault/routing-policy.json"), "utf8")) as WorkspaceRoutingPolicyFile;
-  } catch {
+    return JSON.parse(
+      await secureReadWorkspaceText(
+        workspaceRoot,
+        policyPath,
+        secureIoOptions("routing_policy_read", ioHooks),
+      ),
+    ) as WorkspaceRoutingPolicyFile;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
     return {};
   }
 }
 
-async function existingSourceStems(workspaceRoot: string, importId: string, fileOps: ImportFileOps): Promise<Set<string>> {
+async function existingSourceStems(
+  workspaceRoot: string,
+  importId: string,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<Set<string>> {
   const directories = [path.dirname(assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.importStagingNotePath(importId, "source")))];
-  const names = await Promise.all(directories.map((directoryPath) => existingNames(directoryPath, fileOps)));
+  const names = await Promise.all(directories.map((directoryPath) => existingNames(
+    workspaceRoot,
+    directoryPath,
+    "staging_list",
+    ioHooks,
+  )));
   return new Set(
     names
       .flatMap((entries) => [...entries])
@@ -431,9 +591,22 @@ async function existingSourceStems(workspaceRoot: string, importId: string, file
   );
 }
 
-async function existingNames(directoryPath: string, fileOps: ImportFileOps): Promise<Set<string>> {
+async function existingNames(
+  workspaceRoot: string,
+  directoryPath: string,
+  operation: string,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<Set<string>> {
   try {
-    return new Set((await fileOps.readdir(directoryPath)).map((name) => name.toLocaleLowerCase()));
+    return new Set(
+      (
+        await secureReadWorkspaceDirectory(
+          workspaceRoot,
+          directoryPath,
+          secureIoOptions(operation, ioHooks),
+        )
+      ).map((name) => name.toLocaleLowerCase()),
+    );
   } catch (error) {
     if (isMissingPath(error)) {
       return new Set<string>();
@@ -547,10 +720,25 @@ const defaultImportFileOps: ImportFileOps = {
   writeFile: (targetPath, contents, exclusive) => writeFile(targetPath, contents, exclusive ? { flag: "wx" } : undefined),
 };
 
-async function cleanupCreatedArtifacts(fileOps: ImportFileOps, createdArtifacts: Set<string>): Promise<void> {
+async function cleanupCreatedArtifacts(
+  workspaceRoot: string,
+  fileOps: ImportFileOps,
+  createdArtifacts: Set<string>,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<void> {
   for (const targetPath of [...createdArtifacts].reverse()) {
     try {
-      await fileOps.unlink(targetPath);
+      if (!await secureWorkspacePathExists(workspaceRoot, targetPath)) {
+        continue;
+      }
+      await secureUnlinkWorkspaceFile(
+        workspaceRoot,
+        targetPath,
+        {
+          ...secureIoOptions("failed_import_cleanup", ioHooks),
+          unlinkFile: fileOps.unlink,
+        },
+      );
     } catch (error) {
       if (!isMissingPath(error)) {
         continue;
@@ -568,6 +756,59 @@ function blockedPromotionSafetyDecision(error: unknown): SafetyDecision {
 
 function isFileAlreadyExists(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
+function assertImportAttachmentPath(
+  workspaceRoot: string,
+  targetPath: string,
+): string {
+  const normalized = assertInsideWorkspace(workspaceRoot, targetPath);
+  const relative = workspaceRelativePath(workspaceRoot, normalized);
+  if (!relative.startsWith(`${defaultRoutingPolicy.importAttachmentRoot()}/`)) {
+    throw new Error("Import attachment path is outside the attachment root");
+  }
+  return normalized;
+}
+
+function assertImportStagingPath(
+  workspaceRoot: string,
+  targetPath: string,
+): string {
+  const normalized = assertInsideWorkspace(workspaceRoot, targetPath);
+  const relative = workspaceRelativePath(workspaceRoot, normalized);
+  if (
+    !relative.startsWith(`${defaultRoutingPolicy.importStagingRoot()}/`)
+    || path.posix.extname(relative) !== ".md"
+  ) {
+    throw new Error("Import staging path is outside the staging root");
+  }
+  return normalized;
+}
+
+function workspaceRelativePath(
+  workspaceRoot: string,
+  targetPath: string,
+): string {
+  return path
+    .relative(path.resolve(workspaceRoot), targetPath)
+    .split(path.sep)
+    .join("/");
+}
+
+function secureIoOptions(
+  operation: string,
+  ioHooks?: SecureWorkspaceIoHooks,
+): { operation: string; hooks?: SecureWorkspaceIoHooks } {
+  return {
+    operation,
+    ...(ioHooks === undefined ? {} : { hooks: ioHooks }),
+  };
+}
+
+function secureIoHookOptions(
+  ioHooks?: SecureWorkspaceIoHooks,
+): { ioHooks?: SecureWorkspaceIoHooks } {
+  return ioHooks === undefined ? {} : { ioHooks };
 }
 
 function escapeYamlString(value: string): string {

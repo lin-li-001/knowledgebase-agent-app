@@ -10,8 +10,9 @@ The product has two places that describe where knowledge artifacts should go:
 - `AGENTS.md`, the human-readable workspace contract that explains rules to users and agents.
 - `routingPolicy.ts`, the executable code that chooses filesystem paths for writes.
 
-For example, imported summary notes go to `04-Resources/Imports/<batch-name>.md`,
-while original imported files go to `06-Attachments/Imports/<batch-name>/`.
+For example, pending imported source notes go to
+`.app/import-staging/<batch-name>/<source-stem>.md`, while original imported
+files go to `06-Attachments/Imports/<batch-name>/`.
 
 This creates an intentional mirror: users need to inspect the rule in plain
 language, while the app needs deterministic code to enforce the rule. If the two
@@ -77,4 +78,3 @@ precedence and user customization rules.
 - `packages/workspace/src/templates.ts` includes the human-readable routing rules in generated `AGENTS.md`.
 - `packages/workspace/src/productAudit.ts` checks routing/contract drift, filesystem writer bypasses, and the presence of this decision mirror.
 - `pnpm audit:product` runs product audit checks.
-

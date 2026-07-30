@@ -21,6 +21,7 @@ export type ImportOperation = "stage" | "create" | "move" | "overwrite" | "delet
 
 export type SafetyReasonCode =
   | "PATH_ESCAPES_WORKSPACE"
+  | "DESTINATION_NOT_APPROVED"
   | "DESTINATION_EXISTS"
   | "OPERATION_NOT_ALLOWED"
   | "CLASSIFICATION_MISSING"
@@ -42,7 +43,12 @@ export interface ClassificationSignal {
   evidence: string[];
   destination?: string;
   ruleId?: string;
+  diagnostics?: ClassificationDiagnostic[];
 }
+
+export type ClassificationDiagnostic =
+  | "INVALID_SAVED_RULE_CATEGORY"
+  | "INVALID_SAVED_RULE_SENSITIVITY";
 
 export interface ImportClassification {
   primaryCategory: ContentCategory;
@@ -119,9 +125,18 @@ const PROTECTED_CATEGORIES = new Set<ContentCategory>([
 
 const PROTECTED_DESTINATION_ROOTS = [
   "02-Personal",
-  "02-Profiles",
   "07-Private",
   path.join(".vault", "decisions"),
+];
+
+const APPROVED_FINAL_ROOTS = [
+  "00-Inbox",
+  "01-Projects",
+  "02-Personal",
+  "03-Knowledge",
+  "04-Resources",
+  "07-Private",
+  "08-Archive",
 ];
 
 export function evaluateImportSafety(intent: ImportWriteIntent): SafetyDecision {
@@ -141,6 +156,23 @@ export function fingerprintImportClassification(classification: ImportClassifica
     .digest("hex");
 }
 
+export function assertApprovedImportFinalNotePath(
+  workspaceRoot: string,
+  destination: string,
+): string {
+  const normalizedDestination = normalizeDestination(
+    workspaceRoot,
+    destination,
+  );
+  if (
+    normalizedDestination === undefined
+    || !isApprovedFinalNoteDestination(workspaceRoot, normalizedDestination)
+  ) {
+    throw new Error("Import final destination is not approved");
+  }
+  return normalizedDestination;
+}
+
 function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision {
   const blockedReasons: SafetyReasonCode[] = [];
   const operation = intent.operation as string;
@@ -152,6 +184,14 @@ function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision
 
   if (!IMPORT_OPERATIONS.has(operation as ImportOperation)) {
     blockedReasons.push("OPERATION_NOT_ALLOWED");
+  }
+
+  if (
+    normalizedDestination
+    && operation !== "stage"
+    && !isApprovedFinalNoteDestination(intent.workspaceRoot, normalizedDestination)
+  ) {
+    blockedReasons.push("DESTINATION_NOT_APPROVED");
   }
 
   if (operation === "overwrite" || operation === "delete") {
@@ -269,6 +309,35 @@ function isProtectedDestination(workspaceRoot: string, normalizedDestination: st
   );
 }
 
+function isApprovedFinalNoteDestination(
+  workspaceRoot: string,
+  normalizedDestination: string,
+): boolean {
+  const relativeDestination = path.relative(
+    path.resolve(workspaceRoot),
+    normalizedDestination,
+  );
+  if (
+    relativeDestination === ""
+    || path.isAbsolute(relativeDestination)
+    || path.extname(relativeDestination) !== ".md"
+  ) {
+    return false;
+  }
+
+  const normalizedRelative = relativeDestination.split(path.sep).join("/");
+  if (
+    normalizedRelative.startsWith(".vault/decisions/")
+    && normalizedRelative !== ".vault/decisions/"
+  ) {
+    return true;
+  }
+
+  return APPROVED_FINAL_ROOTS.some(
+    (root) => normalizedRelative.startsWith(`${root}/`),
+  );
+}
+
 function validateClassification(
   classification: ImportClassification | undefined,
 ): "missing" | "invalid" | "valid" {
@@ -312,7 +381,19 @@ function isClassificationSignal(signal: unknown): signal is ClassificationSignal
     Array.isArray(signal.evidence) &&
     signal.evidence.every((item) => typeof item === "string") &&
     (signal.destination === undefined || typeof signal.destination === "string") &&
-    (signal.ruleId === undefined || typeof signal.ruleId === "string");
+    (signal.ruleId === undefined || typeof signal.ruleId === "string") &&
+    (
+      signal.diagnostics === undefined
+      || (
+        Array.isArray(signal.diagnostics)
+        && signal.diagnostics.every(isClassificationDiagnostic)
+      )
+    );
+}
+
+function isClassificationDiagnostic(value: unknown): value is ClassificationDiagnostic {
+  return value === "INVALID_SAVED_RULE_CATEGORY"
+    || value === "INVALID_SAVED_RULE_SENSITIVITY";
 }
 
 function hasConflictingSafetySignal(

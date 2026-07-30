@@ -109,7 +109,7 @@ describe("desktop shell", () => {
               decision: "review_required",
               reasonCodes: ["CATEGORY_REQUIRES_REVIEW"],
             },
-            body: "# Utility Bills",
+            body: "# Utility Bills\n\nActual staged note content.",
           },
         }}
         onApprove={approve}
@@ -121,6 +121,12 @@ describe("desktop shell", () => {
     expect(screen.getByText("Confidence: 0.92")).toBeVisible();
     expect(screen.getByText("Evidence: Amount due $184.27")).toBeVisible();
     expect(screen.getByText("Reasons: CATEGORY_REQUIRES_REVIEW")).toBeVisible();
+    expect(
+      screen.getByText((_content, element) => (
+        element?.tagName === "PRE"
+        && element.textContent === "# Utility Bills\n\nActual staged note content."
+      )),
+    ).toBeVisible();
     expect(screen.getByLabelText("Category")).toHaveValue("finance.utility");
 
     fireEvent.change(screen.getByLabelText("Category"), { target: { value: "finance.insurance" } });
@@ -139,6 +145,42 @@ describe("desktop shell", () => {
       saveAsRoutingRule: true,
       routingRulePattern: "policy number",
     });
+  });
+
+  it("never falls back to raw payload JSON for an imported Review item", () => {
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-import-missing-body",
+          state: "proposed",
+          proposalType: "propose_create_note",
+          risk: "high",
+          targetPath: "04-Resources/Imports/Report.md",
+          reason: "Imported note requires Review.",
+          payload: {
+            sourceNotePath: ".app/import-staging/import-1/Report.md",
+            destination: "04-Resources/Imports/Report.md",
+            sourceFile: "Report.pdf",
+            classification: {
+              primaryCategory: "resource",
+              alternativeCategories: [],
+              sensitivity: "normal",
+              confidence: 1,
+              evidence: [],
+              signals: [],
+              conflict: false,
+            },
+            safetyDecision: {
+              decision: "review_required",
+              reasonCodes: ["CLASSIFIER_CONFLICT"],
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Staged note content is unavailable.")).toBeVisible();
+    expect(screen.queryByText(/"sourceNotePath"/u)).not.toBeInTheDocument();
   });
 
   it("allows failed Review items to be retried and disables claimed Review items", async () => {

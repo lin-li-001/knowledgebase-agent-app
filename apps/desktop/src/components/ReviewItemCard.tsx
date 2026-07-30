@@ -244,6 +244,13 @@ function previewText(item: ReviewCardItem): string {
     if ("patch" in payload) {
       return formatPayload(payload.patch);
     }
+    if (
+      "sourceNotePath" in payload
+      && typeof payload.sourceNotePath === "string"
+      && payload.sourceNotePath.startsWith(".app/import-staging/")
+    ) {
+      return "Staged note content is unavailable.";
+    }
   }
 
   return formatPayload(payload);
