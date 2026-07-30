@@ -92,7 +92,7 @@ describe("IPC contract", () => {
     expect(
       services.db?.sqlite.prepare("SELECT path FROM notes WHERE path = ?").get(finalPath),
     ).toEqual({ path: finalPath });
-  });
+  }, 10_000);
 
   it("writes sanitized IPC debug logs without secrets", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
@@ -870,6 +870,82 @@ January bill.
     expect(agents).toContain("rule b -> 04-Resources/Rules/Rule B.md");
   });
 
+  it("serializes activation contract migration with a concurrent saved routing rule", async () => {
+    const setup = await setupImportedReview();
+    const agentsPath = path.join(setup.root, "AGENTS.md");
+    await writeFile(
+      agentsPath,
+      "# Workspace Contract\n\nUser-authored activation line.\n",
+      "utf8",
+    );
+    const activationRead = deferred<void>();
+    const releaseActivation = deferred<void>();
+    const activationServices: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(setup.root, ".app/settings-activation.json"),
+      workspaceContractIoHooks: {
+        afterPathSnapshot: async (operation) => {
+          if (operation === "workspace_contract_read") {
+            activationRead.resolve();
+            await releaseActivation.promise;
+          }
+        },
+      },
+    };
+    opened.push(activationServices);
+
+    const activation = handleIpcRequest(
+      activationServices,
+      "workspace:open",
+      { rootPath: setup.root },
+    );
+    await activationRead.promise;
+
+    const promotionReached = deferred<void>();
+    setup.services.reviewApplyHooks = {
+      afterPromotion: async () => {
+        promotionReached.resolve();
+      },
+    };
+    const ruleSave = handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: "04-Resources/Approved/Activation Race.md",
+      categoryOverride: "resource",
+      saveAsRoutingRule: true,
+      routingRulePattern: "activation race",
+    });
+    await promotionReached.promise;
+    await delay(25);
+    releaseActivation.resolve();
+
+    await expect(activation).resolves.toEqual(expect.objectContaining({
+      ok: true,
+    }));
+    await expect(ruleSave).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+
+    const policy = JSON.parse(
+      await readFile(path.join(setup.root, ".vault/routing-policy.json"), "utf8"),
+    ) as { rules: Array<{ pattern: string; destination: string }> };
+    expect(policy.rules).toEqual([
+      expect.objectContaining({
+        pattern: "activation race",
+        destination: "04-Resources/Approved/Activation Race.md",
+      }),
+    ]);
+    const agents = await readFile(agentsPath, "utf8");
+    expect(agents).toContain("User-authored activation line.");
+    expect(agents).toContain(
+      "activation race -> 04-Resources/Approved/Activation Race.md",
+    );
+    expect(agents).toContain(
+      "Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md`",
+    );
+  });
+
   it("revalidates a reviewed import with current overrides and promotes the latest staged body once", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
     const editedBody = (await readFile(path.join(root, sourceNotePath), "utf8"))
@@ -1238,7 +1314,7 @@ January bill.
     await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(existingDestination);
   });
 
-  it("retries a failed approval from preserved staging with a corrected destination", async () => {
+  it("does not replace persisted application intent after a pre-publication failure", async () => {
     const existingDestination = activeResourceNote("Existing Utility Bill");
     const { root, services, sourceNotePath } = await setupImportedReview({ existingDestination });
 
@@ -1252,11 +1328,15 @@ January bill.
       targetPathOverride: correctedDestination,
       categoryOverride: "resource",
     })).resolves.toEqual({
-      ok: true,
-      data: { id: "review-import-source-note", state: "applied" },
+      ok: false,
+      error: expect.stringContaining("DESTINATION_EXISTS"),
     });
-    await expect(readFile(path.join(root, correctedDestination), "utf8")).resolves.toContain("Electric bill January 2026.");
-    await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(root, correctedDestination), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(path.join(root, sourceNotePath), "utf8")).resolves.toContain(
+      "Electric bill January 2026.",
+    );
   });
 
   it("reconciles a crash after promotion without rewriting the destination", async () => {
@@ -1359,6 +1439,75 @@ January bill.
     },
   );
 
+  it("uses finalTemp identity to recover the Review hard-link publication window", async () => {
+    const setup = await setupImportedReview();
+    const destinationA = "04-Resources/Approved/Hard Link A.md";
+    const destinationB = "04-Resources/Approved/Conflicting B.md";
+    const stagingPath = path.join(setup.root, setup.sourceNotePath);
+    const replacementStaging = `${await readFile(stagingPath, "utf8")}\nReplacement staging authority.\n`;
+    let injected = false;
+    setup.services.reviewIoHooks = {
+      afterPathSnapshot: async (operation) => {
+        if (
+          operation !== "destination_create_published_verify"
+          || injected
+        ) {
+          return;
+        }
+        injected = true;
+        await rename(stagingPath, `${stagingPath}.previous`);
+        await writeFile(stagingPath, replacementStaging, "utf8");
+        throw new Error("crash in Review hard-link recording window");
+      },
+    };
+
+    await expect(handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationA,
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: false,
+      error: "crash in Review hard-link recording window",
+    });
+    expect(injected).toBe(true);
+    await expect(readFile(path.join(setup.root, destinationA), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const application = JSON.parse(
+      (
+        setup.services.db?.sqlite
+          .prepare(
+            "SELECT application_json AS applicationJson FROM review_items WHERE id = ?",
+          )
+          .get("review-import-source-note") as { applicationJson: string }
+      ).applicationJson,
+    ) as Record<string, unknown>;
+    expect(application).toEqual(expect.objectContaining({
+      destination: destinationA,
+      finalTemp: expect.objectContaining({
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+      }),
+    }));
+    expect(application).not.toHaveProperty("final");
+    setup.services.reviewIoHooks = undefined;
+
+    await expect(handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationB,
+      categoryOverride: "project.document",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+    await expect(readFile(path.join(setup.root, destinationA), "utf8")).resolves.toContain(
+      "Replacement staging authority.",
+    );
+    await expect(readFile(path.join(setup.root, destinationB), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("rolls back the reviewed final when its bound attachment changes before retirement", async () => {
     const setup = await setupImportedReview();
     const destination = "04-Resources/Approved/Attachment Bound.md";
@@ -1455,7 +1604,158 @@ January bill.
     await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("accepts override B only after a failed application has rolled back A", async () => {
+  it("replays persisted destination and rule options after a crash immediately after claim", async () => {
+    const { root, services } = await setupImportedReview();
+    const destinationA = "04-Resources/Approved/Claimed A.md";
+    const destinationB = "04-Resources/Approved/Conflicting B.md";
+    let crash = true;
+    services.reviewApplyHooks = {
+      afterClaim: async () => {
+        if (crash) {
+          crash = false;
+          throw new Error("crash immediately after claim");
+        }
+      },
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationA,
+      categoryOverride: "resource",
+      saveAsRoutingRule: true,
+      routingRulePattern: "persisted claim a",
+    })).resolves.toEqual({
+      ok: false,
+      error: "crash immediately after claim",
+    });
+    services.db?.sqlite
+      .prepare("UPDATE review_items SET claim_started_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", "review-import-source-note");
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationB,
+      categoryOverride: "project.document",
+      saveAsRoutingRule: false,
+      routingRulePattern: "conflicting b",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+
+    await expect(readFile(path.join(root, destinationA), "utf8")).resolves.toContain(
+      "Electric bill January 2026.",
+    );
+    await expect(readFile(path.join(root, destinationB), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const policy = JSON.parse(
+      await readFile(path.join(root, ".vault/routing-policy.json"), "utf8"),
+    ) as {
+      rules: Array<{
+        pattern: string;
+        category?: string;
+        destination: string;
+      }>;
+    };
+    expect(policy.rules).toEqual([
+      expect.objectContaining({
+        pattern: "persisted claim a",
+        category: "resource",
+        destination: destinationA,
+      }),
+    ]);
+    expect(
+      services.db?.sqlite
+        .prepare(
+          "SELECT entity_path AS entityPath FROM activity_events WHERE id = ?",
+        )
+        .get("review-applied-review-import-source-note"),
+    ).toEqual({ entityPath: destinationA });
+  });
+
+  it("replays persisted destination and rule options after a crash after prepare", async () => {
+    const { root, services } = await setupImportedReview();
+    const destinationA = "04-Resources/Approved/Prepared A.md";
+    const destinationB = "04-Resources/Approved/Conflicting B.md";
+    let crash = true;
+    services.reviewIoHooks = {
+      afterPathSnapshot: async (operation, targetPath) => {
+        if (
+          crash
+          && operation === "destination_create"
+          && targetPath === path.join(services.workspaceRoot!, destinationA)
+        ) {
+          crash = false;
+          throw new Error("crash immediately after prepare");
+        }
+      },
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationA,
+      categoryOverride: "resource",
+      saveAsRoutingRule: true,
+      routingRulePattern: "persisted prepared a",
+    })).resolves.toEqual({
+      ok: false,
+      error: "crash immediately after prepare",
+    });
+    const prepared = JSON.parse(
+      (
+        services.db?.sqlite
+          .prepare(
+            "SELECT application_json AS applicationJson FROM review_items WHERE id = ?",
+          )
+          .get("review-import-source-note") as { applicationJson: string }
+      ).applicationJson,
+    ) as Record<string, unknown>;
+    expect(prepared).toEqual(expect.objectContaining({
+      kind: "import_move",
+      destination: destinationA,
+      finalTemp: expect.objectContaining({
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+      }),
+      options: expect.objectContaining({
+        targetPathOverride: destinationA,
+        categoryOverride: "resource",
+        saveAsRoutingRule: true,
+        routingRulePattern: "persisted prepared a",
+      }),
+    }));
+    services.reviewIoHooks = undefined;
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destinationB,
+      categoryOverride: "project.document",
+      saveAsRoutingRule: false,
+      routingRulePattern: "conflicting b",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+
+    await expect(readFile(path.join(root, destinationA), "utf8")).resolves.toContain(
+      "Electric bill January 2026.",
+    );
+    await expect(readFile(path.join(root, destinationB), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const policy = JSON.parse(
+      await readFile(path.join(root, ".vault/routing-policy.json"), "utf8"),
+    ) as { rules: Array<{ pattern: string; destination: string }> };
+    expect(policy.rules).toEqual([
+      expect.objectContaining({
+        pattern: "persisted prepared a",
+        destination: destinationA,
+      }),
+    ]);
+  });
+
+  it("resumes persisted A after its first publication was rolled back", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
     const stagingParent = path.dirname(
       path.join(services.workspaceRoot!, sourceNotePath),
@@ -1491,8 +1791,8 @@ January bill.
       ok: true,
       data: { id: "review-import-source-note", state: "applied" },
     });
-    await expect(readFile(path.join(root, destinationA), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(path.join(root, destinationB), "utf8")).resolves.toContain("Electric bill January 2026.");
+    await expect(readFile(path.join(root, destinationA), "utf8")).resolves.toContain("Electric bill January 2026.");
+    await expect(readFile(path.join(root, destinationB), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -1580,6 +1880,88 @@ January bill.
       data: { id: testCase.id, state: "applied" },
     });
     await expect(readFile(path.join(root, testCase.targetPath), "utf8")).resolves.toBe(written);
+  });
+
+  it("uses finalTemp identity to replay a generic hard-link publication window", async () => {
+    const { root, services } = await setupImportedReview();
+    const id = "review-generic-hard-link";
+    const destinationA = "04-Resources/Generic Hard Link A.md";
+    const destinationB = "04-Resources/Generic Conflicting B.md";
+    services.db?.sqlite
+      .prepare(
+        `INSERT INTO review_items (
+          id, workspace_id, state, risk, proposal_type, payload_json, reason,
+          target_path, source_session_id, source_turn_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        services.workspaceId,
+        "proposed",
+        "high",
+        "propose_create_note",
+        JSON.stringify({
+          path: "04-Resources/Generic Original.md",
+          body: activeResourceNote("Generic hard-link replay"),
+        }),
+        "hard-link replay",
+        "04-Resources/Generic Original.md",
+        services.sessionId,
+        "turn-hard-link",
+        new Date().toISOString(),
+      );
+    let injected = false;
+    services.reviewIoHooks = {
+      afterPathSnapshot: async (operation) => {
+        if (
+          operation === "destination_create_published_verify"
+          && !injected
+        ) {
+          injected = true;
+          throw new Error("crash in generic hard-link recording window");
+        }
+      },
+    };
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id,
+      targetPathOverride: destinationA,
+      saveAsRoutingRule: true,
+      routingRulePattern: "generic persisted a",
+    })).resolves.toEqual({
+      ok: false,
+      error: "crash in generic hard-link recording window",
+    });
+    expect(injected).toBe(true);
+    await expect(readFile(path.join(root, destinationA), "utf8")).resolves.toContain(
+      "Generic hard-link replay",
+    );
+    services.reviewIoHooks = undefined;
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id,
+      targetPathOverride: destinationB,
+      saveAsRoutingRule: false,
+      routingRulePattern: "generic conflicting b",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id, state: "applied" },
+    });
+    await expect(readFile(path.join(root, destinationA), "utf8")).resolves.toContain(
+      "Generic hard-link replay",
+    );
+    await expect(readFile(path.join(root, destinationB), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const policy = JSON.parse(
+      await readFile(path.join(root, ".vault/routing-policy.json"), "utf8"),
+    ) as { rules: Array<{ pattern: string; destination: string }> };
+    expect(policy.rules).toEqual([
+      expect.objectContaining({
+        pattern: "generic persisted a",
+        destination: destinationA,
+      }),
+    ]);
   });
 
   it("rejects a generic retry when the existing destination changed after its write", async () => {
@@ -2399,6 +2781,10 @@ function deferred<T>(): {
     resolve = next;
   });
   return { promise, resolve };
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function writeNote(filePath: string, title: string, body: string): Promise<void> {

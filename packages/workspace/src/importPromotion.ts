@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertApprovedImportFinalNotePath } from "./importSafety";
 import { parseMarkdownDocument } from "./markdown";
@@ -143,19 +144,19 @@ export async function recoverImportPromotions(
     journalDir,
     { operation: "journal_list", hooks: options.ioHooks },
   );
+  const activeTransactionIds = new Set<string>();
 
   for (const journalName of journalNames.sort()) {
-    const journalPath = assertInsideWorkspace(
-      workspaceRoot,
-      path.join(defaultRoutingPolicy.importPromotionJournalDir(), journalName),
-    );
     if (isJournalTempName(journalName)) {
-      await cleanupJournalTemp(workspaceRoot, journalPath, options.ioHooks);
       continue;
     }
     if (!journalName.endsWith(".json")) {
       continue;
     }
+    const journalPath = assertInsideWorkspace(
+      workspaceRoot,
+      path.join(defaultRoutingPolicy.importPromotionJournalDir(), journalName),
+    );
 
     let snapshot;
     try {
@@ -211,7 +212,23 @@ export async function recoverImportPromotions(
     if (journal.version === 1) {
       await persistJournal(workspaceRoot, handle, options.ioHooks);
     }
+    activeTransactionIds.add(upgraded.transactionId);
     await recoverPromotion(workspaceRoot, handle, options.ioHooks);
+  }
+
+  for (const journalName of journalNames.sort()) {
+    if (
+      !isJournalTempName(journalName)
+      || [...activeTransactionIds].some((transactionId) =>
+        journalTempBelongsToTransaction(journalName, transactionId))
+    ) {
+      continue;
+    }
+    const journalPath = assertInsideWorkspace(
+      workspaceRoot,
+      path.join(defaultRoutingPolicy.importPromotionJournalDir(), journalName),
+    );
+    await cleanupJournalTemp(workspaceRoot, journalPath, options.ioHooks);
   }
 }
 
@@ -359,6 +376,7 @@ async function createPromotionJournal(
       operation: "journal_create",
       hooks: promotionJournalHooks(input.ioHooks, input.hooks),
       requireAbsent: true,
+      tempToken: journal.transactionId,
     },
   );
   return { path: journalPath, artifact, journal };
@@ -380,6 +398,7 @@ async function publishFinal(
     {
       operation: "final_create",
       hooks: input.ioHooks,
+      tempToken: handle.journal.transactionId,
       afterTempSync: async (temp) => {
         handle.journal = {
           ...handle.journal,
@@ -601,6 +620,7 @@ async function publishRecoveredFinal(
   await securePublishWorkspaceFileAtomic(workspaceRoot, finalPath, body, {
     operation: "final_recover_create",
     hooks: ioHooks,
+    tempToken: handle.journal.transactionId,
     afterTempSync: async (temp) => {
       handle.journal = {
         ...handle.journal,
@@ -655,15 +675,29 @@ async function rollbackPublishedFinal(
   journal: ImportPromotionJournal,
   ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<void> {
-  if (!journal.final) {
+  const publicationIdentity = journal.final ?? journal.finalTemp;
+  if (!publicationIdentity) {
     return;
   }
+  const finalPath = assertApprovedImportFinalNotePath(
+    workspaceRoot,
+    journal.finalPath,
+  );
   await removeRecordedIfOwned(
     workspaceRoot,
-    journal.final,
+    publicationIdentity,
     "final_rollback",
     ioHooks,
+    finalPath,
   );
+  if (journal.finalTemp) {
+    await removeRecordedIfOwned(
+      workspaceRoot,
+      journal.finalTemp,
+      "final_temp_rollback",
+      ioHooks,
+    );
+  }
 }
 
 async function removeRecordedIfOwned(
@@ -671,8 +705,19 @@ async function removeRecordedIfOwned(
   recorded: RecordedArtifact,
   operation: string,
   ioHooks?: SecureWorkspaceIoHooks,
+  targetPathOverride?: string,
 ): Promise<void> {
-  const artifact = artifactFromRecord(workspaceRoot, recorded);
+  const artifact = {
+    ...artifactFromRecord(workspaceRoot, recorded),
+    ...(targetPathOverride === undefined
+      ? {}
+      : {
+        targetPath: assertInsideWorkspace(
+          workspaceRoot,
+          targetPathOverride,
+        ),
+      }),
+  };
   if (!await secureWorkspacePathExists(workspaceRoot, artifact.targetPath)) {
     return;
   }
@@ -695,6 +740,7 @@ async function persistJournal(
       operation: "journal_update",
       hooks: ioHooks,
       expectedArtifact: handle.artifact,
+      tempToken: handle.journal.transactionId,
     },
   );
 }
@@ -738,12 +784,25 @@ async function cleanupJournalTemp(
       journalPath,
       { operation: "journal_temp_read", hooks: ioHooks },
     );
-    await secureRemoveWorkspaceArtifact(workspaceRoot, snapshot.artifact, {
-      operation: "journal_temp_cleanup",
-      hooks: ioHooks,
-    });
+    const metadata = await lstat(snapshot.artifact.targetPath);
+    if (
+      metadata.dev !== snapshot.artifact.fileDev
+      || metadata.ino !== snapshot.artifact.fileIno
+      || Date.now() - metadata.mtimeMs < journalTempStaleGraceMs
+    ) {
+      return;
+    }
+    await secureQuarantineWorkspaceArtifact(
+      workspaceRoot,
+      snapshot.artifact,
+      "stale-temp",
+      {
+        operation: "journal_temp_stale_quarantine",
+        hooks: ioHooks,
+      },
+    );
   } catch {
-    // A temp that cannot be proven transaction-owned is ignored.
+    // A temp that is fresh or whose identity cannot be proved is left alone.
   }
 }
 
@@ -1019,6 +1078,15 @@ function serializeJournal(journal: ImportPromotionJournal): string {
 
 function isJournalTempName(name: string): boolean {
   return name.endsWith(".tmp") || name.includes(".tmp.");
+}
+
+const journalTempStaleGraceMs = 5 * 60 * 1000;
+
+function journalTempBelongsToTransaction(
+  name: string,
+  transactionId: string,
+): boolean {
+  return name.includes(`.${transactionId}.`);
 }
 
 function isRecordedArtifact(value: unknown): value is RecordedArtifact {

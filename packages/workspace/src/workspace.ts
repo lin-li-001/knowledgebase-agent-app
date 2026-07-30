@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   changesTemplate,
@@ -9,6 +9,13 @@ import {
   workspaceRoutingPolicyContract,
 } from "./templates";
 import { defaultRoutingPolicy } from "./routingPolicy";
+import {
+  secureAtomicReplaceWorkspaceFile,
+  secureReadWorkspaceArtifact,
+  secureWorkspacePathExists,
+  type SecureWorkspaceIoHooks,
+} from "./secureWorkspaceIo";
+import { withWorkspaceWriteLock } from "./workspaceWriteLock";
 
 export interface WorkspaceInfo {
   rootPath: string;
@@ -69,14 +76,42 @@ export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> 
   };
 }
 
-export async function syncWorkspaceContract(rootPath: string): Promise<void> {
-  const contractPath = path.join(path.resolve(rootPath), "AGENTS.md");
-  const current = await readFile(contractPath, "utf8").catch((error: unknown) => {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return "# Workspace Contract\n";
-    }
-    throw error;
-  });
+export interface WorkspaceContractSyncOptions {
+  ioHooks?: SecureWorkspaceIoHooks;
+}
+
+export async function syncWorkspaceContract(
+  rootPath: string,
+  options: WorkspaceContractSyncOptions = {},
+): Promise<void> {
+  await withWorkspaceWriteLock(
+    rootPath,
+    async (canonicalRoot) =>
+      syncWorkspaceContractLocked(canonicalRoot, options),
+    options.ioHooks === undefined ? {} : { ioHooks: options.ioHooks },
+  );
+}
+
+export async function syncWorkspaceContractLocked(
+  canonicalRoot: string,
+  options: WorkspaceContractSyncOptions = {},
+): Promise<void> {
+  const contractPath = path.join(canonicalRoot, "AGENTS.md");
+  const snapshot = await secureWorkspacePathExists(
+    canonicalRoot,
+    contractPath,
+  )
+    ? await secureReadWorkspaceArtifact(
+      canonicalRoot,
+      contractPath,
+      {
+        operation: "workspace_contract_read",
+        hooks: options.ioHooks,
+      },
+    )
+    : undefined;
+  const current = snapshot?.contents.toString("utf8")
+    ?? "# Workspace Contract\n";
   const normalizedCurrent = current.replace(/\r\n?/gu, "\n");
 
   const sourceNoteRoute = ".app/import-staging/<import-id>/<source-stem>.md";
@@ -104,14 +139,6 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
     .replaceAll(
       ".app/import-staging/<batch-name>/",
       ".app/import-staging/<import-id>/",
-    )
-    .replaceAll(
-      "06-Attachments/Imports/<batch-name>/",
-      "06-Attachments/Imports/<import-id>/",
-    )
-    .replaceAll(
-      "00-Inbox/Imports/<batch-name>.md",
-      "00-Inbox/Imports/<import-id>.md",
     );
   if (!hasSourceNoteRoute && !next.includes(sourceNoteRoute)) {
     next = next.includes(legacyRoute)
@@ -142,7 +169,19 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
   }
 
   if (next !== current) {
-    await writeFile(contractPath, next, "utf8");
+    await secureAtomicReplaceWorkspaceFile(
+      canonicalRoot,
+      contractPath,
+      next,
+      {
+        operation: "workspace_contract_write",
+        hooks: options.ioHooks,
+        tempToken: "workspace-contract",
+        ...(snapshot === undefined
+          ? { requireAbsent: true }
+          : { expectedArtifact: snapshot.artifact }),
+      },
+    );
   }
 }
 

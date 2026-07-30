@@ -241,6 +241,69 @@ describe("desktop shell", () => {
     expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
   });
 
+  it("initializes Resume controls from the persisted application", () => {
+    const approve = vi.fn(async () => undefined);
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-prepared-import",
+          state: "failed",
+          proposalType: "propose_create_note",
+          risk: "high",
+          reason: "Previous approval stopped after prepare.",
+          targetPath: "04-Resources/Imports/Utility Bill.md",
+          payload: {
+            sourceNotePath: ".app/import-staging/import-1/Utility Bill.md",
+            destination: "04-Resources/Imports/Utility Bill.md",
+            sourceFile: "Utility Bill.pdf",
+            classification: {
+              primaryCategory: "finance.utility",
+              alternativeCategories: [],
+              sensitivity: "personal",
+              confidence: 0.8,
+              evidence: ["Amount due"],
+              signals: [],
+              conflict: false,
+            },
+            safetyDecision: {
+              decision: "review_required",
+              reasonCodes: ["CATEGORY_REQUIRES_REVIEW"],
+            },
+          },
+          application: {
+            kind: "import_move",
+            destination: "04-Resources/Approved/Persisted A.md",
+            options: {
+              targetPathOverride: "04-Resources/Approved/Persisted A.md",
+              categoryOverride: "resource",
+              saveAsRoutingRule: true,
+              routingRulePattern: "persisted utility",
+            },
+          },
+        }}
+        onApprove={approve}
+      />,
+    );
+
+    expect(screen.getByLabelText("Destination")).toHaveValue(
+      "04-Resources/Approved/Persisted A.md",
+    );
+    expect(screen.getByLabelText("Category")).toHaveValue("resource");
+    expect(screen.getByLabelText("Save as future routing rule")).toBeChecked();
+    expect(screen.getByLabelText("Routing rule pattern")).toHaveValue(
+      "persisted utility",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume approval" }));
+
+    expect(approve).toHaveBeenCalledWith("review-prepared-import", {
+      categoryOverride: "resource",
+      targetPathOverride: "04-Resources/Approved/Persisted A.md",
+      saveAsRoutingRule: true,
+      routingRulePattern: "persisted utility",
+    });
+  });
+
   it("disables Review actions while an approval is pending and prevents duplicate requests", async () => {
     let resolveApproval: (() => void) | undefined;
     const approve = vi.fn(() => new Promise<void>((resolve) => {

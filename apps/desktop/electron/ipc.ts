@@ -46,6 +46,7 @@ import {
   secureWorkspacePathExists,
   serializeMarkdownDocument,
   syncWorkspaceContract,
+  syncWorkspaceContractLocked,
   withWorkspaceWriteLock,
   type ClassificationSignal,
   workspaceIdForRoot,
@@ -78,6 +79,7 @@ export interface IpcServices {
     beforeApplied?(reviewItemId: string): Promise<void>;
   };
   reviewIoHooks?: SecureWorkspaceIoHooks;
+  workspaceContractIoHooks?: SecureWorkspaceIoHooks;
 }
 
 export interface ReviewImportFileOps {
@@ -490,6 +492,20 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
   if (isImportedSourceNotePayload(item.payload) && item.payload.safetyDecision.decision === "blocked") {
     return { ok: false, error: "Blocked import artifacts cannot be approved" };
   }
+  let effectiveOptions: ReviewApproveOptions;
+  try {
+    effectiveOptions = effectiveReviewApproveOptions(
+      item.application,
+      options,
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error
+        ? error.message
+        : "Persisted Review application options are invalid",
+    };
+  }
 
   if (item.proposalType === "propose_create_note" || item.proposalType === "propose_decision") {
     const claimToken = randomUUID();
@@ -498,7 +514,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
       to: "applying",
       token: claimToken,
       startedAt: new Date().toISOString(),
-      application: reviewApplicationIntent(item, options),
+      application: reviewApplicationIntent(item, effectiveOptions),
       staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
       ...(claimIsStale && item.claimToken ? { staleClaimToken: item.claimToken } : {}),
     });
@@ -533,7 +549,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
 
     let entityPath: string;
     try {
-      entityPath = await applyKnowledgeProposal(services, claimedItem, options, {
+      entityPath = await applyKnowledgeProposal(services, claimedItem, effectiveOptions, {
         previousApplication: item.application,
         onPrepared: async (application) => {
           await updateReviewItemApplication(db, id, claimToken, application);
@@ -552,12 +568,12 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     try {
       const routingDestination = isImportedSourceNotePayload(claimedItem.payload)
         ? entityPath
-        : routingDestinationFor(claimedItem, options);
-      if (options.saveAsRoutingRule && routingDestination) {
-        const routingCategory = routingCategoryFor(claimedItem, options);
+        : routingDestinationFor(claimedItem, effectiveOptions);
+      if (effectiveOptions.saveAsRoutingRule && routingDestination) {
+        const routingCategory = routingCategoryFor(claimedItem, effectiveOptions);
         await saveUserRoutingRule(services, claimedItem, {
           destination: routingDestination,
-          pattern: options.routingRulePattern?.trim() || routingPatternFor(claimedItem),
+          pattern: effectiveOptions.routingRulePattern?.trim() || routingPatternFor(claimedItem),
           ...(routingCategory === undefined ? {} : { category: routingCategory }),
           createdAt: appliedAt,
         });
@@ -604,7 +620,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     to: "applying",
     token: claimToken,
     startedAt: new Date().toISOString(),
-    application: { options },
+    application: { options: effectiveOptions },
     staleBefore: new Date(Date.now() - reviewClaimLeaseMs).toISOString(),
     ...(claimIsStale && item.claimToken ? { staleClaimToken: item.claimToken } : {}),
   });
@@ -874,6 +890,7 @@ async function publishGenericWrite(
     {
       operation: "destination_create",
       hooks: ioHooks,
+      tempToken: prepared.reviewItemId,
       afterTempSync: async (temp) => {
         await onPrepared?.({
           ...prepared,
@@ -1076,6 +1093,7 @@ async function moveImportedSourceNote(
       {
         operation: "destination_create",
         hooks: application.ioHooks,
+        tempToken: item.id,
         afterTempSync: async (temp) => {
           preparedApplication = {
             ...preparedApplication,
@@ -1112,22 +1130,37 @@ async function moveImportedSourceNote(
       },
     );
   } catch (error) {
-    if (!preparedApplication.final) {
-      throw error;
-    }
     try {
-      await secureRemoveWorkspaceArtifact(
-        workspaceRoot,
-        artifactFromReviewRecord(
+      const publicationIdentity = preparedApplication.final
+        ?? preparedApplication.finalTemp;
+      if (
+        publicationIdentity
+        && !isFileExistsError(error)
+        && await secureWorkspacePathExists(
           workspaceRoot,
-          preparedApplication.final,
-        ),
-        {
-          operation: "destination_rollback",
-          hooks: application.ioHooks,
-          claimFence: application.claimFence,
-          unlinkFile: fileOps.unlink,
-        },
+          approvedDestinationPath,
+        )
+      ) {
+        await secureRemoveWorkspaceArtifact(
+          workspaceRoot,
+          artifactFromReviewRecord(
+            workspaceRoot,
+            publicationIdentity,
+            approvedDestinationPath,
+          ),
+          {
+            operation: "destination_rollback",
+            hooks: application.ioHooks,
+            claimFence: application.claimFence,
+            unlinkFile: fileOps.unlink,
+          },
+        );
+      }
+      await cleanupReviewFinalTemp(
+        workspaceRoot,
+        preparedApplication.finalTemp,
+        application.ioHooks,
+        fileOps.unlink,
       );
     } catch (rollbackError) {
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
@@ -1262,10 +1295,65 @@ function isRecordedReviewArtifact(value: unknown): value is RecordedReviewArtifa
 }
 
 function reviewApplicationIntent(item: ReviewItem, options: ReviewApproveOptions): unknown {
-  if (isImportMoveApplication(item.application) || isGenericWriteApplication(item.application)) {
+  if (item.application !== undefined && item.application !== null) {
     return item.application;
   }
   return { options };
+}
+
+function effectiveReviewApproveOptions(
+  application: unknown,
+  incoming: ReviewApproveOptions,
+): ReviewApproveOptions {
+  if (application === undefined || application === null) {
+    return { ...incoming };
+  }
+  if (!isRecord(application) || !isRecord(application.options)) {
+    throw new Error("Persisted Review application options are invalid");
+  }
+  const options = application.options;
+  if (
+    options.targetPathOverride !== undefined
+    && typeof options.targetPathOverride !== "string"
+  ) {
+    throw new Error("Persisted Review destination option is invalid");
+  }
+  if (
+    options.categoryOverride !== undefined
+    && (
+      typeof options.categoryOverride !== "string"
+      || contentCategoryFrom(options.categoryOverride)
+        !== options.categoryOverride
+    )
+  ) {
+    throw new Error("Persisted Review category option is invalid");
+  }
+  if (
+    options.saveAsRoutingRule !== undefined
+    && typeof options.saveAsRoutingRule !== "boolean"
+  ) {
+    throw new Error("Persisted Review routing-rule option is invalid");
+  }
+  if (
+    options.routingRulePattern !== undefined
+    && typeof options.routingRulePattern !== "string"
+  ) {
+    throw new Error("Persisted Review routing-rule pattern is invalid");
+  }
+  return {
+    ...(typeof options.targetPathOverride === "string"
+      ? { targetPathOverride: options.targetPathOverride }
+      : {}),
+    ...(typeof options.categoryOverride === "string"
+      ? { categoryOverride: options.categoryOverride as ContentCategory }
+      : {}),
+    ...(typeof options.saveAsRoutingRule === "boolean"
+      ? { saveAsRoutingRule: options.saveAsRoutingRule }
+      : {}),
+    ...(typeof options.routingRulePattern === "string"
+      ? { routingRulePattern: options.routingRulePattern }
+      : {}),
+  };
 }
 
 async function reconcilePersistedImportedApplication(
@@ -1403,12 +1491,14 @@ async function reconcilePersistedImportedApplication(
       );
     }
   } catch (error) {
-    if (previousApplication.final) {
+    const publicationIdentity = previousApplication.final
+      ?? previousApplication.finalTemp;
+    if (publicationIdentity) {
       await secureRemoveWorkspaceArtifact(
         workspaceRoot,
         artifactFromReviewRecord(
           workspaceRoot,
-          previousApplication.final,
+          publicationIdentity,
           persistedPath,
         ),
         {
@@ -1419,6 +1509,12 @@ async function reconcilePersistedImportedApplication(
         },
       );
     }
+    await cleanupReviewFinalTemp(
+      workspaceRoot,
+      previousApplication.finalTemp,
+      ioHooks,
+      fileOps.unlink,
+    );
     if (
       error instanceof Error
       && /staging|attachment/iu.test(error.message)
@@ -1427,6 +1523,12 @@ async function reconcilePersistedImportedApplication(
     }
     throw new Error("Review staging or attachment artifact changed before retirement");
   }
+  await cleanupReviewFinalTemp(
+    workspaceRoot,
+    previousApplication.finalTemp,
+    ioHooks,
+    fileOps.unlink,
+  );
   return previousApplication.destination;
 }
 
@@ -1461,7 +1563,9 @@ async function reconcileGenericWrite(
     || previousApplication.promotedContentHash !== prepared.promotedContentHash) {
     throw new Error("Destination already exists");
   }
-  if (!previousApplication.final) {
+  const publicationIdentity = previousApplication.final
+    ?? previousApplication.finalTemp;
+  if (!publicationIdentity) {
     throw new Error("Existing destination has no persisted publication identity");
   }
   let existing;
@@ -1474,7 +1578,7 @@ async function reconcileGenericWrite(
         hooks: ioHooks,
         expectedArtifact: artifactFromReviewRecord(
           workspaceRoot,
-          previousApplication.final,
+          publicationIdentity,
           targetPath,
         ),
       },
@@ -1485,6 +1589,11 @@ async function reconcileGenericWrite(
   if (existing.artifact.sha256 !== prepared.expectedFinalHash) {
     throw new Error("Existing destination does not match the persisted application");
   }
+  await cleanupReviewFinalTemp(
+    workspaceRoot,
+    previousApplication.finalTemp,
+    ioHooks,
+  );
 }
 
 function hashContents(contents: string): string {
@@ -1527,6 +1636,32 @@ function artifactFromReviewRecord(
     sha256: recorded.sha256,
     size: recorded.size,
   };
+}
+
+async function cleanupReviewFinalTemp(
+  workspaceRoot: string,
+  recorded: RecordedReviewArtifact | undefined,
+  ioHooks?: SecureWorkspaceIoHooks,
+  unlinkFile?: (targetPath: string) => Promise<void>,
+): Promise<void> {
+  if (!recorded) {
+    return;
+  }
+  const artifact = artifactFromReviewRecord(workspaceRoot, recorded);
+  if (!await secureWorkspacePathExists(workspaceRoot, artifact.targetPath)) {
+    return;
+  }
+  await secureRemoveWorkspaceArtifact(workspaceRoot, artifact, {
+    operation: "review_final_temp_cleanup",
+    hooks: ioHooks,
+    ...(unlinkFile === undefined ? {} : { unlinkFile }),
+  });
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && error.code === "EEXIST";
 }
 
 function reviewRelativePath(
@@ -1835,6 +1970,7 @@ async function saveUserRoutingRule(
 
   await withWorkspaceWriteLock(workspaceRoot, async (canonicalRoot) => {
     const rules = await appendRoutingPolicyRule(canonicalRoot, rule);
+    await syncWorkspaceContractLocked(canonicalRoot);
     await syncAgentsRoutingRules(canonicalRoot, rules);
     await writeRoutingRuleAdr(canonicalRoot, rule);
   });
@@ -2042,7 +2178,12 @@ function extractMemoryBody(payload: unknown): string | null {
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
   services.db?.close();
   services.workspaceRoot = await realpath(path.resolve(rootPath));
-  await syncWorkspaceContract(services.workspaceRoot);
+  await syncWorkspaceContract(
+    services.workspaceRoot,
+    services.workspaceContractIoHooks === undefined
+      ? {}
+      : { ioHooks: services.workspaceContractIoHooks },
+  );
   await recoverImportPromotions(services.workspaceRoot);
   if (services.settingsPath) {
     const settings = await readDesktopSettings(services.settingsPath);

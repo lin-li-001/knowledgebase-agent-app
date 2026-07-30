@@ -51,12 +51,22 @@ export function ReviewItemCard({
     && (item.state === undefined || item.state === "proposed" || item.state === "failed");
   const offersApprovalRecovery = hasApplicationIntent && canApprove;
   const source = reviewSource(item);
-  const editableDestination = destinationPath(item);
+  const proposedDestination = destinationPath(item);
+  const persistedApplication = persistedApplicationView(item.application);
+  const editableDestination = persistedApplication.destination
+    ?? persistedApplication.options.targetPathOverride
+    ?? proposedDestination;
   const importDetails = importReviewDetails(item);
   const [destination, setDestination] = useState(editableDestination ?? "");
-  const [category, setCategory] = useState<ContentCategory | undefined>(importDetails?.category);
-  const [saveAsRoutingRule, setSaveAsRoutingRule] = useState(false);
-  const [routingRulePattern, setRoutingRulePattern] = useState("");
+  const [category, setCategory] = useState<ContentCategory | undefined>(
+    persistedApplication.options.categoryOverride ?? importDetails?.category,
+  );
+  const [saveAsRoutingRule, setSaveAsRoutingRule] = useState(
+    persistedApplication.options.saveAsRoutingRule ?? false,
+  );
+  const [routingRulePattern, setRoutingRulePattern] = useState(
+    persistedApplication.options.routingRulePattern ?? "",
+  );
   const [requestPending, setRequestPending] = useState(false);
   const requestInFlight = useRef(false);
 
@@ -66,12 +76,25 @@ export function ReviewItemCard({
     }
 
     const options: ReviewApprovalOptions = {};
-    if (importDetails && category && category !== importDetails.category) {
+    if (
+      importDetails
+      && category
+      && (
+        category !== importDetails.category
+        || hasApplicationIntent
+      )
+    ) {
       options.categoryOverride = category;
     }
     if (editableDestination) {
       const trimmedDestination = destination.trim();
-      if (trimmedDestination && trimmedDestination !== editableDestination) {
+      if (
+        trimmedDestination
+        && (
+          trimmedDestination !== proposedDestination
+          || hasApplicationIntent
+        )
+      ) {
         options.targetPathOverride = trimmedDestination;
       }
     }
@@ -219,6 +242,44 @@ function destinationPath(item: ReviewCardItem): string | null {
     return payload.path;
   }
   return null;
+}
+
+function persistedApplicationView(application: unknown): {
+  destination?: string;
+  options: ReviewApprovalOptions;
+} {
+  if (!isRecord(application)) {
+    return { options: {} };
+  }
+  const options = isRecord(application.options)
+    ? persistedApprovalOptions(application.options)
+    : {};
+  return {
+    ...(typeof application.destination === "string"
+      && application.destination.trim() !== ""
+      ? { destination: application.destination }
+      : {}),
+    options,
+  };
+}
+
+function persistedApprovalOptions(
+  value: Record<string, unknown>,
+): ReviewApprovalOptions {
+  return {
+    ...(isContentCategory(value.categoryOverride)
+      ? { categoryOverride: value.categoryOverride }
+      : {}),
+    ...(typeof value.targetPathOverride === "string"
+      ? { targetPathOverride: value.targetPathOverride }
+      : {}),
+    ...(typeof value.saveAsRoutingRule === "boolean"
+      ? { saveAsRoutingRule: value.saveAsRoutingRule }
+      : {}),
+    ...(typeof value.routingRulePattern === "string"
+      ? { routingRulePattern: value.routingRulePattern }
+      : {}),
+  };
 }
 
 function reviewTitle(item: ReviewCardItem): string {

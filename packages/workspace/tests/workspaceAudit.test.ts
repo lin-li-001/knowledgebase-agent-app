@@ -122,7 +122,7 @@ describe("auditWorkspace", () => {
     );
   });
 
-  it("uses staged source notes for attachment binding without auditing them as indexed notes", async () => {
+  it("resolves a runtime-generated staged source link from the actual note path", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-audit-"));
     await createWorkspace(root);
     const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
@@ -142,7 +142,7 @@ describe("auditWorkspace", () => {
     await writeImportedSourceNote(
       stagingPath,
       "Utility",
-      "../06-Attachments/Imports/import-1/Utility.pdf",
+      "../../../06-Attachments/Imports/import-1/Utility.pdf",
       "03-Knowledge/Utility.md",
     );
     await indexWorkspace(root, db);

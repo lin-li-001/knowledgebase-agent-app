@@ -271,18 +271,8 @@ async function collectImportedSourceNotes(rootPath: string, attachmentRoot: stri
     if (typeof sourceFile !== "string" || sourceFile.trim() === "") {
       return undefined;
     }
-    const routeDestination = document.frontmatter.route_destination;
-    if (
-      staged
-      && (typeof routeDestination !== "string" || routeDestination.trim() === "")
-    ) {
-      return undefined;
-    }
-    const bindingPath = staged
-      ? path.resolve(rootPath, routeDestination as string)
-      : notePath;
     const attachmentPath = path.resolve(
-      path.dirname(bindingPath),
+      path.dirname(notePath),
       unescapeMarkdownPath(sourceFile),
     );
     const relativeAttachment = path.relative(attachmentRoot, attachmentPath);

@@ -26,8 +26,8 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
     "<import-id>",
     "<source-stem>",
   );
-  const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<import-id>/`;
-  const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<import-id>.md`;
+  const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`;
+  const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`;
   const profileMemoryRoute = "02-Profiles/<profile-id>/Memory.md";
   const profileFinanceRoute = "02-Personal/<profile-id>/Finance/";
   const decisionRoute = ".vault/decisions/<decision-id>.md";
@@ -60,6 +60,7 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   );
   await auditSecureImportExtraction(repoRoot, input.sourceOverrides, result);
   await auditIdentityBoundRecovery(repoRoot, input.sourceOverrides, result);
+  await auditRecoveryTempOwnership(repoRoot, input.sourceOverrides, result);
   await auditCrossProcessRoutingLock(repoRoot, input.sourceOverrides, result);
   await auditImportStagingExclusion(repoRoot, input.sourceOverrides, result);
   await auditReviewBypassFields(repoRoot, input.sourceOverrides, result);
@@ -474,6 +475,79 @@ async function auditIdentityBoundRecovery(
   );
 }
 
+async function auditRecoveryTempOwnership(
+  repoRoot: string,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const promotionPath = "packages/workspace/src/importPromotion.ts";
+  const lockPath = "packages/workspace/src/workspaceWriteLock.ts";
+  const [promotionSource, lockSource] = await Promise.all([
+    readSource(repoRoot, promotionPath, sourceOverrides),
+    readSource(repoRoot, lockPath, sourceOverrides),
+  ]);
+  const promotionFile = sourceFileFor(promotionPath, promotionSource);
+  const lockFile = sourceFileFor(lockPath, lockSource);
+  const recover = namedFunction(
+    promotionFile,
+    "recoverImportPromotions",
+  );
+  const cleanupTemp = namedFunction(
+    promotionFile,
+    "cleanupJournalTemp",
+  );
+  const createJournal = namedFunction(
+    promotionFile,
+    "createPromotionJournal",
+  );
+  const persistJournal = namedFunction(
+    promotionFile,
+    "persistJournal",
+  );
+  const publishLock = namedFunction(lockFile, "publishLockRecord");
+
+  const activeTransactionsArePreserved = hasCallIncludingCallbacks(
+    recover,
+    "journalTempBelongsToTransaction",
+  );
+  const staleTempsAreIdentityQuarantined = hasDirectCalls(cleanupTemp, [
+    "secureReadWorkspaceArtifact",
+    "lstat",
+    "secureQuarantineWorkspaceArtifact",
+  ])
+    && functionContainsIdentifier(cleanupTemp, "journalTempStaleGraceMs")
+    && !hasDirectCall(cleanupTemp, "secureRemoveWorkspaceArtifact");
+  const journalTempsCarryTransactionIdentity = hasCallWithObjectProperty(
+    createJournal,
+    "secureAtomicReplaceWorkspaceFile",
+    "tempToken",
+  ) && hasCallWithObjectProperty(
+    persistJournal,
+    "secureAtomicReplaceWorkspaceFile",
+    "tempToken",
+  );
+  const lockTempsCarryTokenIdentity = hasCallWithObjectProperty(
+    publishLock,
+    "securePublishWorkspaceFileAtomic",
+    "tempToken",
+  );
+
+  if (
+    !activeTransactionsArePreserved
+    || !staleTempsAreIdentityQuarantined
+    || !journalTempsCarryTransactionIdentity
+    || !lockTempsCarryTokenIdentity
+  ) {
+    result.failures.push(
+      "journal and lock temp cleanup is not transaction-owned or conservatively stale",
+    );
+    return;
+  }
+  result.passes.push(
+    "journal and lock temp cleanup preserves active transaction ownership",
+  );
+}
+
 async function auditCrossProcessRoutingLock(
   repoRoot: string,
   sourceOverrides: Map<string, string> | undefined,
@@ -481,24 +555,44 @@ async function auditCrossProcessRoutingLock(
 ): Promise<void> {
   const reviewPath = "apps/desktop/electron/ipc.ts";
   const lockPath = "packages/workspace/src/workspaceWriteLock.ts";
-  const [reviewSource, lockSource] = await Promise.all([
+  const workspacePath = "packages/workspace/src/workspace.ts";
+  const [reviewSource, lockSource, workspaceSource] = await Promise.all([
     readSource(repoRoot, reviewPath, sourceOverrides),
     readSource(repoRoot, lockPath, sourceOverrides),
+    readSource(repoRoot, workspacePath, sourceOverrides),
   ]);
   const reviewFile = sourceFileFor(reviewPath, reviewSource);
   const lockFile = sourceFileFor(lockPath, lockSource);
+  const workspaceFile = sourceFileFor(workspacePath, workspaceSource);
   const saveRule = namedFunction(reviewFile, "saveUserRoutingRule");
   const appendPolicy = namedFunction(reviewFile, "appendRoutingPolicyRule");
   const syncAgents = namedFunction(reviewFile, "syncAgentsRoutingRules");
   const activateWorkspace = namedFunction(reviewFile, "activateWorkspace");
+  const syncContract = namedFunction(
+    workspaceFile,
+    "syncWorkspaceContract",
+  );
+  const syncContractLocked = namedFunction(
+    workspaceFile,
+    "syncWorkspaceContractLocked",
+  );
   const acquireLock = namedFunction(lockFile, "acquireFilesystemLock");
+  const publishLock = namedFunction(lockFile, "publishLockRecord");
   const holdLock = namedFunction(lockFile, "withFilesystemLock");
+  const startHeartbeat = namedFunction(lockFile, "startLockHeartbeat");
+  const heartbeat = namedFunction(lockFile, "renewHeldLock");
+  const releaseLock = namedFunction(lockFile, "releaseHeldLock");
   const withLockMethod = namedMethod(lockFile, "withLock");
   const lockCall = directCallsNamed(saveRule, "withWorkspaceWriteLock")[0];
+  const syncLockCall = directCallsNamed(
+    syncContract,
+    "withWorkspaceWriteLock",
+  )[0];
 
   const lockEnclosesRoutingWrites = lockCall !== undefined
     && callbackArgumentCalls(lockCall, 1, [
       "appendRoutingPolicyRule",
+      "syncWorkspaceContractLocked",
       "syncAgentsRoutingRules",
       "writeRoutingRuleAdr",
     ]);
@@ -506,23 +600,59 @@ async function auditCrossProcessRoutingLock(
     appendPolicy,
     "secureAtomicReplaceWorkspaceFile",
   ) && hasDirectCall(syncAgents, "secureAtomicReplaceWorkspaceFile");
+  const activationSyncIsLockedAndAtomic = hasDirectCall(
+    activateWorkspace,
+    "syncWorkspaceContract",
+  )
+    && syncLockCall !== undefined
+    && callbackArgumentCalls(
+      syncLockCall,
+      1,
+      ["syncWorkspaceContractLocked"],
+    )
+    && hasDirectCalls(syncContractLocked, [
+      "secureReadWorkspaceArtifact",
+      "secureAtomicReplaceWorkspaceFile",
+    ]);
   const workspaceIsCanonical = hasDirectCall(
     activateWorkspace,
     "realpath",
   ) && hasDirectCallLike(withLockMethod, "realpath");
   const lockIsFilesystemBacked = hasDirectCalls(acquireLock, [
-    "secureWriteWorkspaceFileExclusive",
-    "syncWorkspaceDirectory",
+    "publishLockRecord",
     "readContendedLock",
-    "secureRemoveWorkspaceArtifact",
+    "secureQuarantineWorkspaceArtifact",
   ])
-    && hasDirectCall(holdLock, "secureRemoveWorkspaceArtifact")
+    && hasDirectCall(
+      publishLock,
+      "securePublishWorkspaceFileAtomic",
+    )
+    && hasCallWithObjectProperty(
+      publishLock,
+      "securePublishWorkspaceFileAtomic",
+      "tempToken",
+    )
+    && hasDirectCalls(heartbeat, [
+      "secureReadWorkspaceArtifact",
+      "secureAtomicReplaceWorkspaceFile",
+      "parseLockRecord",
+    ])
+    && hasDirectCalls(releaseLock, [
+      "secureReadWorkspaceArtifact",
+      "parseLockRecord",
+      "secureRemoveWorkspaceArtifact",
+    ])
+    && hasDirectCall(holdLock, "startLockHeartbeat")
+    && hasCallIncludingCallbacks(startHeartbeat, "renewHeldLock")
+    && functionContainsProperty(holdLock, "Promise", "resolve")
     && functionContainsObjectProperties(acquireLock, [
       "token",
       "pid",
       "createdAt",
+      "heartbeatAt",
       "leaseUntil",
     ])
+    && functionContainsIdentifier(acquireLock, "isProcessAlive")
     && functionContainsIdentifier(acquireLock, "deadline")
     && acquireLock !== undefined
     && nodesInFunction(acquireLock).some(ts.isWhileStatement);
@@ -535,6 +665,7 @@ async function auditCrossProcessRoutingLock(
     )
     || !lockEnclosesRoutingWrites
     || !routingWritesAreAtomic
+    || !activationSyncIsLockedAndAtomic
     || !workspaceIsCanonical
     || !lockIsFilesystemBacked
   ) {
@@ -862,6 +993,16 @@ function hasDirectCall(
 ): boolean {
   return declaration !== undefined
     && nodesInFunction(declaration).some(
+      (node) => ts.isCallExpression(node) && calledName(node) === callName,
+    );
+}
+
+function hasCallIncludingCallbacks(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInNode(declaration).some(
       (node) => ts.isCallExpression(node) && calledName(node) === callName,
     );
 }

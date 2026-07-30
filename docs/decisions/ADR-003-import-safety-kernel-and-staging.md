@@ -40,7 +40,7 @@ over both saved rules and automatic suggestions.
 Pending imported source notes are written under:
 
 ```text
-.app/import-staging/
+.app/import-staging/<import-id>/<source-stem>.md
 ```
 
 This staging area is excluded from knowledge indexing and generated
@@ -48,6 +48,11 @@ This staging area is excluded from knowledge indexing and generated
 to its selected destination while preserving its attachment reference.
 Destination collisions and other blocked safety decisions leave the source in
 staging.
+
+Original attachments retain the user-visible batch grouping at
+`06-Attachments/Imports/<batch-name>/`, and unclassified inbox fallback notes
+use `00-Inbox/Imports/<batch-name>.md`. `<import-id>` is reserved for the
+transaction-scoped staging directory.
 
 This rule replaces the previous runtime behavior that placed pending imported
 source notes in a user knowledge folder.
@@ -80,21 +85,27 @@ Auto-write promotion is source-bound and recorded in a durable journal under
 `.app/`. A journal records the attachment path, hash, and identity; the staging
 path, hash, device, and inode; the expected final body hash; and the final
 device and inode after publication. Journal creation and phase updates write a
-unique exclusive temp file in the journal directory, complete and `fsync` that
-file, rename it atomically, and `fsync` the directory. Recovery removes
-transaction temp journals when ownership can be proven and quarantines a
-malformed final journal without preventing other valid journals from being
-processed.
+unique exclusive temp file in the journal directory whose name includes the
+transaction ID, complete and `fsync` that file, rename it atomically, and
+`fsync` the directory. Recovery does not remove a fresh or active transaction
+temp. It cleans a temp explicitly referenced by its owned journal, or
+identity-quarantines an unreferenced temp only after a conservative stale
+grace. A malformed final journal is quarantined without preventing other valid
+journals from being processed.
 
 An authoritative final path is never written incrementally. Promotion writes
 and verifies a temp file in the canonical destination parent, `fsync`s it,
 publishes it only if the final path is absent by hard-linking the temp inode,
 and `fsync`s the destination parent. The temp and every later cleanup target
 are removed only when their recorded path, parent, device, inode, size, and hash
-still match. Staging retirement and rollback first rename the verified artifact
-to a unique quarantine name in the same verified parent, revalidate the moved
-identity, and only then unlink it. If a staging or final path has been replaced,
-the newer artifact is preserved and recovery fails closed.
+still match. Between hard-link publication and recording the final pathname,
+the recorded final-temp inode is also ownership proof for the final pathname;
+verification, reconciliation, and rollback retarget that exact identity rather
+than treating the pathname as unowned. Staging retirement and rollback first
+rename the verified artifact to a unique quarantine name in the same verified
+parent, revalidate the moved identity, and only then unlink it. If a staging or
+final path has been replaced, the newer artifact is preserved and recovery
+fails closed.
 
 Recovery runs on workspace activation and before later imports. Immediately
 before retiring staging, it reopens the exact recorded staging and attachment
@@ -103,23 +114,36 @@ attachment binding still names that attachment. A collision or identity
 mismatch is not accepted as an old final.
 
 Review promotion also binds recovery to its persisted application. If a prior
-application selected destination A, retries must finish or reconcile A before a
-new override B can be prepared. A persisted application intent also removes
-Reject and clear-intent authority: the UI offers Resume approval, and the
-storage claim for rejection fails closed. If final A was published but staging
-retirement or later work failed, a retry verifies and completes A rather than
-writing override B. A mismatch fails closed.
+application selected destination A and routing options A, every retry ignores
+conflicting request options and replays the persisted destination, category,
+saved-rule choice, and rule pattern for apply, saved-rule output, and activity.
+Incoming options create only the first application intent. The UI initializes
+its controls from that intent and labels the action Resume. Persisted intent
+also removes Reject and clear-intent authority, and the storage claim for
+rejection fails closed. If final A was published but staging retirement or
+later work failed, a retry verifies and completes A rather than writing
+override B. A mismatch fails closed.
 
 Durable routing-rule updates canonicalize the workspace with `realpath` and
 hold a workspace-local `.app/routing-policy.lock` across policy, `AGENTS.md`,
-and decision-record updates. The lock is acquired with exclusive creation and
-contains a random token, PID, creation timestamp, and lease expiry. Contenders
-retry for a bounded interval; an expired lock is retired through the same
-identity-bound quarantine path. Policy and `AGENTS.md` are each replaced by an
-`fsync`ed temp plus atomic rename and parent-directory `fsync`. They are not one
-cross-file transaction, so a process stop between the two files can temporarily
-leave contract drift; the next locked update reconciles all saved rules and
-Product Audit reports remaining drift.
+and decision-record updates. Workspace activation takes the same canonical lock
+while synchronizing the generated contract. A locked internal sync variant
+avoids recursively acquiring the lock during saved-rule updates.
+
+Lock metadata is first written completely to a token-named exclusive temp,
+`fsync`ed, and exclusively hard-linked to the absent authoritative lock path.
+It contains a random token, PID, creation timestamp, heartbeat timestamp, and
+lease expiry. While held, identity- and token-checked atomic heartbeat
+replacements renew the lease. Contenders do not steal a lock merely because a
+wall-clock lease elapsed while its PID is live; stale or malformed
+authoritative locks are identity-quarantined only after the corresponding
+conservative checks. Release verifies both the latest identity and token.
+
+Policy and `AGENTS.md` are each replaced by an `fsync`ed temp plus atomic rename
+and parent-directory `fsync`. They are not one cross-file transaction, so a
+process stop between the two files can temporarily leave contract drift; the
+next locked update reconciles all saved rules and Product Audit reports
+remaining drift.
 
 ### Local threat boundary
 
@@ -151,8 +175,9 @@ interval between a final identity check and a pathname operation.
 - Expired Review application leases become retryable without discarding
   persisted application intent; an item with application intent cannot be
   claimed for rejection.
-- Concurrent durable routing-rule writes are serialized across app processes;
-  policy and contract files are each replaced atomically.
+- Concurrent durable routing-rule writes and activation contract sync are
+  serialized across app processes; policy and contract files are each replaced
+  atomically.
 - Product audits and tests must cover every import writer and promotion path so
   new code cannot silently bypass safety evaluation.
 

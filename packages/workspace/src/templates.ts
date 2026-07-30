@@ -6,8 +6,8 @@ The app uses a code-enforced routing policy for filesystem writes. This contract
 - Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
 - Pending import notes are non-indexed under \`.app/import-staging/\`.
 - The Safety Kernel must approve every final import write.
-- Imported original files go to \`06-Attachments/Imports/<import-id>/\`.
-- Unclassified import candidates fall back to \`00-Inbox/Imports/<import-id>.md\` for user organization.
+- Imported original files go to \`06-Attachments/Imports/<batch-name>/\`.
+- Unclassified import candidates fall back to \`00-Inbox/Imports/<batch-name>.md\` for user organization.
 - Profile memory lives at \`02-Profiles/<profile-id>/Memory.md\`.
 - Profile finance records live under \`02-Personal/<profile-id>/Finance/\`.
 - Workspace decision records live at \`.vault/decisions/<decision-id>.md\`.

@@ -7,6 +7,7 @@ import {
   readdir,
   rename,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -96,9 +97,52 @@ describe("durable import promotion", () => {
       await expect(readFile(path.join(setup.root, setup.intent.finalPath), "utf8")).resolves.toBe(setup.body);
       await expect(access(path.join(setup.root, setup.intent.stagingPath))).rejects.toMatchObject({ code: "ENOENT" });
     }
+  }, 10_000);
+
+  it("uses finalTemp identity to roll back a hard-linked final when staging is replaced before final recording", async () => {
+    const setup = await promotionSetup();
+    const stagingPath = path.join(setup.root, setup.intent.stagingPath);
+    const replacementBody = `${setup.body}\nReplacement staging authority.\n`;
+    let injected = false;
+
+    await expect(promoteImportArtifact({
+      ...setup.intent,
+      ioHooks: {
+        afterPathSnapshot: async (operation) => {
+          if (operation !== "final_create_published_verify" || injected) {
+            return;
+          }
+          injected = true;
+          await rename(stagingPath, `${stagingPath}.previous`);
+          await writeFile(stagingPath, replacementBody, "utf8");
+          throw new Error("crash in final hard-link recording window");
+        },
+      },
+    })).rejects.toThrow("crash in final hard-link recording window");
+
+    expect(injected).toBe(true);
+    await expect(readFile(path.join(setup.root, setup.intent.finalPath), "utf8")).resolves.toBe(
+      setup.body,
+    );
+    const journal = await readOnlyFinalJournal(setup.root);
+    expect(journal).toEqual(expect.objectContaining({
+      phase: "final_temp_synced",
+      finalTemp: expect.objectContaining({
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+      }),
+    }));
+    expect(journal).not.toHaveProperty("final");
+
+    await expect(recoverImportPromotions(setup.root)).resolves.toBeUndefined();
+
+    await expect(access(path.join(setup.root, setup.intent.finalPath))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(stagingPath, "utf8")).resolves.toBe(replacementBody);
   });
 
-  it("quarantines malformed journals without blocking valid recovery and cleans temp journals", async () => {
+  it("quarantines malformed journals and conservatively stale temp journals", async () => {
     const setup = await promotionSetup();
     await expect(promoteImportArtifact({
       ...setup.intent,
@@ -112,15 +156,59 @@ describe("durable import promotion", () => {
     })).rejects.toThrow("leave valid journal");
     const journalDir = path.join(setup.root, ".app/import-promotion-journal");
     await writeFile(path.join(journalDir, "broken.json"), "{not-json", "utf8");
-    await writeFile(path.join(journalDir, ".partial.json.123.tmp"), "partial", "utf8");
+    const staleTemp = path.join(journalDir, ".partial.json.123.tmp");
+    await writeFile(staleTemp, "partial", "utf8");
+    await utimes(staleTemp, new Date(0), new Date(0));
 
     await expect(recoverImportPromotions(setup.root)).resolves.toBeUndefined();
 
     await expect(readFile(path.join(setup.root, setup.intent.finalPath), "utf8")).resolves.toBe(setup.body);
     const names = await journalFiles(setup.root);
     expect(names.some((name) => name.includes("broken.json") && name.includes("malformed"))).toBe(true);
-    expect(names.some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(names.some((name) => name.endsWith(".stale-temp"))).toBe(true);
     expect(names.some((name) => name.endsWith(".json"))).toBe(false);
+  });
+
+  it("does not remove another process's active journal temp before rename", async () => {
+    const setup = await promotionSetup();
+    const tempReady = deferred<void>();
+    const releaseRename = deferred<void>();
+    let paused = false;
+    const promotion = promoteImportArtifact({
+      ...setup.intent,
+      ioHooks: {
+        afterPathSnapshot: async (operation, targetPath) => {
+          if (
+            operation !== "journal_create"
+            || !targetPath.endsWith(".json")
+            || paused
+          ) {
+            return;
+          }
+          paused = true;
+          tempReady.resolve();
+          await releaseRename.promise;
+        },
+      },
+    });
+
+    await tempReady.promise;
+    const journalDir = path.join(setup.root, ".app/import-promotion-journal");
+    const [activeTemp] = (await readdir(journalDir)).filter((name) =>
+      name.endsWith(".tmp"));
+    expect(activeTemp).toBeDefined();
+
+    await expect(recoverImportPromotions(setup.root)).resolves.toBeUndefined();
+    await expect(readFile(path.join(journalDir, activeTemp!), "utf8")).resolves.toContain(
+      "\"transactionId\"",
+    );
+
+    releaseRename.resolve();
+    await expect(promotion).resolves.toEqual({
+      final: expect.objectContaining({
+        sha256: createHash("sha256").update(setup.body).digest("hex"),
+      }),
+    });
   });
 
   it.each(["edited", "replaced"] as const)(
@@ -317,4 +405,15 @@ async function readOnlyFinalJournal(root: string): Promise<Record<string, unknow
   const finalJournals = (await readdir(journalDir)).filter((name) => name.endsWith(".json"));
   expect(finalJournals).toHaveLength(1);
   return JSON.parse(await readFile(path.join(journalDir, finalJournals[0]!), "utf8")) as Record<string, unknown>;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }

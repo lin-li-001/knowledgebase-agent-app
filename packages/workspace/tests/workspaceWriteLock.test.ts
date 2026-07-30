@@ -1,4 +1,13 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -16,14 +25,17 @@ describe("workspace write lock", () => {
     const targetPath = path.join(root, ".vault/routing-policy.json");
     await mkdir(path.dirname(targetPath), { recursive: true });
     await writeFile(targetPath, '{"rules":[]}\n', "utf8");
+    const alias = `${root}-alias`;
+    await symlink(root, alias, "dir");
     const firstClient = createWorkspaceWriteLockClient();
     const secondClient = createWorkspaceWriteLockClient();
 
     const appendRule = async (
       client: ReturnType<typeof createWorkspaceWriteLockClient>,
+      workspaceRoot: string,
       id: string,
       pauseMs: number,
-    ) => client.withLock(root, async (canonicalRoot) => {
+    ) => client.withLock(workspaceRoot, async (canonicalRoot) => {
       const canonicalTargetPath = path.join(
         canonicalRoot,
         ".vault/routing-policy.json",
@@ -50,8 +62,8 @@ describe("workspace write lock", () => {
     });
 
     await Promise.all([
-      appendRule(firstClient, "first", 50),
-      appendRule(secondClient, "second", 0),
+      appendRule(firstClient, root, "first", 50),
+      appendRule(secondClient, alias, "second", 0),
     ]);
 
     const result = JSON.parse(await readFile(targetPath, "utf8")) as {
@@ -72,8 +84,9 @@ describe("workspace write lock", () => {
       `${JSON.stringify({
         version: 1,
         token: "expired-owner",
-        pid: 123,
+        pid: 999_999,
         createdAt: "2000-01-01T00:00:00.000Z",
+        heartbeatAt: "2000-01-01T00:00:00.000Z",
         leaseUntil: "2000-01-01T00:00:01.000Z",
       })}\n`,
       "utf8",
@@ -91,6 +104,120 @@ describe("workspace write lock", () => {
 
     expect(ran).toBe(true);
     await expect(secureWorkspacePathExists(root, lockPath)).resolves.toBe(false);
+  });
+
+  it("releases the filesystem lock when an operation throws synchronously", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const firstClient = createWorkspaceWriteLockClient();
+    const secondClient = createWorkspaceWriteLockClient();
+
+    await expect(firstClient.withLock(root, () => {
+      throw new Error("synchronous operation failure");
+    })).rejects.toThrow("synchronous operation failure");
+
+    let acquired = false;
+    await secondClient.withLock(root, async () => {
+      acquired = true;
+    }, {
+      retryDelayMs: 5,
+      timeoutMs: 250,
+    });
+    expect(acquired).toBe(true);
+  });
+
+  it("does not release a replacement lock with a different identity and token", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const lockPath = path.join(root, workspaceWriteLockRelativePath);
+    const client = createWorkspaceWriteLockClient();
+    const replacement = {
+      version: 1,
+      token: "replacement-owner",
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    await expect(client.withLock(root, async () => {
+      await rename(lockPath, `${lockPath}.previous-owner`);
+      await writeFile(lockPath, `${JSON.stringify(replacement)}\n`, "utf8");
+    })).rejects.toThrow();
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(
+      `${JSON.stringify(replacement)}\n`,
+    );
+  });
+
+  it("does not steal a live holder after the original lease interval", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const firstClient = createWorkspaceWriteLockClient();
+    const secondClient = createWorkspaceWriteLockClient();
+    let active = 0;
+    let maxActive = 0;
+    const hold = async (milliseconds: number) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await delay(milliseconds);
+      active -= 1;
+    };
+
+    const first = firstClient.withLock(root, async () => hold(140), {
+      leaseMs: 45,
+      retryDelayMs: 5,
+      timeoutMs: 2_500,
+    });
+    await delay(70);
+    const second = secondClient.withLock(root, async () => hold(5), {
+      leaseMs: 45,
+      retryDelayMs: 5,
+      timeoutMs: 2_500,
+    });
+    await Promise.all([first, second]);
+
+    expect(maxActive).toBe(1);
+  });
+
+  it("leaves a fresh partial lock temp untouched while acquiring a complete lock", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const appRoot = path.join(root, ".app");
+    await mkdir(appRoot, { recursive: true });
+    const activeTemp = path.join(
+      appRoot,
+      ".routing-policy.lock.active-token.partial.publish.tmp",
+    );
+    await writeFile(activeTemp, "{\"version\":1", "utf8");
+    const client = createWorkspaceWriteLockClient();
+
+    await client.withLock(root, async () => undefined);
+
+    await expect(readFile(activeTemp, "utf8")).resolves.toBe("{\"version\":1");
+  });
+
+  it("quarantines a malformed authoritative lock only after stale mtime", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const lockPath = path.join(root, workspaceWriteLockRelativePath);
+    await mkdir(path.dirname(lockPath), { recursive: true });
+    await writeFile(lockPath, "{\"version\":1", "utf8");
+    const client = createWorkspaceWriteLockClient();
+
+    await expect(client.withLock(root, async () => undefined, {
+      malformedStaleMs: 10_000,
+      retryDelayMs: 5,
+      timeoutMs: 250,
+    })).rejects.toThrow("Timed out waiting for workspace routing lock");
+
+    await utimes(lockPath, new Date(0), new Date(0));
+    await expect(client.withLock(root, async () => undefined, {
+      malformedStaleMs: 10_000,
+      retryDelayMs: 5,
+      timeoutMs: 250,
+    })).resolves.toBeUndefined();
+
+    const names = await readdir(path.dirname(lockPath));
+    expect(names.some((name) => (
+      name.includes("routing-policy.lock")
+      && name.endsWith(".malformed-lock")
+    ))).toBe(true);
   });
 });
 

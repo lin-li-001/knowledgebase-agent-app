@@ -12,7 +12,9 @@ The product has two places that describe where knowledge artifacts should go:
 
 For example, pending imported source notes go to
 `.app/import-staging/<import-id>/<source-stem>.md`, while original imported
-files go to `06-Attachments/Imports/<import-id>/`.
+files go to `06-Attachments/Imports/<batch-name>/`. Unclassified inbox
+fallback notes use `00-Inbox/Imports/<batch-name>.md`; an import ID identifies
+the staging transaction and does not replace the user-visible batch name.
 
 This creates an intentional mirror: users need to inspect the rule in plain
 language, while the app needs deterministic code to enforce the rule. If the two

@@ -80,6 +80,7 @@ interface SecureRemovalOptions extends SecureIoOptions {
 interface SecureAtomicWriteOptions extends SecureIoOptions {
   expectedArtifact?: SecureWorkspaceArtifactIdentity | undefined;
   requireAbsent?: boolean | undefined;
+  tempToken?: string | undefined;
   afterTempSync?(
     artifact: SecureWorkspaceArtifactIdentity,
   ): Promise<void>;
@@ -301,6 +302,7 @@ export async function securePublishWorkspaceFileAtomic(
     normalizedTarget,
     {
       operation: `${options.operation}_published_verify`,
+      hooks: options.hooks,
       expectedArtifact: {
         ...tempArtifact,
         targetPath: normalizedTarget,
@@ -355,6 +357,7 @@ export async function secureAtomicReplaceWorkspaceFile(
     normalizedTarget,
     {
       operation: `${options.operation}_published_verify`,
+      hooks: options.hooks,
       expectedArtifact: {
         ...tempArtifact,
         targetPath: normalizedTarget,
@@ -585,9 +588,10 @@ async function writeAtomicTemp(
   options: SecureAtomicWriteOptions,
   kind: string,
 ): Promise<SecureWorkspaceArtifactIdentity> {
+  const tempToken = normalizeTempToken(options.tempToken ?? randomUUID());
   const tempPath = path.join(
     path.dirname(targetPath),
-    `.${path.basename(targetPath)}.${randomUUID()}.${kind}.tmp`,
+    `.${path.basename(targetPath)}.${tempToken}.${randomUUID()}.${kind}.tmp`,
   );
   return secureWriteWorkspaceFileExclusive(
     workspaceRoot,
@@ -598,6 +602,11 @@ async function writeAtomicTemp(
       hooks: options.hooks,
     },
   );
+}
+
+function normalizeTempToken(token: string): string {
+  const normalized = token.replace(/[^a-zA-Z0-9_-]/gu, "-").slice(0, 128);
+  return normalized || "anonymous";
 }
 
 async function writeAll(

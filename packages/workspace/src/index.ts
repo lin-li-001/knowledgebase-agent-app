@@ -18,7 +18,11 @@ export { parseMarkdownDocument, parseMarkdownNote, serializeMarkdownDocument } f
 export { auditWorkspace } from "./workspaceAudit";
 export { defaultRoutingPolicy } from "./routingPolicy";
 export { importCandidateRoutingPolicy, importCandidateRoutingPrecedence } from "./importCandidateRoutingPolicy";
-export { createWorkspace, syncWorkspaceContract } from "./workspace";
+export {
+  createWorkspace,
+  syncWorkspaceContract,
+  syncWorkspaceContractLocked,
+} from "./workspace";
 export {
   createWorkspaceWriteLockClient,
   withWorkspaceWriteLock,
@@ -51,7 +55,10 @@ export type {
   SafetyDecision,
   SafetyReasonCode,
 } from "./importSafety";
-export type { WorkspaceInfo } from "./workspace";
+export type {
+  WorkspaceContractSyncOptions,
+  WorkspaceInfo,
+} from "./workspace";
 export type {
   WorkspaceWriteLockClient,
   WorkspaceWriteLockOptions,

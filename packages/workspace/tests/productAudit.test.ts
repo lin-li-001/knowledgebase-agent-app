@@ -119,6 +119,9 @@ describe("product audit", () => {
     expect(result.passes).toContain(
       "routing policy and AGENTS updates use the canonical cross-process workspace lock",
     );
+    expect(result.passes).toContain(
+      "journal and lock temp cleanup preserves active transaction ownership",
+    );
     expect(result.passes).toContain("import staging is documented as non-indexed");
     expect(result.passes).toContain("filesystem writers use routingPolicy instead of route literals");
     expect(result.passes).toContain("implementation repo has a docs/decisions decision mirror");
@@ -493,6 +496,115 @@ void withWorkspaceWriteLock;
     const result = await auditProductContracts({
       repoRoot,
       sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "routing policy and AGENTS updates are not protected by the canonical cross-process workspace lock",
+    );
+  });
+
+  it("rejects an activation sync lock decoy outside the real contract update", async () => {
+    const workspacePath = path.join(
+      repoRoot,
+      "packages/workspace/src/workspace.ts",
+    );
+    const workspaceSource = await readFile(workspacePath, "utf8");
+    const brokenWorkspaceSource = `${workspaceSource.replace(
+      "  await withWorkspaceWriteLock(\n    rootPath,",
+      "  await withoutActivationLock(\n    rootPath,",
+    )}
+async function withoutActivationLock<T>(
+  workspaceRoot: string,
+  operation: (canonicalRoot: string) => Promise<T>,
+): Promise<T> {
+  return operation(workspaceRoot);
+}
+void withWorkspaceWriteLock;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([
+        [workspacePath, brokenWorkspaceSource],
+      ]),
+    });
+
+    expect(result.failures).toContain(
+      "routing policy and AGENTS updates are not protected by the canonical cross-process workspace lock",
+    );
+  });
+
+  it("rejects a non-atomic activation AGENTS writer with an atomic token decoy", async () => {
+    const workspacePath = path.join(
+      repoRoot,
+      "packages/workspace/src/workspace.ts",
+    );
+    const workspaceSource = await readFile(workspacePath, "utf8");
+    const brokenWorkspaceSource = `${workspaceSource.replace(
+      "    await secureAtomicReplaceWorkspaceFile(\n      canonicalRoot,\n      contractPath,",
+      "    await unsafeContractWrite(\n      canonicalRoot,\n      contractPath,",
+    )}
+const unsafeContractWrite = async (
+  _workspaceRoot: string,
+  targetPath: string,
+  contents: string,
+): Promise<void> => writeFile(targetPath, contents, "utf8");
+void secureAtomicReplaceWorkspaceFile;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([
+        [workspacePath, brokenWorkspaceSource],
+      ]),
+    });
+
+    expect(result.failures).toContain(
+      "routing policy and AGENTS updates are not protected by the canonical cross-process workspace lock",
+    );
+  });
+
+  it("rejects active-transaction temp cleanup bypasses despite token decoys", async () => {
+    const promotionPath = path.join(
+      repoRoot,
+      "packages/workspace/src/importPromotion.ts",
+    );
+    const promotionSource = await readFile(promotionPath, "utf8");
+    const brokenPromotionSource = `${promotionSource.replace(
+      "journalTempBelongsToTransaction(journalName, transactionId)",
+      "false",
+    )}
+void journalTempBelongsToTransaction;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([
+        [promotionPath, brokenPromotionSource],
+      ]),
+    });
+
+    expect(result.failures).toContain(
+      "journal and lock temp cleanup is not transaction-owned or conservatively stale",
+    );
+  });
+
+  it("rejects a heartbeat token decoy that never renews the held lock", async () => {
+    const lockPath = path.join(
+      repoRoot,
+      "packages/workspace/src/workspaceWriteLock.ts",
+    );
+    const lockSource = await readFile(lockPath, "utf8");
+    const brokenLockSource = `${lockSource.replace(
+      "        await renewHeldLock(canonicalRoot, held, leaseMs, options);",
+      "        await Promise.resolve();",
+    )}
+void renewHeldLock;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[lockPath, brokenLockSource]]),
     });
 
     expect(result.failures).toContain(
@@ -965,7 +1077,7 @@ async function unsafeSecondPromotion(
     });
 
     expect(result.failures).toContain("final import writer is not gated on Safety Kernel auto_write: apps/desktop/electron/ipc.ts");
-  });
+  }, 10_000);
 
   it("fails when source code declares an import Review bypass field", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");

@@ -56,7 +56,10 @@ describe("createWorkspace", () => {
       "Each imported source note records `route_status` and `route_destination`",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
-      "Imported original files go to `06-Attachments/Imports/<import-id>/`",
+      "Imported original files go to `06-Attachments/Imports/<batch-name>/`",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "Unclassified import candidates fall back to `00-Inbox/Imports/<batch-name>.md`",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Import candidate routing precedence",
@@ -105,7 +108,7 @@ describe("createWorkspace", () => {
     const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
     await writeFile(
       path.join(rootPath, "AGENTS.md"),
-      "# Workspace Contract\n\n## Routing Policy\n\n- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.\n",
+      "# Workspace Contract\n\n## Routing Policy\n\n- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.\n- Imported original files go to `06-Attachments/Imports/<batch-name>/`.\n- Unclassified import candidates fall back to `00-Inbox/Imports/<batch-name>.md` for user organization.\n",
     );
 
     await createWorkspace(rootPath);
@@ -120,6 +123,14 @@ describe("createWorkspace", () => {
     expect(contract).not.toContain(
       "04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review",
     );
+    expect(contract).toContain(
+      "Imported original files go to `06-Attachments/Imports/<batch-name>/`",
+    );
+    expect(contract).toContain(
+      "Unclassified import candidates fall back to `00-Inbox/Imports/<batch-name>.md`",
+    );
+    expect(contract).not.toContain("06-Attachments/Imports/<import-id>/");
+    expect(contract).not.toContain("00-Inbox/Imports/<import-id>.md");
   });
 
   it("replaces the legacy target-only precedence with category and destination precedence", async () => {
