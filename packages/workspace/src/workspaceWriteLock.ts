@@ -186,18 +186,58 @@ async function renewHeldLock(
     heartbeatAt: heartbeatAt.toISOString(),
     leaseUntil: new Date(heartbeatAt.getTime() + leaseMs).toISOString(),
   };
-  held.artifact = await secureAtomicReplaceWorkspaceFile(
-    canonicalRoot,
-    held.artifact.targetPath,
-    serializeLockRecord(nextRecord),
-    {
-      operation: "workspace_lock_heartbeat",
-      hooks: options.ioHooks,
-      expectedArtifact: held.artifact,
-      tempToken: held.record.token,
-    },
-  );
-  held.record = nextRecord;
+  try {
+    held.artifact = await secureAtomicReplaceWorkspaceFile(
+      canonicalRoot,
+      held.artifact.targetPath,
+      serializeLockRecord(nextRecord),
+      {
+        operation: "workspace_lock_heartbeat",
+        hooks: options.ioHooks,
+        expectedArtifact: held.artifact,
+        tempToken: held.record.token,
+      },
+    );
+    held.record = nextRecord;
+  } catch (error) {
+    const reconciled = await reconcilePublishedHeartbeat(
+      canonicalRoot,
+      held,
+      options,
+    );
+    if (!reconciled) {
+      throw error;
+    }
+    held.artifact = reconciled.artifact;
+    held.record = reconciled.record;
+  }
+}
+
+async function reconcilePublishedHeartbeat(
+  canonicalRoot: string,
+  held: HeldLock,
+  options: WorkspaceWriteLockOptions,
+): Promise<HeldLock | undefined> {
+  try {
+    const current = await secureReadWorkspaceArtifact(
+      canonicalRoot,
+      held.artifact.targetPath,
+      {
+        operation: "workspace_lock_heartbeat_reconcile",
+        hooks: options.ioHooks,
+      },
+    );
+    const currentRecord = parseLockRecord(current.contents.toString("utf8"));
+    if (
+      currentRecord.token !== held.record.token
+      || sameArtifactVersion(current.artifact, held.artifact)
+    ) {
+      return undefined;
+    }
+    return { artifact: current.artifact, record: currentRecord };
+  } catch {
+    return undefined;
+  }
 }
 
 async function releaseHeldLock(
@@ -211,7 +251,6 @@ async function releaseHeldLock(
     {
       operation: "workspace_lock_release_read",
       hooks: options.ioHooks,
-      expectedArtifact: held.artifact,
     },
   );
   const currentRecord = parseLockRecord(current.contents.toString("utf8"));
@@ -429,7 +468,9 @@ function parseLockRecord(raw: string): LockRecord {
     || value.token.length === 0
     || !("pid" in value)
     || typeof value.pid !== "number"
+    || !Number.isInteger(value.pid)
     || !Number.isSafeInteger(value.pid)
+    || value.pid <= 0
     || !("createdAt" in value)
     || typeof value.createdAt !== "string"
     || !isIsoDate(value.createdAt)
@@ -481,6 +522,15 @@ function isMissingPathError(error: unknown): boolean {
 function isTransientIdentityError(error: unknown): boolean {
   return error instanceof Error
     && /identity changed|hash changed/iu.test(error.message);
+}
+
+function sameArtifactVersion(
+  left: SecureWorkspaceArtifactIdentity,
+  right: SecureWorkspaceArtifactIdentity,
+): boolean {
+  return left.fileDev === right.fileDev
+    && left.fileIno === right.fileIno
+    && left.sha256 === right.sha256;
 }
 
 function isProcessAlive(pid: number): boolean {

@@ -169,7 +169,7 @@ describe("durable import promotion", () => {
     expect(names.some((name) => name.endsWith(".json"))).toBe(false);
   });
 
-  it("does not remove another process's active journal temp before rename", async () => {
+  it("preserves an old journal temp while its recorded owner PID is alive", async () => {
     const setup = await promotionSetup();
     const tempReady = deferred<void>();
     const releaseRename = deferred<void>();
@@ -196,19 +196,50 @@ describe("durable import promotion", () => {
     const journalDir = path.join(setup.root, ".app/import-promotion-journal");
     const [activeTemp] = (await readdir(journalDir)).filter((name) =>
       name.endsWith(".tmp"));
-    expect(activeTemp).toBeDefined();
+    try {
+      expect(activeTemp).toBeDefined();
+      expect(activeTemp).toMatch(
+        new RegExp(`__p${process.pid}__i[0-9a-f-]{36}__c\\d+`, "u"),
+      );
+      await utimes(
+        path.join(journalDir, activeTemp!),
+        new Date(0),
+        new Date(0),
+      );
+
+      await expect(recoverImportPromotions(setup.root)).resolves.toBeUndefined();
+      await expect(readFile(path.join(journalDir, activeTemp!), "utf8")).resolves.toContain(
+        "\"transactionId\"",
+      );
+    } finally {
+      releaseRename.resolve();
+      await expect(promotion).resolves.toEqual({
+        final: expect.objectContaining({
+          sha256: createHash("sha256").update(setup.body).digest("hex"),
+        }),
+      });
+    }
+  });
+
+  it("identity-quarantines an old journal temp whose recorded owner PID is dead", async () => {
+    const setup = await promotionSetup();
+    const journalDir = path.join(setup.root, ".app/import-promotion-journal");
+    await mkdir(journalDir, { recursive: true });
+    const transactionId = "11111111-1111-4111-8111-111111111111";
+    const processInstance = "22222222-2222-4222-8222-222222222222";
+    const staleTempName = `.${transactionId}.json.${transactionId}__p999999__i${processInstance}__c1.33333333-3333-4333-8333-333333333333.replace.tmp`;
+    const staleTempPath = path.join(journalDir, staleTempName);
+    await writeFile(staleTempPath, "partial pre-journal bytes", "utf8");
+    await utimes(staleTempPath, new Date(0), new Date(0));
 
     await expect(recoverImportPromotions(setup.root)).resolves.toBeUndefined();
-    await expect(readFile(path.join(journalDir, activeTemp!), "utf8")).resolves.toContain(
-      "\"transactionId\"",
-    );
 
-    releaseRename.resolve();
-    await expect(promotion).resolves.toEqual({
-      final: expect.objectContaining({
-        sha256: createHash("sha256").update(setup.body).digest("hex"),
-      }),
-    });
+    await expect(access(staleTempPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const names = await journalFiles(setup.root);
+    expect(names.some((name) => (
+      name.includes(transactionId)
+      && name.endsWith(".stale-temp")
+    ))).toBe(true);
   });
 
   it.each(["edited", "replaced"] as const)(

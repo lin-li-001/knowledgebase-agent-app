@@ -86,12 +86,13 @@ Auto-write promotion is source-bound and recorded in a durable journal under
 path, hash, device, and inode; the expected final body hash; and the final
 device and inode after publication. Journal creation and phase updates write a
 unique exclusive temp file in the journal directory whose name includes the
-transaction ID, complete and `fsync` that file, rename it atomically, and
-`fsync` the directory. Recovery does not remove a fresh or active transaction
-temp. It cleans a temp explicitly referenced by its owned journal, or
-identity-quarantines an unreferenced temp only after a conservative stale
-grace. A malformed final journal is quarantined without preventing other valid
-journals from being processed.
+transaction ID, positive owner PID, process-instance token, and creation time,
+complete and `fsync` that file, rename it atomically, and `fsync` the directory.
+Recovery does not age-quarantine a temp while its recorded owner PID is live.
+If the owner is dead or its metadata is malformed, recovery
+identity-quarantines the temp only after a conservative stale grace. A
+malformed final journal is quarantined without preventing other valid journals
+from being processed.
 
 An authoritative final path is never written incrementally. Promotion writes
 and verifies a temp file in the canonical destination parent, `fsync`s it,
@@ -118,11 +119,14 @@ application selected destination A and routing options A, every retry ignores
 conflicting request options and replays the persisted destination, category,
 saved-rule choice, and rule pattern for apply, saved-rule output, and activity.
 Incoming options create only the first application intent. The UI initializes
-its controls from that intent and labels the action Resume. Persisted intent
-also removes Reject and clear-intent authority, and the storage claim for
-rejection fails closed. If final A was published but staging retirement or
-later work failed, a retry verifies and completes A rather than writing
-override B. A mismatch fails closed.
+its controls from that intent and labels the action Resume. Approval and
+rejection requests refresh Review state even when the request fails, and a new
+persisted application version resets the form without overwriting edits during
+equivalent same-version renders. Persisted intent also removes Reject and
+clear-intent authority, and the storage claim for rejection fails closed. If
+final A was published but staging retirement or later work failed, a retry
+verifies and completes A rather than writing override B. A mismatch fails
+closed.
 
 Durable routing-rule updates canonicalize the workspace with `realpath` and
 hold a workspace-local `.app/routing-policy.lock` across policy, `AGENTS.md`,
@@ -134,10 +138,14 @@ Lock metadata is first written completely to a token-named exclusive temp,
 `fsync`ed, and exclusively hard-linked to the absent authoritative lock path.
 It contains a random token, PID, creation timestamp, heartbeat timestamp, and
 lease expiry. While held, identity- and token-checked atomic heartbeat
-replacements renew the lease. Contenders do not steal a lock merely because a
-wall-clock lease elapsed while its PID is live; stale or malformed
-authoritative locks are identity-quarantined only after the corresponding
-conservative checks. Release verifies both the latest identity and token.
+replacements renew the lease. If a heartbeat's new inode is published but its
+verification reports an error before the in-memory identity advances, the
+holder re-reads the authoritative lock and adopts that inode only when its
+token still matches. Release likewise re-reads and removes the current
+same-token identity; another token is never removed. Lock PIDs must be positive
+integers. Contenders do not steal a lock merely because a wall-clock lease
+elapsed while its PID is live; stale or malformed authoritative locks are
+identity-quarantined only after the corresponding conservative checks.
 
 Policy and `AGENTS.md` are each replaced by an `fsync`ed temp plus atomic rename
 and parent-directory `fsync`. They are not one cross-file transaction, so a
@@ -155,6 +163,12 @@ and the tested crash windows, and they prefer leaving or quarantining an
 artifact when ownership cannot be proved. They do not claim protection from a
 malicious process with the same filesystem permissions that wins the remaining
 interval between a final identity check and a pathname operation.
+
+A reused live PID can conservatively preserve a stale pre-journal temp that
+belongs to an older process instance. This is an intentional fail-closed leak:
+the process-instance token records the distinction, but without an
+OS-authenticated process birth identity recovery does not delete solely on that
+comparison.
 
 ## Consequences
 

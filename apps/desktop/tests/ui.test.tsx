@@ -304,6 +304,223 @@ describe("desktop shell", () => {
     });
   });
 
+  it("reinitializes Resume controls only when the persisted application version changes", async () => {
+    const item = {
+      id: "review-versioned-application",
+      state: "failed",
+      proposalType: "propose_create_note",
+      risk: "high",
+      reason: "Previous approval stopped after prepare.",
+      targetPath: "04-Resources/Imports/Utility Bill.md",
+      payload: {
+        sourceNotePath: ".app/import-staging/import-1/Utility Bill.md",
+        destination: "04-Resources/Imports/Utility Bill.md",
+        sourceFile: "Utility Bill.pdf",
+        classification: {
+          primaryCategory: "finance.utility",
+          alternativeCategories: [],
+          sensitivity: "personal",
+          confidence: 0.8,
+          evidence: ["Amount due"],
+          signals: [],
+          conflict: false,
+        },
+        safetyDecision: {
+          decision: "review_required",
+          reasonCodes: ["CATEGORY_REQUIRES_REVIEW"],
+        },
+      },
+      application: {
+        kind: "import_move",
+        transactionId: "application-v1",
+        destination: "04-Resources/Approved/A.md",
+        options: {
+          targetPathOverride: "04-Resources/Approved/A.md",
+          categoryOverride: "resource",
+          saveAsRoutingRule: true,
+          routingRulePattern: "application a",
+        },
+      },
+    };
+    const { rerender } = render(<ReviewItemCard item={item} />);
+
+    fireEvent.change(screen.getByLabelText("Destination"), {
+      target: { value: "04-Resources/Unsaved/User Edit.md" },
+    });
+    fireEvent.change(screen.getByLabelText("Category"), {
+      target: { value: "unknown" },
+    });
+    fireEvent.click(screen.getByLabelText("Save as future routing rule"));
+
+    rerender(
+      <ReviewItemCard
+        item={{
+          ...item,
+          application: {
+            ...item.application,
+            options: { ...item.application.options },
+          },
+        }}
+      />,
+    );
+    expect(screen.getByLabelText("Destination")).toHaveValue(
+      "04-Resources/Unsaved/User Edit.md",
+    );
+    expect(screen.getByLabelText("Category")).toHaveValue("unknown");
+    expect(screen.getByLabelText("Save as future routing rule")).not.toBeChecked();
+
+    rerender(
+      <ReviewItemCard
+        item={{
+          ...item,
+          application: {
+            kind: "import_move",
+            transactionId: "application-v2",
+            destination: "04-Resources/Approved/C.md",
+            options: {
+              targetPathOverride: "04-Resources/Approved/C.md",
+              categoryOverride: "project.document",
+              saveAsRoutingRule: true,
+              routingRulePattern: "application c",
+            },
+          },
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Destination")).toHaveValue(
+        "04-Resources/Approved/C.md",
+      );
+      expect(screen.getByLabelText("Category")).toHaveValue("project.document");
+      expect(screen.getByLabelText("Save as future routing rule")).toBeChecked();
+      expect(screen.getByLabelText("Routing rule pattern")).toHaveValue(
+        "application c",
+      );
+    });
+  });
+
+  it("refreshes a failed approval into persisted Resume state", async () => {
+    const proposedItem = {
+      id: "review-refresh-after-failure",
+      state: "proposed",
+      proposalType: "propose_create_note",
+      risk: "high",
+      reason: "Imported note requires Review.",
+      targetPath: "04-Resources/Imports/Utility Bill.md",
+      payload: {
+        sourceNotePath: ".app/import-staging/import-1/Utility Bill.md",
+        destination: "04-Resources/Imports/Utility Bill.md",
+        sourceFile: "Utility Bill.pdf",
+        classification: {
+          primaryCategory: "finance.utility",
+          alternativeCategories: [],
+          sensitivity: "personal",
+          confidence: 0.8,
+          evidence: ["Amount due"],
+          signals: [],
+          conflict: false,
+        },
+        safetyDecision: {
+          decision: "review_required",
+          reasonCodes: ["CATEGORY_REQUIRES_REVIEW"],
+        },
+      },
+    };
+    const persistedDestination = "04-Resources/Approved/Persisted A.md";
+    let approvalFailed = false;
+    window.kbAgent = {
+      invoke: vi.fn(async (channel, input) => {
+        if (channel === "workspace:get-active") {
+          return {
+            ok: true,
+            data: {
+              rootPath: "/tmp/kb",
+              workspaceId: "workspace-1",
+              sessionId: "session-1",
+            },
+          };
+        }
+        if (channel === "settings:get") {
+          return { ok: true, data: { hasApiKey: false, modelName: "mock" } };
+        }
+        if (channel === "activity:list") {
+          return { ok: true, data: [] };
+        }
+        if (channel === "workspace:tree") {
+          return {
+            ok: true,
+            data: { name: "kb", path: "", type: "directory", children: [] },
+          };
+        }
+        if (channel === "review:list") {
+          return {
+            ok: true,
+            data: [
+              approvalFailed
+                ? {
+                  ...proposedItem,
+                  state: "failed",
+                  failureReason: "simulated approval crash",
+                  application: {
+                    kind: "import_move",
+                    transactionId: "application-a",
+                    destination: persistedDestination,
+                    options: {
+                      targetPathOverride: persistedDestination,
+                      categoryOverride: "resource",
+                      saveAsRoutingRule: true,
+                      routingRulePattern: "persisted utility",
+                    },
+                  },
+                }
+                : proposedItem,
+            ],
+          };
+        }
+        if (channel === "review:approve") {
+          expect(input).toEqual({
+            id: proposedItem.id,
+            targetPathOverride: persistedDestination,
+            categoryOverride: "resource",
+            saveAsRoutingRule: true,
+            routingRulePattern: "persisted utility",
+          });
+          approvalFailed = true;
+          return { ok: false, error: "simulated approval crash" };
+        }
+        return { ok: true, data: null };
+      }),
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    fireEvent.change(await screen.findByLabelText("Destination"), {
+      target: { value: persistedDestination },
+    });
+    fireEvent.change(screen.getByLabelText("Category"), {
+      target: { value: "resource" },
+    });
+    fireEvent.click(screen.getByLabelText("Save as future routing rule"));
+    fireEvent.change(screen.getByLabelText("Routing rule pattern"), {
+      target: { value: "persisted utility" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    expect(await screen.findByRole("button", {
+      name: "Resume approval",
+    })).toBeEnabled();
+    expect(screen.getByLabelText("Destination")).toHaveValue(
+      persistedDestination,
+    );
+    expect(screen.getByLabelText("Category")).toHaveValue("resource");
+    expect(screen.getByLabelText("Save as future routing rule")).toBeChecked();
+    expect(screen.getByLabelText("Routing rule pattern")).toHaveValue(
+      "persisted utility",
+    );
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
+  });
+
   it("disables Review actions while an approval is pending and prevents duplicate requests", async () => {
     let resolveApproval: (() => void) | undefined;
     const approve = vi.fn(() => new Promise<void>((resolve) => {

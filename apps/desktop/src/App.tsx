@@ -258,12 +258,21 @@ export function App() {
       return;
     }
 
-    const result = await api.invoke(channel, { id, ...(options ?? {}) });
-    if (!result.ok) {
-      setError(result.error);
-      return;
+    setError(null);
+    try {
+      const result = await api.invoke(channel, { id, ...(options ?? {}) });
+      if (!result.ok) {
+        setError(result.error);
+      }
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Review request failed.",
+      );
+    } finally {
+      await refreshPanels();
     }
-    await refreshPanels();
   }
 
   async function readWorkspaceFile(filePath: string) {

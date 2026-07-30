@@ -177,6 +177,38 @@ describe("workspace write lock", () => {
     expect(maxActive).toBe(1);
   });
 
+  it("reconciles a heartbeat published-verify fault and releases the published lock", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+    const firstClient = createWorkspaceWriteLockClient();
+    const secondClient = createWorkspaceWriteLockClient();
+    let injected = false;
+
+    await expect(firstClient.withLock(root, async () => {
+      await delay(90);
+    }, {
+      leaseMs: 45,
+      retryDelayMs: 5,
+      timeoutMs: 1_000,
+      ioHooks: {
+        afterPathSnapshot: async (operation) => {
+          if (
+            operation === "workspace_lock_heartbeat_published_verify"
+            && !injected
+          ) {
+            injected = true;
+            throw new Error("heartbeat verify fault");
+          }
+        },
+      },
+    })).resolves.toBeUndefined();
+
+    expect(injected).toBe(true);
+    await expect(secondClient.withLock(root, async () => "acquired", {
+      retryDelayMs: 5,
+      timeoutMs: 500,
+    })).resolves.toBe("acquired");
+  });
+
   it("leaves a fresh partial lock temp untouched while acquiring a complete lock", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
     const appRoot = path.join(root, ".app");
@@ -219,6 +251,41 @@ describe("workspace write lock", () => {
       && name.endsWith(".malformed-lock")
     ))).toBe(true);
   });
+
+  it.each([0, -1])(
+    "quarantines an expired lock with malformed pid %s after the stale grace",
+    async (pid) => {
+      const root = await mkdtemp(path.join(tmpdir(), "kb-workspace-lock-"));
+      const lockPath = path.join(root, workspaceWriteLockRelativePath);
+      await mkdir(path.dirname(lockPath), { recursive: true });
+      await writeFile(
+        lockPath,
+        `${JSON.stringify({
+          version: 1,
+          token: `invalid-pid-${pid}`,
+          pid,
+          createdAt: "2000-01-01T00:00:00.000Z",
+          heartbeatAt: "2000-01-01T00:00:00.000Z",
+          leaseUntil: "2000-01-01T00:00:01.000Z",
+        })}\n`,
+        "utf8",
+      );
+      await utimes(lockPath, new Date(0), new Date(0));
+      const client = createWorkspaceWriteLockClient();
+
+      await expect(client.withLock(root, async () => undefined, {
+        malformedStaleMs: 10,
+        retryDelayMs: 5,
+        timeoutMs: 500,
+      })).resolves.toBeUndefined();
+
+      const names = await readdir(path.dirname(lockPath));
+      expect(names.some((name) => (
+        name.includes("routing-policy.lock")
+        && name.endsWith(".malformed-lock")
+      ))).toBe(true);
+    },
+  );
 });
 
 function delay(milliseconds: number): Promise<void> {

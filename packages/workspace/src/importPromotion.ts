@@ -91,6 +91,14 @@ interface JournalHandle {
   journal: ImportPromotionJournal;
 }
 
+interface JournalTempOwner {
+  pid: number;
+  processInstanceToken: string;
+  createdAtMs: number;
+}
+
+const journalProcessInstanceToken = randomUUID();
+
 export async function promoteImportArtifact(
   input: PromoteImportArtifactInput,
 ): Promise<ImportPromotionResult> {
@@ -376,7 +384,7 @@ async function createPromotionJournal(
       operation: "journal_create",
       hooks: promotionJournalHooks(input.ioHooks, input.hooks),
       requireAbsent: true,
-      tempToken: journal.transactionId,
+      tempToken: journalTempToken(journal.transactionId),
     },
   );
   return { path: journalPath, artifact, journal };
@@ -740,7 +748,7 @@ async function persistJournal(
       operation: "journal_update",
       hooks: ioHooks,
       expectedArtifact: handle.artifact,
-      tempToken: handle.journal.transactionId,
+      tempToken: journalTempToken(handle.journal.transactionId),
     },
   );
 }
@@ -785,11 +793,21 @@ async function cleanupJournalTemp(
       { operation: "journal_temp_read", hooks: ioHooks },
     );
     const metadata = await lstat(snapshot.artifact.targetPath);
+    const owner = parseJournalTempOwner(path.basename(journalPath));
     if (
       metadata.dev !== snapshot.artifact.fileDev
       || metadata.ino !== snapshot.artifact.fileIno
-      || Date.now() - metadata.mtimeMs < journalTempStaleGraceMs
     ) {
+      return;
+    }
+    if (owner && isProcessAlive(owner.pid)) {
+      return;
+    }
+    const newestKnownCreation = Math.max(
+      metadata.mtimeMs,
+      owner?.createdAtMs ?? 0,
+    );
+    if (Date.now() - newestKnownCreation < journalTempStaleGraceMs) {
       return;
     }
     await secureQuarantineWorkspaceArtifact(
@@ -1082,11 +1100,48 @@ function isJournalTempName(name: string): boolean {
 
 const journalTempStaleGraceMs = 5 * 60 * 1000;
 
+function journalTempToken(transactionId: string): string {
+  if (!Number.isInteger(process.pid) || process.pid <= 0) {
+    throw new Error("Import promotion journal owner PID is invalid");
+  }
+  return `${transactionId}__p${process.pid}__i${journalProcessInstanceToken}__c${Date.now()}`;
+}
+
+function parseJournalTempOwner(name: string): JournalTempOwner | undefined {
+  const match = /__p(-?\d+)__i([0-9a-f-]{36})__c(\d+)\./iu.exec(name);
+  if (!match) {
+    return undefined;
+  }
+  const pid = Number(match[1]);
+  const processInstanceToken = match[2]!;
+  const createdAtMs = Number(match[3]);
+  if (
+    !Number.isInteger(pid)
+    || pid <= 0
+    || !Number.isSafeInteger(createdAtMs)
+    || createdAtMs <= 0
+  ) {
+    return undefined;
+  }
+  return { pid, processInstanceToken, createdAtMs };
+}
+
 function journalTempBelongsToTransaction(
   name: string,
   transactionId: string,
 ): boolean {
   return name.includes(`.${transactionId}.`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error
+      && "code" in error
+      && error.code === "EPERM";
+  }
 }
 
 function isRecordedArtifact(value: unknown): value is RecordedArtifact {

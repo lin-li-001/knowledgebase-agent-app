@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ContentCategory } from "@kb-agent/workspace";
 
 const contentCategories = [
@@ -67,8 +67,34 @@ export function ReviewItemCard({
   const [routingRulePattern, setRoutingRulePattern] = useState(
     persistedApplication.options.routingRulePattern ?? "",
   );
+  const applicationVersion = reviewApplicationVersion(item);
+  const renderedApplicationVersion = useRef(applicationVersion);
   const [requestPending, setRequestPending] = useState(false);
   const requestInFlight = useRef(false);
+
+  useEffect(() => {
+    if (renderedApplicationVersion.current === applicationVersion) {
+      return;
+    }
+    renderedApplicationVersion.current = applicationVersion;
+    setDestination(editableDestination ?? "");
+    setCategory(
+      persistedApplication.options.categoryOverride ?? importDetails?.category,
+    );
+    setSaveAsRoutingRule(
+      persistedApplication.options.saveAsRoutingRule ?? false,
+    );
+    setRoutingRulePattern(
+      persistedApplication.options.routingRulePattern ?? "",
+    );
+  }, [
+    applicationVersion,
+    editableDestination,
+    importDetails?.category,
+    persistedApplication.options.categoryOverride,
+    persistedApplication.options.routingRulePattern,
+    persistedApplication.options.saveAsRoutingRule,
+  ]);
 
   async function approve() {
     if (!onApprove || requestInFlight.current) {
@@ -280,6 +306,28 @@ function persistedApprovalOptions(
       ? { routingRulePattern: value.routingRulePattern }
       : {}),
   };
+}
+
+function reviewApplicationVersion(item: ReviewCardItem): string {
+  return `${item.id}:${stableValueSignature(item.application)}`;
+}
+
+function stableValueSignature(value: unknown): string {
+  if (value === undefined) {
+    return "undefined";
+  }
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableValueSignature).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableValueSignature(
+      (value as Record<string, unknown>)[key],
+    )}`)
+    .join(",")}}`;
 }
 
 function reviewTitle(item: ReviewCardItem): string {
