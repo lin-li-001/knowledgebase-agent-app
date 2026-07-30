@@ -52,7 +52,9 @@ function expectSourceOverrideToTypecheck(sourcePath: string, source: string): vo
     host: compilerHost,
   });
 
-  expect(ts.getPreEmitDiagnostics(program)).toEqual([]);
+  const diagnostics = ts.getPreEmitDiagnostics(program).map((diagnostic) =>
+    ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"));
+  expect(diagnostics).toEqual([]);
 }
 
 function importerWriterFixture(
@@ -106,7 +108,16 @@ describe("product audit", () => {
     expect(result.passes).toContain("import candidate routing precedence is implemented");
     expect(result.passes).toContain("final import writes invoke the Safety Kernel");
     expect(result.passes).toContain(
-      "initial import attachment, staging, and final writes use hardened workspace IO",
+      "initial import attachment, staging, journal, and final writes use hardened workspace IO",
+    );
+    expect(result.passes).toContain(
+      "secure import extraction consumes identity-verified copied attachment bytes",
+    );
+    expect(result.passes).toContain(
+      "import rollback and retirement cleanup are identity-bound quarantine operations",
+    );
+    expect(result.passes).toContain(
+      "routing policy and AGENTS updates use the canonical cross-process workspace lock",
     );
     expect(result.passes).toContain("import staging is documented as non-indexed");
     expect(result.passes).toContain("filesystem writers use routingPolicy instead of route literals");
@@ -138,8 +149,8 @@ describe("product audit", () => {
     const contractPath = path.join(repoRoot, "packages/workspace/src/templates.ts");
     const contractSource = await readFile(contractPath, "utf8");
     const brokenContractSource = contractSource.replace(
-      ".app/import-staging/<batch-name>/<source-stem>.md",
-      "03-Knowledge/Imports/<batch-name>/<source-stem>.md",
+      ".app/import-staging/<import-id>/<source-stem>.md",
+      "03-Knowledge/Imports/<import-id>/<source-stem>.md",
     );
 
     const result = await auditProductContracts({
@@ -147,15 +158,15 @@ describe("product audit", () => {
       sourceOverrides: new Map([[contractPath, brokenContractSource]]),
     });
 
-    expect(result.failures).toContain("workspace contract is missing per-source import note route .app/import-staging/<batch-name>/<source-stem>.md");
+    expect(result.failures).toContain("workspace contract is missing per-source import note route .app/import-staging/<import-id>/<source-stem>.md");
   });
 
   it("rejects the obsolete 04-Resources pending-note route", async () => {
     const contractPath = path.join(repoRoot, "packages/workspace/src/templates.ts");
     const contractSource = await readFile(contractPath, "utf8");
     const legacyContractSource = contractSource.replace(
-      "Imported source Markdown notes remain non-indexed under \\`.app/import-staging/<batch-name>/<source-stem>.md\\` while pending Review; low-risk imports are immediately written to \\`00-Inbox/Imports/\\`.",
-      "Imported source Markdown notes go to \\`04-Resources/Imports/<batch-name>/<source-stem>.md\\` while pending Review; low-risk imports are immediately written to \\`00-Inbox/Imports/\\`.",
+      "Imported source Markdown notes remain non-indexed under \\`.app/import-staging/<import-id>/<source-stem>.md\\` while pending Review; low-risk imports are immediately written to \\`00-Inbox/Imports/\\`.",
+      "Imported source Markdown notes go to \\`04-Resources/Imports/<import-id>/<source-stem>.md\\` while pending Review; low-risk imports are immediately written to \\`00-Inbox/Imports/\\`.",
     );
 
     const result = await auditProductContracts({
@@ -164,7 +175,7 @@ describe("product audit", () => {
     });
 
     expect(result.failures).toContain(
-      "workspace contract is missing per-source import note route .app/import-staging/<batch-name>/<source-stem>.md",
+      "workspace contract is missing per-source import note route .app/import-staging/<import-id>/<source-stem>.md",
     );
     expect(result.failures).toContain(
       "workspace contract retains obsolete 04-Resources/Imports pending-note route",
@@ -177,8 +188,8 @@ describe("product audit", () => {
     await writeFile(
       agentsPath,
       agents.replace(
-        "Imported source Markdown notes remain non-indexed under `.app/import-staging/<batch-name>/<source-stem>.md` while pending Review",
-        "Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review",
+        "Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md` while pending Review",
+        "Imported source Markdown notes go to `04-Resources/Imports/<import-id>/<source-stem>.md` while pending Review",
       ),
       "utf8",
     );
@@ -308,10 +319,12 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
   it("fails when attachment copy bypasses hardened workspace IO", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = importsSource.replace(
+    const brokenImportsSource = `${importsSource.replace(
       "await secureCopyFileIntoWorkspace(\n        input.workspaceRoot,",
-      "await secureWriteWorkspaceFileExclusive(\n        input.workspaceRoot,",
-    );
+      "await unsafeAttachmentCopy(\n        input.workspaceRoot,",
+    )}
+const unsafeAttachmentCopy = secureCopyFileIntoWorkspace;
+`;
     expectSourceOverrideToTypecheck(importsPath, brokenImportsSource);
 
     const result = await auditProductContracts({
@@ -324,13 +337,59 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
     );
   });
 
+  it("rejects verified-buffer decoys when extraction reopens the attachment path", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource.replace(
+      "        copied.contents,\n",
+      "        await readFile(attachmentTargetPath),\n",
+    )}
+function verifiedBufferDecoy(copied: { contents: Buffer }): void {
+  void copied.contents;
+}
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "secure import extraction does not consume identity-verified copied attachment bytes",
+    );
+  });
+
+  it("rejects extractor buffer decoys when an extractor reopens sourcePath", async () => {
+    const extractorPath = path.join(
+      repoRoot,
+      "packages/workspace/src/importExtractors.ts",
+    );
+    const extractorSource = await readFile(extractorPath, "utf8");
+    const brokenExtractorSource = `import { readFile } from "node:fs/promises";
+${extractorSource.replace(
+  "    const text = verifiedContents.toString(\"utf8\");",
+  "    void verifiedContents;\n    const text = await readFile(sourcePath, \"utf8\");",
+)}`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[extractorPath, brokenExtractorSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "secure import extraction does not consume identity-verified copied attachment bytes",
+    );
+  });
+
   it("fails when staging creation bypasses hardened workspace IO", async () => {
     const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
     const importsSource = await readFile(importsPath, "utf8");
-    const brokenImportsSource = importsSource.replace(
+    const brokenImportsSource = `${importsSource.replace(
       "await secureWriteWorkspaceFileExclusive(\n    workspaceRoot,\n    stagingTargetPath,",
-      "await secureCopyFileIntoWorkspace(\n    workspaceRoot,\n    stagingTargetPath,",
-    );
+      "await unsafeStagingWrite(\n    workspaceRoot,\n    stagingTargetPath,",
+    )}
+const unsafeStagingWrite = secureWriteWorkspaceFileExclusive;
+`;
     expectSourceOverrideToTypecheck(importsPath, brokenImportsSource);
 
     const result = await auditProductContracts({
@@ -350,10 +409,10 @@ function missingSafetyKernel(intent: Parameters<typeof evaluateImportSafety>[0])
     );
     const promotionSource = await readFile(promotionPath, "utf8");
     const brokenPromotionSource = `${promotionSource.replace(
-      "await secureWriteWorkspaceFileExclusive(\n    input.workspaceRoot,\n    finalTargetPath,",
-      "await unsafeFinalWrite(\n    input.workspaceRoot,\n    finalTargetPath,",
+      "  return securePublishWorkspaceFileAtomic(\n",
+      "  return unsafeFinalWrite(\n",
     )}
-const unsafeFinalWrite = secureWriteWorkspaceFileExclusive;
+const unsafeFinalWrite = securePublishWorkspaceFileAtomic;
 `;
     expectSourceOverrideToTypecheck(promotionPath, brokenPromotionSource);
 
@@ -364,6 +423,80 @@ const unsafeFinalWrite = secureWriteWorkspaceFileExclusive;
 
     expect(result.failures).toContain(
       "initial import final write bypasses hardened workspace IO: packages/workspace/src/importPromotion.ts",
+    );
+  });
+
+  it("rejects an atomic journal token decoy when phase updates use an alias", async () => {
+    const promotionPath = path.join(
+      repoRoot,
+      "packages/workspace/src/importPromotion.ts",
+    );
+    const promotionSource = await readFile(promotionPath, "utf8");
+    const brokenPromotionSource = `${promotionSource.replace(
+      "  handle.artifact = await secureAtomicReplaceWorkspaceFile(\n",
+      "  handle.artifact = await aliasedJournalReplace(\n",
+    )}
+const aliasedJournalReplace = secureAtomicReplaceWorkspaceFile;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[promotionPath, brokenPromotionSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "initial import final write bypasses hardened workspace IO: packages/workspace/src/importPromotion.ts",
+    );
+  });
+
+  it("rejects identity-cleanup token decoys outside the batch rollback", async () => {
+    const importsPath = path.join(repoRoot, "packages/workspace/src/imports.ts");
+    const importsSource = await readFile(importsPath, "utf8");
+    const brokenImportsSource = `${importsSource.replace(
+      "      await secureRemoveWorkspaceArtifact(\n        workspaceRoot,\n        artifact,",
+      "      await unsafeCleanup(\n        workspaceRoot,\n        artifact,",
+    )}
+const unsafeCleanup = async (
+  _workspaceRoot: string,
+  artifact: SecureWorkspaceArtifactIdentity,
+  _options: unknown,
+): Promise<void> => unlink(artifact.targetPath);
+void secureRemoveWorkspaceArtifact;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[importsPath, brokenImportsSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "import rollback and retirement cleanup are not identity-bound quarantine operations",
+    );
+  });
+
+  it("rejects a cross-process lock token decoy outside the routing update", async () => {
+    const reviewPath = path.join(repoRoot, "apps/desktop/electron/ipc.ts");
+    const reviewSource = await readFile(reviewPath, "utf8");
+    const brokenReviewSource = `${reviewSource.replace(
+      "  await withWorkspaceWriteLock(workspaceRoot, async (canonicalRoot) => {",
+      "  await withoutWorkspaceLock(workspaceRoot, async (canonicalRoot) => {",
+    )}
+async function withoutWorkspaceLock<T>(
+  workspaceRoot: string,
+  operation: (canonicalRoot: string) => Promise<T>,
+): Promise<T> {
+  return operation(await realpath(workspaceRoot));
+}
+void withWorkspaceWriteLock;
+`;
+
+    const result = await auditProductContracts({
+      repoRoot,
+      sourceOverrides: new Map([[reviewPath, brokenReviewSource]]),
+    });
+
+    expect(result.failures).toContain(
+      "routing policy and AGENTS updates are not protected by the canonical cross-process workspace lock",
     );
   });
 
@@ -695,7 +828,10 @@ async function decoyReviewPromotion(
   if (safetyDecision.decision !== "auto_write") {
     throw new Error("blocked");
   }
-  await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);
+  await securePublishWorkspaceFileAtomic(workspaceRoot, approvedDestinationPath, approvedBody, {
+    operation: "destination_create",
+    hooks: application.ioHooks,
+  });
 }
 `;
 
@@ -807,7 +943,10 @@ async function unsafeSecondPromotion(
   const approvedBody = destinationPath === approvedDestinationPath
     ? updatedBody
     : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);
-  await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);
+	  await securePublishWorkspaceFileAtomic(workspaceRoot, approvedDestinationPath, approvedBody, {
+	    operation: "destination_create",
+	    hooks: application.ioHooks,
+	  });
   if (safetyDecision.decision !== "auto_write") {
     throw new Error(\`Import approval \${safetyDecision.decision}: \${safetyDecision.reasonCodes.join(", ")}\`);
   }
@@ -818,7 +957,7 @@ async function unsafeSecondPromotion(
   await assertRealPathInsideWorkspace(workspaceRoot, approvedDestinationPath);`,
     );
 
-    expect(brokenReviewSource).toContain("await secureWriteExclusive(workspaceRoot, approvedDestinationPath, approvedBody, fileOps, application.ioHooks);");
+    expect(brokenReviewSource).toContain("await securePublishWorkspaceFileAtomic(workspaceRoot, approvedDestinationPath, approvedBody, {");
     expectSourceOverrideToTypecheck(reviewPath, brokenReviewSource);
     const result = await auditProductContracts({
       repoRoot,
@@ -1079,12 +1218,20 @@ void shouldSkipDirectory(".app");
       await mkdir(path.join(tempRoot, "packages/workspace/src"), { recursive: true });
       const contractSource = await readFile(path.join(repoRoot, "packages/workspace/src/templates.ts"), "utf8");
       const importsSource = await readFile(path.join(repoRoot, "packages/workspace/src/imports.ts"), "utf8");
+      const extractorsSource = await readFile(path.join(repoRoot, "packages/workspace/src/importExtractors.ts"), "utf8");
+      const promotionSource = await readFile(path.join(repoRoot, "packages/workspace/src/importPromotion.ts"), "utf8");
+      const secureIoSource = await readFile(path.join(repoRoot, "packages/workspace/src/secureWorkspaceIo.ts"), "utf8");
+      const writeLockSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspaceWriteLock.ts"), "utf8");
       const importRoutingSource = await readFile(path.join(repoRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), "utf8");
       const workspaceSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspace.ts"), "utf8");
       const indexerSource = await readFile(path.join(repoRoot, "packages/workspace/src/indexer.ts"), "utf8");
       const ipcSource = await readFile(path.join(repoRoot, "apps/desktop/electron/ipc.ts"), "utf8");
       await writeFile(path.join(tempRoot, "packages/workspace/src/templates.ts"), contractSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/imports.ts"), importsSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/importExtractors.ts"), extractorsSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/importPromotion.ts"), promotionSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/secureWorkspaceIo.ts"), secureIoSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/workspaceWriteLock.ts"), writeLockSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), importRoutingSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/workspace.ts"), workspaceSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/indexer.ts"), indexerSource);

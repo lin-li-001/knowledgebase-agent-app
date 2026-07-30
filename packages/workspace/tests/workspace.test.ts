@@ -50,13 +50,13 @@ describe("createWorkspace", () => {
       "Markdown files are the source of truth",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
-      "Imported source Markdown notes remain non-indexed under `.app/import-staging/<batch-name>/<source-stem>.md`",
+      "Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md`",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Each imported source note records `route_status` and `route_destination`",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
-      "Imported original files go to `06-Attachments/Imports/<batch-name>/`",
+      "Imported original files go to `06-Attachments/Imports/<import-id>/`",
     );
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Import candidate routing precedence",
@@ -115,7 +115,7 @@ describe("createWorkspace", () => {
     expect(contract.match(/^## Routing Policy$/gm)).toHaveLength(1);
     expect(contract).toContain("Import candidate routing precedence:");
     expect(contract).toContain(
-      "Imported source Markdown notes remain non-indexed under `.app/import-staging/<batch-name>/<source-stem>.md`",
+      "Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md`",
     );
     expect(contract).not.toContain(
       "04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review",
@@ -130,7 +130,7 @@ describe("createWorkspace", () => {
 
 ## Routing Policy
 
-- Imported source Markdown notes remain non-indexed under \`.app/import-staging/<batch-name>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
+- Imported source Markdown notes remain non-indexed under \`.app/import-staging/<import-id>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
 - Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
 
 Import candidate routing precedence:
@@ -216,7 +216,7 @@ Import candidate routing precedence:
     const rootPath = await mkdtemp(path.join(tmpdir(), "kb-agent-workspace-"));
     await writeFile(
       path.join(rootPath, "AGENTS.md"),
-      "# Workspace Contract\n\n- Imported source Markdown notes remain non-indexed under `.app/import-staging/<batch-name>/<source-stem>.md`.\n",
+      "# Workspace Contract\n\n- Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md`.\n",
     );
 
     await createWorkspace(rootPath);

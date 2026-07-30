@@ -26,6 +26,7 @@ export interface ReviewCardItem {
   sourceSessionId?: string;
   sourceTurnId?: string;
   failureReason?: string;
+  application?: unknown;
 }
 
 export interface ReviewApprovalOptions {
@@ -45,7 +46,10 @@ export function ReviewItemCard({
   onReject?(id: string): Promise<void>;
 }) {
   const canApprove = item.state === undefined || item.state === "proposed" || item.state === "approved" || item.state === "failed";
-  const canReject = item.state === undefined || item.state === "proposed" || item.state === "failed";
+  const hasApplicationIntent = item.application !== undefined && item.application !== null;
+  const canReject = !hasApplicationIntent
+    && (item.state === undefined || item.state === "proposed" || item.state === "failed");
+  const offersApprovalRecovery = hasApplicationIntent && canApprove;
   const source = reviewSource(item);
   const editableDestination = destinationPath(item);
   const importDetails = importReviewDetails(item);
@@ -183,13 +187,20 @@ export function ReviewItemCard({
         </div>
       ) : null}
       {item.failureReason ? <p className="error-text">{item.failureReason}</p> : null}
+      {offersApprovalRecovery ? (
+        <p className="review-recovery">
+          This approval is already prepared. Resume approval to reconcile its recorded destination.
+        </p>
+      ) : null}
       <div className="button-row">
         <button type="button" disabled={requestPending || !canApprove} onClick={() => void approve()}>
-          Approve
+          {offersApprovalRecovery ? "Resume approval" : "Approve"}
         </button>
-        <button type="button" className="secondary-button" disabled={requestPending || !canReject} onClick={() => void reject()}>
-          Reject
-        </button>
+        {!hasApplicationIntent ? (
+          <button type="button" className="secondary-button" disabled={requestPending || !canReject} onClick={() => void reject()}>
+            Reject
+          </button>
+        ) : null}
       </div>
     </article>
   );

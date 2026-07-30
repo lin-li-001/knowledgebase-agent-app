@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -54,7 +54,16 @@ describe("IPC contract", () => {
     await mkdir(path.dirname(path.join(root, sourcePath)), { recursive: true });
     await mkdir(path.dirname(path.join(root, stagingPath)), { recursive: true });
     await writeFile(path.join(root, sourcePath), "Original source bytes.", "utf8");
-    await writeFile(path.join(root, stagingPath), activeResourceNote("Recovered Source"), "utf8");
+    await writeFile(
+      path.join(root, stagingPath),
+      importedSourceBody({
+        destination: finalPath,
+        sourceLink: "../06-Attachments/Imports/Crash/Source.txt",
+      })
+        .replace("title: Utility Bill", "title: Recovered Source")
+        .replace("# Utility Bill", "# Recovered Source"),
+      "utf8",
+    );
     await expect(promoteImportArtifact({
       workspaceRoot: root,
       sourcePath,
@@ -196,6 +205,7 @@ describe("IPC contract", () => {
 
   it("persists the active workspace and restores it for a fresh app session", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
+    const canonicalRoot = await realpath(root);
     const settingsPath = path.join(root, ".desktop/settings.json");
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
     await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n\nUse local notes.", "utf8");
@@ -211,7 +221,9 @@ describe("IPC contract", () => {
     await expect(handleIpcRequest(firstSession, "workspace:open", { rootPath: root })).resolves.toEqual(
       expect.objectContaining({ ok: true }),
     );
-    await expect(readDesktopSettings(settingsPath)).resolves.toEqual(expect.objectContaining({ workspaceRoot: root }));
+    await expect(readDesktopSettings(settingsPath)).resolves.toEqual(
+      expect.objectContaining({ workspaceRoot: canonicalRoot }),
+    );
 
     const nextSession: IpcServices = {
       activeTurns: new Set(),
@@ -224,7 +236,7 @@ describe("IPC contract", () => {
     await expect(handleIpcRequest(nextSession, "workspace:get-active", {})).resolves.toEqual(
       expect.objectContaining({
         ok: true,
-        data: expect.objectContaining({ rootPath: root }),
+        data: expect.objectContaining({ rootPath: canonicalRoot }),
       }),
     );
   });
@@ -770,19 +782,32 @@ January bill.
     expect(policy.rules[0]).not.toHaveProperty("skipReview");
   });
 
-  it("persists concurrent routing-rule approvals without losing policy or AGENTS entries", async () => {
+  it("persists concurrent routing rules across canonical and symlink workspace clients", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-routing-race-"));
+    const alias = path.join(
+      path.dirname(root),
+      `${path.basename(root)}-alias`,
+    );
+    await symlink(root, alias, "dir");
     await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n", "utf8");
-    const services: IpcServices = {
+    const firstServices: IpcServices = {
       activeTurns: new Set(),
       abortControllers: new Map(),
-      settingsPath: path.join(root, ".app/settings.json"),
+      settingsPath: path.join(root, ".app/settings-a.json"),
     };
-    opened.push(services);
-    await handleIpcRequest(services, "workspace:open", { rootPath: root });
+    const secondServices: IpcServices = {
+      activeTurns: new Set(),
+      abortControllers: new Map(),
+      settingsPath: path.join(root, ".app/settings-b.json"),
+    };
+    opened.push(firstServices, secondServices);
+    await handleIpcRequest(firstServices, "workspace:open", { rootPath: root });
+    await handleIpcRequest(secondServices, "workspace:open", { rootPath: alias });
+    expect(firstServices.workspaceRoot).toBe(await realpath(root));
+    expect(secondServices.workspaceRoot).toBe(await realpath(root));
     const createdAt = new Date().toISOString();
     for (const suffix of ["A", "B"]) {
-      services.db?.sqlite
+      firstServices.db?.sqlite
         .prepare(
           `INSERT INTO review_items (
             id, workspace_id, state, risk, proposal_type, payload_json, reason,
@@ -791,7 +816,7 @@ January bill.
         )
         .run(
           `review-routing-${suffix}`,
-          services.workspaceId,
+          firstServices.workspaceId,
           "proposed",
           "medium",
           "propose_create_note",
@@ -801,14 +826,14 @@ January bill.
           }),
           "reason",
           `00-Inbox/Rule ${suffix}.md`,
-          services.sessionId,
+          firstServices.sessionId,
           `turn-${suffix}`,
           createdAt,
         );
     }
     const bothPromoted = deferred<void>();
     let promotionCount = 0;
-    services.reviewApplyHooks = {
+    const reviewApplyHooks = {
       afterPromotion: async () => {
         promotionCount += 1;
         if (promotionCount === 2) {
@@ -817,9 +842,11 @@ January bill.
         await bothPromoted.promise;
       },
     };
+    firstServices.reviewApplyHooks = reviewApplyHooks;
+    secondServices.reviewApplyHooks = reviewApplyHooks;
 
-    const results = await Promise.all(["A", "B"].map(async (suffix) =>
-      handleIpcRequest(services, "review:approve", {
+    const results = await Promise.all(["A", "B"].map(async (suffix, index) =>
+      handleIpcRequest(index === 0 ? firstServices : secondServices, "review:approve", {
         id: `review-routing-${suffix}`,
         targetPathOverride: `04-Resources/Rules/Rule ${suffix}.md`,
         categoryOverride: "resource",
@@ -883,7 +910,11 @@ January bill.
   });
 
   it("preserves import sensitivity, PDF metadata, and a balanced-parenthesis attachment link on approval", async () => {
-    const { root, services, sourceNotePath } = await setupImportedReview();
+    const { root, services, sourceNotePath, attachmentPath } = await setupImportedReview();
+    await rename(
+      path.join(root, attachmentPath),
+      path.join(root, path.dirname(attachmentPath), "Report (Final).pdf"),
+    );
     const sourceLink = "../../../06-Attachments/Imports/Utility Bill/Report (Final).pdf";
     const stagedBody = importedSourceBody({
       destination: "02-Personal/default/Finance/Utilities/2026/Utility Bill.md",
@@ -919,7 +950,11 @@ January bill.
   });
 
   it("round-trips escaped parentheses in the Markdown attachment destination", async () => {
-    const { root, services, sourceNotePath } = await setupImportedReview();
+    const { root, services, sourceNotePath, attachmentPath } = await setupImportedReview();
+    await rename(
+      path.join(root, attachmentPath),
+      path.join(root, path.dirname(attachmentPath), "Report (Final).pdf"),
+    );
     const sourceLink = "../../../06-Attachments/Imports/Utility Bill/Report \\(Final\\).pdf";
     const stagedPath = path.join(root, sourceNotePath);
     const stagedBody = importedSourceBody({
@@ -1107,7 +1142,7 @@ January bill.
     let unlinkSnapshots = 0;
     setup.services.reviewIoHooks = {
       afterPathSnapshot: async (operation) => {
-        if (operation !== "staging_unlink") {
+        if (operation !== "staging_retire") {
           return;
         }
         unlinkSnapshots += 1;
@@ -1150,11 +1185,15 @@ January bill.
   it("does not roll back a replacement destination inode", async () => {
     const setup = await setupImportedReview();
     const destination = "04-Resources/Approved/Utility Bill.md";
-    const destinationPath = path.join(setup.root, destination);
+    const canonicalRoot = setup.services.workspaceRoot!;
+    const destinationPath = path.join(canonicalRoot, destination);
+    const stagingParent = path.dirname(
+      path.join(canonicalRoot, setup.sourceNotePath),
+    );
     const replacement = "replacement destination owned by another worker";
     setup.services.reviewImportFileOps = {
       unlink: async (targetPath) => {
-        if (targetPath === path.join(setup.root, setup.sourceNotePath)) {
+        if (path.dirname(targetPath) === stagingParent) {
           await unlink(destinationPath);
           await writeFile(destinationPath, replacement, "utf8");
           throw new Error("staging unlink failed after replacement");
@@ -1169,7 +1208,7 @@ January bill.
       categoryOverride: "resource",
     })).resolves.toEqual({
       ok: false,
-      error: expect.stringContaining("Destination identity changed before rollback"),
+      error: expect.stringMatching(/identity changed/iu),
     });
     await expect(readFile(destinationPath, "utf8")).resolves.toBe(replacement);
     await expect(readFile(path.join(setup.root, setup.sourceNotePath), "utf8")).resolves.toContain("pending_review");
@@ -1243,26 +1282,112 @@ January bill.
       error: "simulated interruption after promotion",
     });
     const promotedBody = await readFile(path.join(root, destination), "utf8");
+    const persistedApplication = JSON.parse(
+      (
+        services.db?.sqlite
+          .prepare("SELECT application_json as applicationJson FROM review_items WHERE id = ?")
+          .get("review-import-source-note") as { applicationJson: string }
+      ).applicationJson,
+    ) as Record<string, unknown>;
+    expect(persistedApplication).toEqual(expect.objectContaining({
+      attachment: expect.objectContaining({
+        path: expect.stringMatching(/^06-Attachments\/Imports\//u),
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      }),
+      staging: expect.objectContaining({
+        path: sourceNotePath,
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      }),
+      expectedFinalHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      final: expect.objectContaining({
+        path: destination,
+        dev: expect.any(Number),
+        ino: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      }),
+    }));
     await expect(readFile(path.join(root, sourceNotePath), "utf8")).rejects.toThrow();
     services.db?.sqlite
       .prepare(
         "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ? WHERE id = ?",
       )
       .run("interrupted-process", "2000-01-01T00:00:00.000Z", "review-import-source-note");
-    services.reviewImportFileOps = {
-      writeFile: async (targetPath, contents, exclusive) => {
-        if (targetPath === path.join(root, destination)) {
-          throw new Error("destination must not be rewritten");
-        }
-        await writeFile(targetPath, contents, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
-      },
-    };
-
     await expect(handleIpcRequest(services, "review:approve", request)).resolves.toEqual({
       ok: true,
       data: { id: "review-import-source-note", state: "applied" },
     });
     await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(promotedBody);
+  });
+
+  it.each(["edited", "replaced"] as const)(
+    "rolls back only the reviewed final when staging is %s after publication",
+    async (mutation) => {
+      const setup = await setupImportedReview();
+      const destination = "04-Resources/Approved/Identity Bound.md";
+      const stagingPath = path.join(setup.root, setup.sourceNotePath);
+      const newerStaging = `${await readFile(stagingPath, "utf8")}\nNewer staged edit.\n`;
+      let mutated = false;
+      setup.services.reviewIoHooks = {
+        afterPathSnapshot: async (operation) => {
+          if (operation !== "staging_retire" || mutated) {
+            return;
+          }
+          mutated = true;
+          if (mutation === "replaced") {
+            await rename(stagingPath, `${stagingPath}.previous`);
+          }
+          await writeFile(stagingPath, newerStaging, "utf8");
+        },
+      };
+
+      await expect(handleIpcRequest(setup.services, "review:approve", {
+        id: "review-import-source-note",
+        targetPathOverride: destination,
+        categoryOverride: "resource",
+      })).resolves.toEqual({
+        ok: false,
+        error: expect.stringMatching(/staging artifact changed/iu),
+      });
+
+      expect(mutated).toBe(true);
+      await expect(readFile(path.join(setup.root, destination), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(stagingPath, "utf8")).resolves.toBe(newerStaging);
+    },
+  );
+
+  it("rolls back the reviewed final when its bound attachment changes before retirement", async () => {
+    const setup = await setupImportedReview();
+    const destination = "04-Resources/Approved/Attachment Bound.md";
+    let mutated = false;
+    setup.services.reviewIoHooks = {
+      afterPathSnapshot: async (operation) => {
+        if (operation === "staging_retire" && !mutated) {
+          mutated = true;
+          await writeFile(
+            path.join(setup.root, setup.attachmentPath),
+            "new attachment authority",
+            "utf8",
+          );
+        }
+      },
+    };
+
+    await expect(handleIpcRequest(setup.services, "review:approve", {
+      id: "review-import-source-note",
+      targetPathOverride: destination,
+      categoryOverride: "resource",
+    })).resolves.toEqual({
+      ok: false,
+      error: expect.stringMatching(/attachment changed/iu),
+    });
+
+    expect(mutated).toBe(true);
+    await expect(readFile(path.join(setup.root, destination), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(setup.root, setup.sourceNotePath), "utf8")).resolves.toContain("pending_review");
   });
 
   it("reconciles a crash window with both staging and an exact destination", async () => {
@@ -1332,11 +1457,14 @@ January bill.
 
   it("accepts override B only after a failed application has rolled back A", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
+    const stagingParent = path.dirname(
+      path.join(services.workspaceRoot!, sourceNotePath),
+    );
     const destinationA = "04-Resources/Approved/Rolled Back A.md";
     const destinationB = "04-Resources/Approved/Replacement B.md";
     services.reviewImportFileOps = {
       unlink: async (targetPath) => {
-        if (targetPath === path.join(root, sourceNotePath)) {
+        if (path.dirname(targetPath) === stagingParent) {
           throw new Error("staging unlink failed");
         }
         await unlink(targetPath);
@@ -1569,7 +1697,7 @@ January bill.
 
     await expect(handleIpcRequest(services, "review:approve", { id: "review-import-source-note" })).resolves.toEqual({
       ok: false,
-      error: "Path resolves outside workspace",
+      error: expect.stringContaining("Path resolves outside workspace"),
     });
     await expect(readFile(outside, "utf8")).resolves.toBe(stagedBody);
   });
@@ -1659,7 +1787,7 @@ January bill.
       reviewIoHooks: { afterPathSnapshot(operation: string): Promise<void> };
     }).reviewIoHooks = {
       afterPathSnapshot: async (operation) => {
-        if (operation === "staging_unlink") {
+        if (operation === "staging_retire") {
           await rename(parent, movedParent);
           await symlink(outside, parent, "dir");
         }
@@ -1673,7 +1801,7 @@ January bill.
       categoryOverride: "resource",
     })).resolves.toEqual({
       ok: false,
-      error: expect.stringContaining("Path"),
+      error: expect.stringMatching(/staging artifact changed/iu),
     });
     await expect(readFile(path.join(root, destination), "utf8")).rejects.toThrow();
     await expect(readFile(outsideNote, "utf8")).resolves.toContain("pending_review");
@@ -1747,7 +1875,11 @@ January bill.
   });
 
   it("round-trips YAML-sensitive route and source filenames during approval", async () => {
-    const { root, services, sourceNotePath } = await setupImportedReview();
+    const { root, services, sourceNotePath, attachmentPath } = await setupImportedReview();
+    await rename(
+      path.join(root, attachmentPath),
+      path.join(root, "06-Attachments/Imports/Bill #1: July.pdf"),
+    );
     const stagedPath = path.join(root, sourceNotePath);
     const sourceFile = "../../../06-Attachments/Imports/Bill #1: July.pdf";
     const staged = (await readFile(stagedPath, "utf8"))
@@ -1810,9 +1942,12 @@ January bill.
 
   it("rolls back a promoted destination when removing staging fails", async () => {
     const setup = await setupImportedReview();
+    const stagingParent = path.dirname(
+      path.join(setup.services.workspaceRoot!, setup.sourceNotePath),
+    );
     setup.services.reviewImportFileOps = {
       unlink: async (targetPath) => {
-        if (targetPath === path.join(setup.root, setup.sourceNotePath)) {
+        if (path.dirname(targetPath) === stagingParent) {
           throw new Error("staging unlink failed");
         }
         await unlink(targetPath);
@@ -1866,13 +2001,26 @@ January bill.
     expect(rejected.frontmatter.status).toBe("rejected");
   });
 
-  it("refreshes expired claims as retryable and permits rejecting a stale apply", async () => {
+  it("refreshes an expired prepared apply as approval-only recovery", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
     services.db?.sqlite
       .prepare(
-        "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ? WHERE id = ?",
+        "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ?, application_json = ? WHERE id = ?",
       )
-      .run("stopped-applier", "2000-01-01T00:00:00.000Z", "review-import-source-note");
+      .run(
+        "stopped-applier",
+        "2000-01-01T00:00:00.000Z",
+        JSON.stringify({
+          kind: "import_move",
+          reviewItemId: "review-import-source-note",
+          sourceNotePath,
+          destination: "04-Resources/Approved/A.md",
+          classificationFingerprint: "prepared",
+          promotedContentHash: "a".repeat(64),
+          options: {},
+        }),
+        "review-import-source-note",
+      );
 
     await expect(handleIpcRequest(services, "review:list", {})).resolves.toEqual(
       expect.objectContaining({
@@ -1882,6 +2030,10 @@ January bill.
             id: "review-import-source-note",
             state: "failed",
             failureReason: "Previous applying lease expired; retry is available.",
+            application: expect.objectContaining({
+              kind: "import_move",
+              destination: "04-Resources/Approved/A.md",
+            }),
           }),
         ]),
       }),
@@ -1889,29 +2041,34 @@ January bill.
     await expect(handleIpcRequest(services, "review:reject", {
       id: "review-import-source-note",
     })).resolves.toEqual({
-      ok: true,
-      data: { id: "review-import-source-note", state: "rejected" },
+      ok: false,
+      error: "Review item has a prepared application; resume approval instead",
     });
-    const rejected = await parseMarkdownNote(path.join(root, sourceNotePath));
-    expect(rejected.frontmatter.status).toBe("rejected");
+    const staged = await parseMarkdownNote(path.join(root, sourceNotePath));
+    expect(staged.frontmatter.status).toBe("pending_review");
   });
 
-  it("rejects a stale applying claim safely even before the Review list refreshes", async () => {
+  it("fails closed on rejecting prepared intent before the Review list refreshes", async () => {
     const { root, services, sourceNotePath } = await setupImportedReview();
     services.db?.sqlite
       .prepare(
-        "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ? WHERE id = ?",
+        "UPDATE review_items SET state = 'applying', claim_token = ?, claim_started_at = ?, application_json = ? WHERE id = ?",
       )
-      .run("stopped-applier", "2000-01-01T00:00:00.000Z", "review-import-source-note");
+      .run(
+        "stopped-applier",
+        "2000-01-01T00:00:00.000Z",
+        JSON.stringify({ kind: "prepared", destination: "04-Resources/Approved/A.md" }),
+        "review-import-source-note",
+      );
 
     await expect(handleIpcRequest(services, "review:reject", {
       id: "review-import-source-note",
     })).resolves.toEqual({
-      ok: true,
-      data: { id: "review-import-source-note", state: "rejected" },
+      ok: false,
+      error: "Review item has a prepared application; resume approval instead",
     });
-    const rejected = await parseMarkdownNote(path.join(root, sourceNotePath));
-    expect(rejected.frontmatter.status).toBe("rejected");
+    const staged = await parseMarkdownNote(path.join(root, sourceNotePath));
+    expect(staged.frontmatter.status).toBe("pending_review");
   });
 
   it("prevents an old rejecter from overwriting body B after takeover", async () => {
@@ -2077,6 +2234,7 @@ async function setupImportedReview(input: {
   root: string;
   services: IpcServices;
   sourceNotePath: string;
+  attachmentPath: string;
   destination: string;
 }> {
   const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
@@ -2140,7 +2298,7 @@ async function setupImportedReview(input: {
       new Date().toISOString(),
     );
 
-  return { root, services, sourceNotePath, destination };
+  return { root, services, sourceNotePath, attachmentPath, destination };
 }
 
 function financeImportClassification() {

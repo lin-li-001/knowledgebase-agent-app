@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { access, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -39,13 +38,22 @@ import {
   mergeImportClassification,
   parseMarkdownDocument,
   recoverImportPromotions,
+  secureAtomicReplaceWorkspaceFile,
+  securePublishWorkspaceFileAtomic,
+  secureReadWorkspaceArtifact,
+  secureRemoveWorkspaceArtifact,
+  secureRewriteWorkspaceFile,
+  secureWorkspacePathExists,
   serializeMarkdownDocument,
   syncWorkspaceContract,
+  withWorkspaceWriteLock,
   type ClassificationSignal,
   workspaceIdForRoot,
   type ContentCategory,
   type ImportClassification,
   type SafetyDecision,
+  type SecureWorkspaceArtifactIdentity,
+  type SecureWorkspaceIoHooks,
 } from "@kb-agent/workspace";
 import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
@@ -69,17 +77,11 @@ export interface IpcServices {
     afterPromotion?(reviewItemId: string): Promise<void>;
     beforeApplied?(reviewItemId: string): Promise<void>;
   };
-  reviewIoHooks?: {
-    afterPathSnapshot?(operation: string, targetPath: string): Promise<void>;
-  };
+  reviewIoHooks?: SecureWorkspaceIoHooks;
 }
 
 export interface ReviewImportFileOps {
-  mkdir(directoryPath: string): Promise<void>;
-  pathExists(targetPath: string): Promise<boolean>;
-  readFile(targetPath: string): Promise<Buffer>;
   unlink(targetPath: string): Promise<void>;
-  writeFile(targetPath: string, contents: string, exclusive: boolean): Promise<void>;
 }
 
 interface WorkspaceTreeNode {
@@ -515,7 +517,6 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         const importedPayload = await reconstructImportedSourcePayload(
           requireWorkspaceRoot(services),
           item.payload,
-          reviewImportFileOps(services),
         );
         if (importedPayload.safetyDecision.decision === "blocked") {
           throw new Error("Blocked import artifacts cannot be approved");
@@ -656,6 +657,12 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
   if (item.state === "applying") {
     return { ok: false, error: "Review item is currently applying" };
   }
+  if (item.application !== undefined && item.application !== null) {
+    return {
+      ok: false,
+      error: "Review item has a prepared application; resume approval instead",
+    };
+  }
   const claimStartedAt = item.claimStartedAt ? Date.parse(item.claimStartedAt) : Number.NaN;
   const claimIsStale = item.state === "rejecting"
     && Number.isFinite(claimStartedAt)
@@ -684,7 +691,6 @@ async function rejectReviewItem(services: IpcServices, id: string): Promise<IpcR
       await rejectImportedSourceNote(
         requireWorkspaceRoot(services),
         item.payload.sourceNotePath,
-        reviewImportFileOps(services),
         services.reviewIoHooks,
         reviewClaimFence(db, id, "rejecting", claimToken),
       );
@@ -802,7 +808,7 @@ async function applyKnowledgeProposal(
     const relativePath = options.targetPathOverride?.trim() || payload.path;
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
     const prepared = genericWriteApplication(item, relativePath, payload.body, options);
-    if (await reviewImportFileOps(services).pathExists(targetPath)) {
+    if (await secureWorkspacePathExists(requireWorkspaceRoot(services), targetPath)) {
       await reconcileGenericWrite(
         requireWorkspaceRoot(services),
         targetPath,
@@ -812,13 +818,13 @@ async function applyKnowledgeProposal(
       );
       return relativePath;
     }
-    await application.onPrepared?.(prepared);
-    await secureWriteExclusive(
+    await publishGenericWrite(
       requireWorkspaceRoot(services),
       targetPath,
       payload.body,
-      reviewImportFileOps(services),
+      prepared,
       application.ioHooks,
+      application.onPrepared,
     );
     return relativePath;
   }
@@ -829,7 +835,7 @@ async function applyKnowledgeProposal(
     const targetPath = assertInsideWorkspace(requireWorkspaceRoot(services), relativePath);
     const contents = `${body.trimEnd()}\n`;
     const prepared = genericWriteApplication(item, relativePath, contents, options);
-    if (await reviewImportFileOps(services).pathExists(targetPath)) {
+    if (await secureWorkspacePathExists(requireWorkspaceRoot(services), targetPath)) {
       await reconcileGenericWrite(
         requireWorkspaceRoot(services),
         targetPath,
@@ -839,18 +845,50 @@ async function applyKnowledgeProposal(
       );
       return relativePath;
     }
-    await application.onPrepared?.(prepared);
-    await secureWriteExclusive(
+    await publishGenericWrite(
       requireWorkspaceRoot(services),
       targetPath,
       contents,
-      reviewImportFileOps(services),
+      prepared,
       application.ioHooks,
+      application.onPrepared,
     );
     return relativePath;
   }
 
   throw new Error(`Unsupported proposal apply: ${item.proposalType}`);
+}
+
+async function publishGenericWrite(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string,
+  prepared: GenericWriteApplication,
+  ioHooks?: SecureWorkspaceIoHooks,
+  onPrepared?: (application: ReviewWriteApplication) => Promise<void>,
+): Promise<void> {
+  await securePublishWorkspaceFileAtomic(
+    workspaceRoot,
+    targetPath,
+    contents,
+    {
+      operation: "destination_create",
+      hooks: ioHooks,
+      afterTempSync: async (temp) => {
+        await onPrepared?.({
+          ...prepared,
+          finalTemp: recordReviewArtifact(workspaceRoot, temp),
+        });
+      },
+      afterPublish: async (final, temp) => {
+        await onPrepared?.({
+          ...prepared,
+          finalTemp: recordReviewArtifact(workspaceRoot, temp),
+          final: recordReviewArtifact(workspaceRoot, final),
+        });
+      },
+    },
+  );
 }
 
 interface ImportedSourceNotePayload {
@@ -867,7 +905,12 @@ interface ImportMoveApplication {
   sourceNotePath: string;
   destination: string;
   classificationFingerprint: string;
+  attachment: RecordedReviewArtifact;
+  staging: RecordedReviewArtifact;
+  expectedFinalHash: string;
   promotedContentHash: string;
+  finalTemp?: RecordedReviewArtifact;
+  final?: RecordedReviewArtifact;
   options: ReviewApproveOptions;
 }
 
@@ -876,8 +919,23 @@ interface GenericWriteApplication {
   reviewItemId: string;
   proposalType: string;
   destination: string;
+  expectedFinalHash: string;
   promotedContentHash: string;
+  finalTemp?: RecordedReviewArtifact;
+  final?: RecordedReviewArtifact;
   options: ReviewApproveOptions;
+}
+
+interface RecordedReviewArtifact {
+  path: string;
+  parentPath: string;
+  parentRealPath: string;
+  parentDev: number;
+  parentIno: number;
+  dev: number;
+  ino: number;
+  sha256: string;
+  size: number;
 }
 
 type ReviewWriteApplication = ImportMoveApplication | GenericWriteApplication;
@@ -943,20 +1001,16 @@ async function moveImportedSourceNote(
   if (destinationPath !== undefined) {
     await assertRealPathInsideWorkspace(workspaceRoot, destinationPath);
   }
-  if (!await fileOps.pathExists(sourcePath)) {
-    return reconcileImportedMove(
-      workspaceRoot,
-      item,
-      payload,
-      destination,
-      classificationFingerprint,
-      application.previousApplication,
-      fileOps,
-    );
+  if (!await secureWorkspacePathExists(workspaceRoot, sourcePath)) {
+    throw new Error("Imported source note is missing and cannot be reconciled");
   }
 
-  await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
-  const body = await secureReadExisting(workspaceRoot, sourcePath, "staging_read", application.ioHooks);
+  const staging = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    sourcePath,
+    { operation: "staging_read", hooks: application.ioHooks },
+  );
+  const body = staging.contents.toString("utf8");
   const document = parseMarkdownDocument(body);
   if (document.frontmatter.status !== "pending_review" || document.frontmatter.route_status !== "pending_review") {
     throw new Error("Imported source note is no longer pending review");
@@ -968,36 +1022,13 @@ async function moveImportedSourceNote(
     destination,
     classification,
   );
-  const previous = application.previousApplication;
-  if (destinationPath !== undefined
-    && await fileOps.pathExists(destinationPath)
-    && isImportMoveApplication(previous)) {
-    if (previous.reviewItemId !== item.id
-      || previous.sourceNotePath !== payload.sourceNotePath
-      || previous.destination !== destination
-      || previous.classificationFingerprint !== classificationFingerprint
-      || previous.promotedContentHash !== hashContents(updatedBody)) {
-      throw new Error("Promoted import does not match current Review intent");
-    }
-    const existing = await secureReadExisting(workspaceRoot, destinationPath, "destination_reconcile", application.ioHooks);
-    if (hashContents(existing) !== previous.promotedContentHash) {
-      throw new Error("Promoted import does not match the persisted application");
-    }
-    await secureUnlinkExisting(
-      workspaceRoot,
-      sourcePath,
-      "staging_unlink",
-      fileOps,
-      application.ioHooks,
-      application.claimFence,
-    );
-    return destination;
-  }
   const safetyDecision = evaluateImportSafety({
     workspaceRoot,
     operation: "move",
     destination,
-    destinationExists: destinationPath === undefined ? false : await fileOps.pathExists(destinationPath),
+    destinationExists: destinationPath === undefined
+      ? false
+      : await secureWorkspacePathExists(workspaceRoot, destinationPath),
     autoWriteThreshold: 0.95,
     classification,
     approval: {
@@ -1018,42 +1049,85 @@ async function moveImportedSourceNote(
   const approvedBody = destinationPath === approvedDestinationPath
     ? updatedBody
     : updateImportedSourceNoteRoute(body, sourcePath, approvedDestinationPath, destination, classification);
-  const preparedApplication: ImportMoveApplication = {
+  const attachment = await readReviewedImportAttachment(
+    workspaceRoot,
+    sourcePath,
+    body,
+    application.ioHooks,
+  );
+  let preparedApplication: ImportMoveApplication = {
     kind: "import_move",
     reviewItemId: item.id,
     sourceNotePath: payload.sourceNotePath,
     destination,
     classificationFingerprint,
+    attachment: recordReviewArtifact(workspaceRoot, attachment.artifact),
+    staging: recordReviewArtifact(workspaceRoot, staging.artifact),
+    expectedFinalHash: hashContents(approvedBody),
     promotedContentHash: hashContents(approvedBody),
     options,
   };
   await application.onPrepared?.(preparedApplication);
-  const createdDestination = await secureWriteExclusive(
-    workspaceRoot,
-    approvedDestinationPath,
-    approvedBody,
-    fileOps,
-    application.ioHooks,
-  );
   try {
-    await secureUnlinkExisting(
+    await securePublishWorkspaceFileAtomic(
       workspaceRoot,
-      sourcePath,
-      "staging_unlink",
-      fileOps,
+      approvedDestinationPath,
+      approvedBody,
+      {
+        operation: "destination_create",
+        hooks: application.ioHooks,
+        afterTempSync: async (temp) => {
+          preparedApplication = {
+            ...preparedApplication,
+            finalTemp: recordReviewArtifact(workspaceRoot, temp),
+          };
+          await application.onPrepared?.(preparedApplication);
+        },
+        afterPublish: async (final, temp) => {
+          preparedApplication = {
+            ...preparedApplication,
+            finalTemp: recordReviewArtifact(workspaceRoot, temp),
+            final: recordReviewArtifact(workspaceRoot, final),
+          };
+          await application.onPrepared?.(preparedApplication);
+        },
+      },
+    );
+    await verifyReviewedImportBindings(
+      workspaceRoot,
+      preparedApplication,
       application.ioHooks,
-      application.claimFence,
+    );
+    await secureRemoveWorkspaceArtifact(
+      workspaceRoot,
+      artifactFromReviewRecord(
+        workspaceRoot,
+        preparedApplication.staging,
+      ),
+      {
+        operation: "staging_retire",
+        hooks: application.ioHooks,
+        claimFence: application.claimFence,
+        unlinkFile: fileOps.unlink,
+      },
     );
   } catch (error) {
+    if (!preparedApplication.final) {
+      throw error;
+    }
     try {
-      await secureUnlinkExisting(
+      await secureRemoveWorkspaceArtifact(
         workspaceRoot,
-        approvedDestinationPath,
-        "destination_rollback",
-        fileOps,
-        undefined,
-        application.claimFence,
-        createdDestination,
+        artifactFromReviewRecord(
+          workspaceRoot,
+          preparedApplication.final,
+        ),
+        {
+          operation: "destination_rollback",
+          hooks: application.ioHooks,
+          claimFence: application.claimFence,
+          unlinkFile: fileOps.unlink,
+        },
       );
     } catch (rollbackError) {
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure";
@@ -1065,35 +1139,84 @@ async function moveImportedSourceNote(
   return destination;
 }
 
-async function reconcileImportedMove(
+async function readReviewedImportAttachment(
   workspaceRoot: string,
-  item: ReviewItem,
-  payload: ImportedSourceNotePayload,
-  destination: string,
-  classificationFingerprint: string,
-  previousApplication: unknown,
-  fileOps: ReviewImportFileOps,
-): Promise<string> {
-  if (!isImportMoveApplication(previousApplication)
-    || previousApplication.reviewItemId !== item.id
-    || previousApplication.sourceNotePath !== payload.sourceNotePath
-    || previousApplication.destination !== destination
-    || previousApplication.classificationFingerprint !== classificationFingerprint) {
-    throw new Error("Imported source note is missing and cannot be reconciled");
+  stagingPath: string,
+  stagingBody: string,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<Awaited<ReturnType<typeof secureReadWorkspaceArtifact>>> {
+  const sourceFile = parseMarkdownDocument(stagingBody).frontmatter.source_file;
+  if (typeof sourceFile !== "string" || sourceFile.trim() === "") {
+    throw new Error("Imported source note is missing its attachment binding");
   }
-  const destinationPath = assertInsideWorkspace(workspaceRoot, destination);
-  await assertRealPathInsideWorkspace(workspaceRoot, destinationPath, { mustExist: true });
-  const destinationBody = await secureReadExisting(workspaceRoot, destinationPath, "destination_reconcile");
-  if (hashContents(destinationBody) !== previousApplication.promotedContentHash) {
-    throw new Error("Promoted import no longer matches the claimed application");
+  const attachmentPath = assertInsideWorkspace(
+    workspaceRoot,
+    path.resolve(
+      path.dirname(stagingPath),
+      sourceFile.replace(/\\([()\\])/gu, "$1"),
+    ),
+  );
+  const relativeAttachment = reviewRelativePath(workspaceRoot, attachmentPath);
+  if (!relativeAttachment.startsWith(`${defaultRoutingPolicy.importAttachmentRoot()}/`)) {
+    throw new Error("Imported source note attachment is outside the import attachment root");
   }
-  const document = parseMarkdownDocument(destinationBody);
-  if (document.frontmatter.status !== "approved"
-    || document.frontmatter.route_status !== "approved"
-    || document.frontmatter.route_destination !== destination) {
-    throw new Error("Promoted import does not match current Review intent");
+  return secureReadWorkspaceArtifact(workspaceRoot, attachmentPath, {
+    operation: "attachment_read",
+    hooks: ioHooks,
+  });
+}
+
+async function verifyReviewedImportBindings(
+  workspaceRoot: string,
+  application: ImportMoveApplication,
+  ioHooks?: SecureWorkspaceIoHooks,
+): Promise<void> {
+  let staging;
+  try {
+    staging = await secureReadWorkspaceArtifact(
+      workspaceRoot,
+      artifactFromReviewRecord(workspaceRoot, application.staging).targetPath,
+      {
+        operation: "staging_retire",
+        hooks: ioHooks,
+        expectedArtifact: artifactFromReviewRecord(
+          workspaceRoot,
+          application.staging,
+        ),
+      },
+    );
+  } catch {
+    throw new Error("Review staging artifact changed before retirement");
   }
-  return destination;
+  let attachment;
+  try {
+    attachment = await secureReadWorkspaceArtifact(
+      workspaceRoot,
+      artifactFromReviewRecord(workspaceRoot, application.attachment).targetPath,
+      {
+        operation: "attachment_retire",
+        expectedArtifact: artifactFromReviewRecord(
+          workspaceRoot,
+          application.attachment,
+        ),
+      },
+    );
+  } catch {
+    throw new Error("Review attachment changed before retirement");
+  }
+  const rebound = await readReviewedImportAttachment(
+    workspaceRoot,
+    staging.artifact.targetPath,
+    staging.contents.toString("utf8"),
+  );
+  if (
+    rebound.artifact.targetPath !== attachment.artifact.targetPath
+    || rebound.artifact.sha256 !== attachment.artifact.sha256
+    || rebound.artifact.fileDev !== attachment.artifact.fileDev
+    || rebound.artifact.fileIno !== attachment.artifact.fileIno
+  ) {
+    throw new Error("Review attachment binding changed before retirement");
+  }
 }
 
 function isImportMoveApplication(value: unknown): value is ImportMoveApplication {
@@ -1103,7 +1226,12 @@ function isImportMoveApplication(value: unknown): value is ImportMoveApplication
     && typeof value.sourceNotePath === "string"
     && typeof value.destination === "string"
     && typeof value.classificationFingerprint === "string"
+    && isRecordedReviewArtifact(value.attachment)
+    && isRecordedReviewArtifact(value.staging)
+    && typeof value.expectedFinalHash === "string"
     && typeof value.promotedContentHash === "string"
+    && (value.finalTemp === undefined || isRecordedReviewArtifact(value.finalTemp))
+    && (value.final === undefined || isRecordedReviewArtifact(value.final))
     && isRecord(value.options);
 }
 
@@ -1113,8 +1241,24 @@ function isGenericWriteApplication(value: unknown): value is GenericWriteApplica
     && typeof value.reviewItemId === "string"
     && typeof value.proposalType === "string"
     && typeof value.destination === "string"
+    && typeof value.expectedFinalHash === "string"
     && typeof value.promotedContentHash === "string"
+    && (value.finalTemp === undefined || isRecordedReviewArtifact(value.finalTemp))
+    && (value.final === undefined || isRecordedReviewArtifact(value.final))
     && isRecord(value.options);
+}
+
+function isRecordedReviewArtifact(value: unknown): value is RecordedReviewArtifact {
+  return isRecord(value)
+    && typeof value.path === "string"
+    && typeof value.parentPath === "string"
+    && typeof value.parentRealPath === "string"
+    && typeof value.parentDev === "number"
+    && typeof value.parentIno === "number"
+    && typeof value.dev === "number"
+    && typeof value.ino === "number"
+    && typeof value.sha256 === "string"
+    && typeof value.size === "number";
 }
 
 function reviewApplicationIntent(item: ReviewItem, options: ReviewApproveOptions): unknown {
@@ -1147,34 +1291,141 @@ async function reconcilePersistedImportedApplication(
     workspaceRoot,
     previousApplication.destination,
   );
-  const persistedExists = await fileOps.pathExists(persistedPath);
+  const persistedExists = await secureWorkspacePathExists(
+    workspaceRoot,
+    persistedPath,
+  );
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
-  const sourceExists = await fileOps.pathExists(sourcePath);
+  const sourceExists = await secureWorkspacePathExists(
+    workspaceRoot,
+    sourcePath,
+  );
   if (!persistedExists) {
     if (!sourceExists) {
       throw new Error("Persisted import application has no remaining authority");
     }
+    if (previousApplication.finalTemp) {
+      const temp = artifactFromReviewRecord(
+        workspaceRoot,
+        previousApplication.finalTemp,
+      );
+      if (await secureWorkspacePathExists(workspaceRoot, temp.targetPath)) {
+        await secureRemoveWorkspaceArtifact(workspaceRoot, temp, {
+          operation: "persisted_final_temp_cleanup",
+          hooks: ioHooks,
+          unlinkFile: fileOps.unlink,
+        });
+      }
+    }
     return undefined;
   }
 
-  const existing = await secureReadExisting(
+  const recordedFinal = previousApplication.final ?? previousApplication.finalTemp;
+  if (!recordedFinal) {
+    throw new Error("Persisted import destination has no publication identity");
+  }
+  const expectedFinal = artifactFromReviewRecord(
     workspaceRoot,
+    recordedFinal,
     persistedPath,
-    "persisted_destination_reconcile",
-    ioHooks,
   );
-  if (hashContents(existing) !== previousApplication.promotedContentHash) {
+  let existing;
+  try {
+    existing = await secureReadWorkspaceArtifact(
+      workspaceRoot,
+      persistedPath,
+      {
+        operation: "persisted_destination_reconcile",
+        hooks: ioHooks,
+        expectedArtifact: expectedFinal,
+      },
+    );
+  } catch {
+    throw new Error("Persisted import destination does not match its publication identity");
+  }
+  if (existing.artifact.sha256 !== previousApplication.expectedFinalHash) {
     throw new Error("Persisted import destination does not match its approved hash");
   }
-  if (sourceExists) {
-    await secureUnlinkExisting(
+
+  try {
+    const attachment = await secureReadWorkspaceArtifact(
       workspaceRoot,
-      sourcePath,
-      "persisted_staging_unlink",
-      fileOps,
-      ioHooks,
-      claimFence,
+      artifactFromReviewRecord(
+        workspaceRoot,
+        previousApplication.attachment,
+      ).targetPath,
+      {
+        operation: "persisted_attachment_reconcile",
+        expectedArtifact: artifactFromReviewRecord(
+          workspaceRoot,
+          previousApplication.attachment,
+        ),
+      },
     );
+    if (sourceExists) {
+      const staging = await secureReadWorkspaceArtifact(
+        workspaceRoot,
+        sourcePath,
+        {
+          operation: "staging_retire",
+          hooks: ioHooks,
+          expectedArtifact: artifactFromReviewRecord(
+            workspaceRoot,
+            previousApplication.staging,
+          ),
+        },
+      );
+      const rebound = await readReviewedImportAttachment(
+        workspaceRoot,
+        sourcePath,
+        staging.contents.toString("utf8"),
+      );
+      if (
+        rebound.artifact.targetPath !== attachment.artifact.targetPath
+        || rebound.artifact.sha256 !== attachment.artifact.sha256
+        || rebound.artifact.fileDev !== attachment.artifact.fileDev
+        || rebound.artifact.fileIno !== attachment.artifact.fileIno
+      ) {
+        throw new Error("Review attachment binding changed before retirement");
+      }
+      await secureRemoveWorkspaceArtifact(
+        workspaceRoot,
+        artifactFromReviewRecord(
+          workspaceRoot,
+          previousApplication.staging,
+        ),
+        {
+          operation: "persisted_staging_retire",
+          hooks: ioHooks,
+          claimFence,
+          unlinkFile: fileOps.unlink,
+        },
+      );
+    }
+  } catch (error) {
+    if (previousApplication.final) {
+      await secureRemoveWorkspaceArtifact(
+        workspaceRoot,
+        artifactFromReviewRecord(
+          workspaceRoot,
+          previousApplication.final,
+          persistedPath,
+        ),
+        {
+          operation: "persisted_destination_rollback",
+          hooks: ioHooks,
+          claimFence,
+          unlinkFile: fileOps.unlink,
+        },
+      );
+    }
+    if (
+      error instanceof Error
+      && /staging|attachment/iu.test(error.message)
+    ) {
+      throw error;
+    }
+    throw new Error("Review staging or attachment artifact changed before retirement");
   }
   return previousApplication.destination;
 }
@@ -1190,6 +1441,7 @@ function genericWriteApplication(
     reviewItemId: item.id,
     proposalType: item.proposalType,
     destination,
+    expectedFinalHash: hashContents(contents),
     promotedContentHash: hashContents(contents),
     options,
   };
@@ -1209,14 +1461,85 @@ async function reconcileGenericWrite(
     || previousApplication.promotedContentHash !== prepared.promotedContentHash) {
     throw new Error("Destination already exists");
   }
-  const existing = await secureReadExisting(workspaceRoot, targetPath, "destination_reconcile", ioHooks);
-  if (hashContents(existing) !== prepared.promotedContentHash) {
+  if (!previousApplication.final) {
+    throw new Error("Existing destination has no persisted publication identity");
+  }
+  let existing;
+  try {
+    existing = await secureReadWorkspaceArtifact(
+      workspaceRoot,
+      targetPath,
+      {
+        operation: "destination_reconcile",
+        hooks: ioHooks,
+        expectedArtifact: artifactFromReviewRecord(
+          workspaceRoot,
+          previousApplication.final,
+          targetPath,
+        ),
+      },
+    );
+  } catch {
+    throw new Error("Existing destination does not match the persisted application");
+  }
+  if (existing.artifact.sha256 !== prepared.expectedFinalHash) {
     throw new Error("Existing destination does not match the persisted application");
   }
 }
 
 function hashContents(contents: string): string {
   return createHash("sha256").update(contents).digest("hex");
+}
+
+function recordReviewArtifact(
+  workspaceRoot: string,
+  artifact: SecureWorkspaceArtifactIdentity,
+): RecordedReviewArtifact {
+  return {
+    path: reviewRelativePath(workspaceRoot, artifact.targetPath),
+    parentPath: reviewRelativePath(workspaceRoot, artifact.parentPath),
+    parentRealPath: artifact.parentRealPath,
+    parentDev: artifact.parentDev,
+    parentIno: artifact.parentIno,
+    dev: artifact.fileDev,
+    ino: artifact.fileIno,
+    sha256: artifact.sha256,
+    size: artifact.size,
+  };
+}
+
+function artifactFromReviewRecord(
+  workspaceRoot: string,
+  recorded: RecordedReviewArtifact,
+  targetPathOverride?: string,
+): SecureWorkspaceArtifactIdentity {
+  return {
+    targetPath: assertInsideWorkspace(
+      workspaceRoot,
+      targetPathOverride ?? recorded.path,
+    ),
+    parentPath: assertInsideWorkspace(workspaceRoot, recorded.parentPath),
+    parentRealPath: recorded.parentRealPath,
+    parentDev: recorded.parentDev,
+    parentIno: recorded.parentIno,
+    fileDev: recorded.dev,
+    fileIno: recorded.ino,
+    sha256: recorded.sha256,
+    size: recorded.size,
+  };
+}
+
+function reviewRelativePath(
+  workspaceRoot: string,
+  targetPath: string,
+): string {
+  return path
+    .relative(
+      path.resolve(workspaceRoot),
+      assertInsideWorkspace(workspaceRoot, targetPath),
+    )
+    .split(path.sep)
+    .join("/");
 }
 
 function classificationWithCurrentOverrides(
@@ -1286,7 +1609,6 @@ function updateImportedSourceNoteRoute(
 async function rejectImportedSourceNote(
   workspaceRoot: string,
   sourceNotePath: string,
-  fileOps: ReviewImportFileOps,
   ioHooks?: IpcServices["reviewIoHooks"],
   claimFence?: () => Promise<void>,
 ): Promise<void> {
@@ -1314,7 +1636,6 @@ async function rejectImportedSourceNote(
 async function reconstructImportedSourcePayload(
   workspaceRoot: string,
   payload: { sourceNotePath: string; destination?: string },
-  fileOps: ReviewImportFileOps,
 ): Promise<ImportedSourceNotePayload> {
   const sourcePath = importStagingPath(workspaceRoot, payload.sourceNotePath);
   await assertRealPathInsideWorkspace(workspaceRoot, sourcePath, { mustExist: true });
@@ -1445,46 +1766,19 @@ function reviewImportFileOps(services: IpcServices): ReviewImportFileOps {
   return { ...defaultReviewImportFileOps, ...services.reviewImportFileOps };
 }
 
-interface PathIdentity {
-  targetPath: string;
-  parentPath: string;
-  parentRealPath: string;
-  parentDev: number;
-  parentIno: number;
-  fileDev?: number;
-  fileIno?: number;
-}
-
-interface DirectoryIdentity {
-  path: string;
-  realPath: string;
-  dev: number;
-  ino: number;
-}
-
-// Node exposes O_NOFOLLOW but not openat/unlinkat. These checks close deterministic
-// ancestor-swap windows around each operation; an OS-level rename after the final
-// identity check cannot be made fully race-free without directory-relative syscalls.
 async function secureReadExisting(
   workspaceRoot: string,
   targetPath: string,
   operation: string,
   ioHooks?: IpcServices["reviewIoHooks"],
 ): Promise<string> {
-  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
-  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
-  await revalidatePathIdentity(workspaceRoot, identity, true);
-  const handle = await open(
-    targetPath,
-    constants.O_RDONLY | noFollowFlag(),
-  );
-  try {
-    await assertHandleIdentity(handle, identity);
-    await revalidatePathIdentity(workspaceRoot, identity, true);
-    return await handle.readFile("utf8");
-  } finally {
-    await handle.close();
-  }
+  return (
+    await secureReadWorkspaceArtifact(
+      workspaceRoot,
+      targetPath,
+      { operation, hooks: ioHooks },
+    )
+  ).contents.toString("utf8");
 }
 
 async function secureRewriteExisting(
@@ -1495,307 +1789,20 @@ async function secureRewriteExisting(
   ioHooks?: IpcServices["reviewIoHooks"],
   claimFence?: () => Promise<void>,
 ): Promise<void> {
-  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
-  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
-  await revalidatePathIdentity(workspaceRoot, identity, true);
-  const handle = await open(
+  await secureRewriteWorkspaceFile(
+    workspaceRoot,
     targetPath,
-    constants.O_WRONLY | noFollowFlag(),
+    contents,
+    {
+      operation,
+      hooks: ioHooks,
+      claimFence,
+    },
   );
-  try {
-    await assertHandleIdentity(handle, identity);
-    await revalidatePathIdentity(workspaceRoot, identity, true);
-    // Node cannot atomically couple rename() to the SQLite claim CAS. Renewing
-    // immediately before mutating the verified open inode avoids that rename gap.
-    await claimFence?.();
-    await handle.truncate(0);
-    await handle.writeFile(contents, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await revalidatePathIdentity(workspaceRoot, identity, true);
-}
-
-async function secureUnlinkExisting(
-  workspaceRoot: string,
-  targetPath: string,
-  operation: string,
-  fileOps: ReviewImportFileOps,
-  ioHooks?: IpcServices["reviewIoHooks"],
-  claimFence?: () => Promise<void>,
-  expectedIdentity?: PathIdentity,
-): Promise<void> {
-  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
-  if (expectedIdentity && !samePathIdentity(identity, expectedIdentity)) {
-    throw new Error("Destination identity changed before rollback");
-  }
-  await ioHooks?.afterPathSnapshot?.(operation, targetPath);
-  await revalidatePathIdentity(workspaceRoot, identity, true);
-  await claimFence?.();
-  await fileOps.unlink(targetPath);
-}
-
-async function secureWriteExclusive(
-  workspaceRoot: string,
-  targetPath: string,
-  contents: string,
-  fileOps: ReviewImportFileOps,
-  ioHooks?: IpcServices["reviewIoHooks"],
-): Promise<PathIdentity> {
-  const nearestParent = await captureNearestExistingDirectory(workspaceRoot, path.dirname(targetPath));
-  await fileOps.mkdir(path.dirname(targetPath));
-  await revalidateDirectoryIdentity(workspaceRoot, nearestParent);
-  const identity = await capturePathIdentity(workspaceRoot, targetPath, false);
-  await ioHooks?.afterPathSnapshot?.("destination_create", targetPath);
-  await revalidatePathIdentity(workspaceRoot, identity, false);
-
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let wroteContent = false;
-  let createdIdentity: PathIdentity | undefined;
-  try {
-    handle = await open(
-      targetPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(),
-      0o600,
-    );
-    const created = await handle.stat();
-    createdIdentity = {
-      ...identity,
-      fileDev: created.dev,
-      fileIno: created.ino,
-    };
-    await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
-    await assertHandleIdentity(handle, createdIdentity);
-    await handle.writeFile(contents, "utf8");
-    wroteContent = true;
-    await handle.sync();
-    await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
-  } catch (error) {
-    if (handle && !wroteContent) {
-      await removeVerifiedEmptyCreatedFile(workspaceRoot, targetPath, handle).catch(() => undefined);
-    }
-    throw error;
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
-  if (!createdIdentity) {
-    throw new Error("Destination identity was not captured");
-  }
-  return createdIdentity;
-}
-
-function samePathIdentity(left: PathIdentity, right: PathIdentity): boolean {
-  return left.targetPath === right.targetPath
-    && left.parentRealPath === right.parentRealPath
-    && left.parentDev === right.parentDev
-    && left.parentIno === right.parentIno
-    && left.fileDev === right.fileDev
-    && left.fileIno === right.fileIno;
-}
-
-async function captureNearestExistingDirectory(
-  workspaceRoot: string,
-  targetDirectory: string,
-): Promise<DirectoryIdentity> {
-  const normalizedDirectory = assertInsideWorkspace(workspaceRoot, targetDirectory);
-  await assertNoSymlinkAncestors(workspaceRoot, normalizedDirectory);
-  let current = normalizedDirectory;
-  while (true) {
-    try {
-      const entry = await lstat(current);
-      if (!entry.isDirectory() || entry.isSymbolicLink()) {
-        throw new Error("Path resolves outside workspace");
-      }
-      const realPath = await realpath(current);
-      await assertCanonicalInsideWorkspace(workspaceRoot, realPath);
-      return { path: current, realPath, dev: entry.dev, ino: entry.ino };
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-        throw error;
-      }
-      const parent = path.dirname(current);
-      if (parent === current) {
-        throw error;
-      }
-      current = parent;
-    }
-  }
-}
-
-async function revalidateDirectoryIdentity(
-  workspaceRoot: string,
-  identity: DirectoryIdentity,
-): Promise<void> {
-  await assertNoSymlinkAncestors(workspaceRoot, identity.path);
-  const entry = await lstat(identity.path);
-  const realPath = await realpath(identity.path);
-  if (
-    !entry.isDirectory()
-    || entry.isSymbolicLink()
-    || entry.dev !== identity.dev
-    || entry.ino !== identity.ino
-    || realPath !== identity.realPath
-  ) {
-    throw new Error("Path identity changed during secure IO");
-  }
-}
-
-async function capturePathIdentity(
-  workspaceRoot: string,
-  targetPath: string,
-  includeFile: boolean,
-): Promise<PathIdentity> {
-  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
-  await assertNoSymlinkAncestors(workspaceRoot, includeFile ? normalizedTarget : path.dirname(normalizedTarget));
-  const parentPath = path.dirname(normalizedTarget);
-  const parent = await lstat(parentPath);
-  if (!parent.isDirectory() || parent.isSymbolicLink()) {
-    throw new Error("Path resolves outside workspace");
-  }
-  const parentRealPath = await realpath(parentPath);
-  await assertCanonicalInsideWorkspace(workspaceRoot, parentRealPath);
-  const identity: PathIdentity = {
-    targetPath: normalizedTarget,
-    parentPath,
-    parentRealPath,
-    parentDev: parent.dev,
-    parentIno: parent.ino,
-  };
-  if (includeFile) {
-    const file = await lstat(normalizedTarget);
-    if (!file.isFile() || file.isSymbolicLink()) {
-      throw new Error("Path resolves outside workspace");
-    }
-    identity.fileDev = file.dev;
-    identity.fileIno = file.ino;
-    await assertRealPathInsideWorkspace(workspaceRoot, normalizedTarget, { mustExist: true });
-  }
-  return identity;
-}
-
-async function assertCanonicalInsideWorkspace(workspaceRoot: string, canonicalPath: string): Promise<void> {
-  const canonicalRoot = await realpath(workspaceRoot);
-  const relative = path.relative(canonicalRoot, canonicalPath);
-  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error("Path resolves outside workspace");
-  }
-}
-
-async function revalidatePathIdentity(
-  workspaceRoot: string,
-  identity: PathIdentity,
-  includeFile: boolean,
-): Promise<void> {
-  await assertNoSymlinkAncestors(workspaceRoot, includeFile ? identity.targetPath : identity.parentPath);
-  const parent = await lstat(identity.parentPath);
-  const parentRealPath = await realpath(identity.parentPath);
-  if (
-    !parent.isDirectory()
-    || parent.isSymbolicLink()
-    || parent.dev !== identity.parentDev
-    || parent.ino !== identity.parentIno
-    || parentRealPath !== identity.parentRealPath
-  ) {
-    throw new Error("Path identity changed during secure IO");
-  }
-  if (includeFile) {
-    const file = await lstat(identity.targetPath);
-    if (
-      !file.isFile()
-      || file.isSymbolicLink()
-      || file.dev !== identity.fileDev
-      || file.ino !== identity.fileIno
-    ) {
-      throw new Error("Path identity changed during secure IO");
-    }
-    await assertRealPathInsideWorkspace(workspaceRoot, identity.targetPath, { mustExist: true });
-  }
-}
-
-async function assertHandleIdentity(
-  handle: Awaited<ReturnType<typeof open>>,
-  identity: PathIdentity,
-): Promise<void> {
-  const file = await handle.stat();
-  if (!file.isFile() || file.dev !== identity.fileDev || file.ino !== identity.fileIno) {
-    throw new Error("Path identity changed during secure IO");
-  }
-}
-
-async function assertNoSymlinkAncestors(workspaceRoot: string, targetPath: string): Promise<void> {
-  const root = path.resolve(workspaceRoot);
-  const target = assertInsideWorkspace(root, targetPath);
-  const relative = path.relative(root, target);
-  let current = root;
-  for (const segment of relative.split(path.sep).filter(Boolean)) {
-    current = path.join(current, segment);
-    try {
-      const entry = await lstat(current);
-      if (entry.isSymbolicLink()) {
-        throw new Error("Path resolves outside workspace");
-      }
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return;
-      }
-      throw error;
-    }
-  }
-}
-
-async function removeVerifiedEmptyCreatedFile(
-  workspaceRoot: string,
-  targetPath: string,
-  handle: Awaited<ReturnType<typeof open>>,
-): Promise<void> {
-  const opened = await handle.stat();
-  if (opened.size !== 0) {
-    return;
-  }
-  const canonicalPath = await realpath(targetPath);
-  const canonical = await lstat(canonicalPath);
-  if (
-    canonical.isSymbolicLink()
-    || canonical.dev !== opened.dev
-    || canonical.ino !== opened.ino
-    || canonical.size !== 0
-  ) {
-    return;
-  }
-  const canonicalRoot = await realpath(workspaceRoot);
-  const relative = path.relative(canonicalRoot, canonicalPath);
-  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    await unlink(canonicalPath);
-    return;
-  }
-  await unlink(canonicalPath);
-}
-
-function noFollowFlag(): number {
-  return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
 }
 
 const defaultReviewImportFileOps: ReviewImportFileOps = {
-  mkdir: async (directoryPath) => {
-    await mkdir(directoryPath, { recursive: true });
-  },
-  pathExists: async (targetPath) => access(targetPath).then(
-    () => true,
-    (error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return false;
-      }
-      throw error;
-    },
-  ),
-  readFile: async (targetPath) => readFile(targetPath),
   unlink: async (targetPath) => unlink(targetPath),
-  writeFile: async (targetPath, contents, exclusive) => writeFile(
-    targetPath,
-    contents,
-    { encoding: "utf8", flag: exclusive ? "wx" : "w" },
-  ),
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1810,8 +1817,6 @@ interface UserRoutingRule {
   sourceReviewItemId: string;
   createdAt: string;
 }
-
-const routingRuleWriteQueues = new Map<string, Promise<void>>();
 
 async function saveUserRoutingRule(
   services: IpcServices,
@@ -1828,119 +1833,98 @@ async function saveUserRoutingRule(
     createdAt: input.createdAt,
   };
 
-  await withRoutingRuleWriteLock(workspaceRoot, async () => {
-    await appendRoutingPolicyRule(workspaceRoot, rule);
-    await appendAgentsRoutingRule(workspaceRoot, rule);
-    await writeRoutingRuleAdr(workspaceRoot, rule);
+  await withWorkspaceWriteLock(workspaceRoot, async (canonicalRoot) => {
+    const rules = await appendRoutingPolicyRule(canonicalRoot, rule);
+    await syncAgentsRoutingRules(canonicalRoot, rules);
+    await writeRoutingRuleAdr(canonicalRoot, rule);
   });
 }
 
-async function appendRoutingPolicyRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
+async function appendRoutingPolicyRule(
+  workspaceRoot: string,
+  rule: UserRoutingRule,
+): Promise<UserRoutingRule[]> {
   const policyPath = assertInsideWorkspace(workspaceRoot, ".vault/routing-policy.json");
-  await mkdir(path.dirname(policyPath), { recursive: true });
-  const existing = await readFile(policyPath, "utf8")
-    .then((content) => JSON.parse(content) as { version?: number; rules?: UserRoutingRule[] })
-    .catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return { version: 1, rules: [] };
-      }
-      throw error;
-    });
-  const rules = existing.rules ?? [];
+  const snapshot = await readOptionalWorkspaceArtifact(
+    workspaceRoot,
+    policyPath,
+    "routing_policy_read",
+  );
+  const existing = snapshot
+    ? JSON.parse(snapshot.contents.toString("utf8")) as {
+      version?: number;
+      rules?: UserRoutingRule[];
+    }
+    : { version: 1, rules: [] };
+  const rules = [...(existing.rules ?? [])];
   if (!rules.some((existingRule) => existingRule.id === rule.id)) {
     rules.push(rule);
   }
-  await atomicWriteWorkspaceText(
+  await secureAtomicReplaceWorkspaceFile(
     workspaceRoot,
     policyPath,
     `${JSON.stringify({ version: 1, rules }, null, 2)}\n`,
+    {
+      operation: "routing_policy_write",
+      ...(snapshot === undefined
+        ? { requireAbsent: true }
+        : { expectedArtifact: snapshot.artifact }),
+    },
+  );
+  return rules;
+}
+
+async function syncAgentsRoutingRules(
+  workspaceRoot: string,
+  rules: UserRoutingRule[],
+): Promise<void> {
+  const agentsPath = assertInsideWorkspace(workspaceRoot, "AGENTS.md");
+  const snapshot = await readOptionalWorkspaceArtifact(
+    workspaceRoot,
+    agentsPath,
+    "routing_agents_read",
+  );
+  const current = snapshot?.contents.toString("utf8")
+    ?? "# Workspace Contract\n";
+  const heading = "## User Routing Rules";
+  let next = current.includes(heading)
+    ? current
+    : `${current.trimEnd()}\n\n${heading}\n`;
+  for (const rule of rules) {
+    const ruleLine = `- ${rule.pattern} -> ${rule.destination}`;
+    if (!next.includes(ruleLine)) {
+      next = next.replace(heading, `${heading}\n${ruleLine}`);
+    }
+  }
+  if (!next.endsWith("\n")) {
+    next += "\n";
+  }
+  await secureAtomicReplaceWorkspaceFile(
+    workspaceRoot,
+    agentsPath,
+    next,
+    {
+      operation: "routing_agents_write",
+      ...(snapshot === undefined
+        ? { requireAbsent: true }
+        : { expectedArtifact: snapshot.artifact }),
+    },
   );
 }
 
-async function appendAgentsRoutingRule(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
-  const agentsPath = assertInsideWorkspace(workspaceRoot, "AGENTS.md");
-  const current = await readFile(agentsPath, "utf8").catch((error: unknown) => {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return "# Workspace Contract\n";
-    }
-    throw error;
-  });
-  const ruleLine = `- ${rule.pattern} -> ${rule.destination}`;
-  if (current.includes(ruleLine)) {
-    return;
-  }
-  const heading = "## User Routing Rules";
-  const next = current.includes(heading)
-    ? current.replace(heading, `${heading}\n${ruleLine}`)
-    : `${current.trimEnd()}\n\n${heading}\n\n${ruleLine}\n`;
-  await atomicWriteWorkspaceText(workspaceRoot, agentsPath, next);
-}
-
-async function withRoutingRuleWriteLock(
-  workspaceRoot: string,
-  operation: () => Promise<void>,
-): Promise<void> {
-  const key = path.resolve(workspaceRoot);
-  const previous = routingRuleWriteQueues.get(key) ?? Promise.resolve();
-  const run = previous.catch(() => undefined).then(operation);
-  const tail = run.then(() => undefined, () => undefined);
-  routingRuleWriteQueues.set(key, tail);
-  try {
-    await run;
-  } finally {
-    if (routingRuleWriteQueues.get(key) === tail) {
-      routingRuleWriteQueues.delete(key);
-    }
-  }
-}
-
-async function atomicWriteWorkspaceText(
+async function readOptionalWorkspaceArtifact(
   workspaceRoot: string,
   targetPath: string,
-  contents: string,
-): Promise<void> {
-  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
-  const parentPath = path.dirname(normalizedTarget);
-  await mkdir(parentPath, { recursive: true });
-  const parentIdentity = await capturePathIdentity(
-    workspaceRoot,
-    normalizedTarget,
-    false,
-  );
-  const tempPath = path.join(
-    parentPath,
-    `.${path.basename(normalizedTarget)}.${randomUUID()}.tmp`,
-  );
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(
-      tempPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(),
-      0o600,
-    );
-    await handle.writeFile(contents, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await revalidatePathIdentity(workspaceRoot, parentIdentity, false);
-    await rename(tempPath, normalizedTarget);
-    const directoryHandle = await open(parentPath, constants.O_RDONLY);
-    try {
-      await directoryHandle.sync();
-    } finally {
-      await directoryHandle.close();
-    }
-    await revalidatePathIdentity(workspaceRoot, parentIdentity, false);
-  } catch (error) {
-    await handle?.close().catch(() => undefined);
-    await unlink(tempPath).catch(() => undefined);
-    throw error;
+  operation: string,
+) {
+  if (!await secureWorkspacePathExists(workspaceRoot, targetPath)) {
+    return undefined;
   }
+  return secureReadWorkspaceArtifact(workspaceRoot, targetPath, { operation });
 }
 
 async function writeRoutingRuleAdr(workspaceRoot: string, rule: UserRoutingRule): Promise<void> {
   const adrPath = assertInsideWorkspace(workspaceRoot, defaultRoutingPolicy.decisionPath(rule.id));
-  await mkdir(path.dirname(adrPath), { recursive: true });
   const contents = `# User-defined routing rule
 
 **Date:** ${rule.createdAt.slice(0, 10)}
@@ -1970,17 +1954,21 @@ ${rule.destination}
 - The workspace contract records the user-readable rule in \`AGENTS.md\`.
 - The source Review item is \`${rule.sourceReviewItemId}\`.
 `;
-  try {
-    await writeFile(adrPath, contents, { encoding: "utf8", flag: "wx" });
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
-      throw error;
-    }
-    const existing = await readFile(adrPath, "utf8");
-    if (!existing.includes(`The source Review item is \`${rule.sourceReviewItemId}\`.`)) {
+  const existing = await readOptionalWorkspaceArtifact(
+    workspaceRoot,
+    adrPath,
+    "routing_adr_read",
+  );
+  if (existing) {
+    const existingBody = existing.contents.toString("utf8");
+    if (!existingBody.includes(`The source Review item is \`${rule.sourceReviewItemId}\`.`)) {
       throw new Error("Saved routing rule ADR conflicts with an existing file");
     }
+    return;
   }
+  await securePublishWorkspaceFileAtomic(workspaceRoot, adrPath, contents, {
+    operation: "routing_adr_create",
+  });
 }
 
 function routingPatternFor(item: ReviewItem): string {
@@ -2053,7 +2041,7 @@ function extractMemoryBody(payload: unknown): string | null {
 
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
   services.db?.close();
-  services.workspaceRoot = path.resolve(rootPath);
+  services.workspaceRoot = await realpath(path.resolve(rootPath));
   await syncWorkspaceContract(services.workspaceRoot);
   await recoverImportPromotions(services.workspaceRoot);
   if (services.settingsPath) {

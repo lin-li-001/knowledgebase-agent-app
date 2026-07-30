@@ -1,18 +1,36 @@
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
+  link,
   lstat,
   mkdir,
   open,
   readFile,
   readdir,
   realpath,
+  rename,
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
 import { assertInsideWorkspace, assertRealPathInsideWorkspace } from "./pathGuard";
 
+export type SecureDestructivePhase =
+  | "quarantine_rename"
+  | "quarantine_unlink";
+
 export interface SecureWorkspaceIoHooks {
   afterPathSnapshot?(operation: string, targetPath: string): Promise<void>;
+  afterWriteChunk?(
+    operation: string,
+    tempPath: string,
+    bytesWritten: number,
+    totalBytes: number,
+  ): Promise<void>;
+  beforeDestructiveOperation?(
+    operation: string,
+    phase: SecureDestructivePhase,
+    targetPath: string,
+  ): Promise<void>;
 }
 
 export interface SecureWorkspacePathIdentity {
@@ -23,6 +41,19 @@ export interface SecureWorkspacePathIdentity {
   parentIno: number;
   fileDev?: number;
   fileIno?: number;
+}
+
+export interface SecureWorkspaceArtifactIdentity
+  extends SecureWorkspacePathIdentity {
+  fileDev: number;
+  fileIno: number;
+  sha256: string;
+  size: number;
+}
+
+export interface SecureWorkspaceFileSnapshot {
+  artifact: SecureWorkspaceArtifactIdentity;
+  contents: Buffer;
 }
 
 interface DirectoryIdentity {
@@ -37,28 +68,68 @@ interface SecureIoOptions {
   operation: string;
 }
 
+interface SecureRemovalOptions extends SecureIoOptions {
+  afterQuarantine?(
+    artifact: SecureWorkspaceArtifactIdentity,
+  ): Promise<void>;
+  claimFence?: (() => Promise<void>) | undefined;
+  quarantinePath?: string | undefined;
+  unlinkFile?: ((targetPath: string) => Promise<void>) | undefined;
+}
+
+interface SecureAtomicWriteOptions extends SecureIoOptions {
+  expectedArtifact?: SecureWorkspaceArtifactIdentity | undefined;
+  requireAbsent?: boolean | undefined;
+  afterTempSync?(
+    artifact: SecureWorkspaceArtifactIdentity,
+  ): Promise<void>;
+  afterPublish?(
+    artifact: SecureWorkspaceArtifactIdentity,
+    tempArtifact: SecureWorkspaceArtifactIdentity,
+  ): Promise<void>;
+}
+
 export async function secureCopyFileIntoWorkspace(
   workspaceRoot: string,
   sourcePath: string,
   targetPath: string,
   options: SecureIoOptions,
-): Promise<SecureWorkspacePathIdentity> {
+): Promise<SecureWorkspaceFileSnapshot> {
   const contents = await readFile(sourcePath);
-  return secureWriteWorkspaceFileExclusive(
+  const artifact = await secureWriteWorkspaceFileExclusive(
     workspaceRoot,
     targetPath,
     contents,
     options,
   );
+  return secureReadWorkspaceArtifact(
+    workspaceRoot,
+    targetPath,
+    {
+      operation: options.operation === "attachment_create"
+        ? "attachment_verify"
+        : `${options.operation}_verify`,
+      hooks: options.hooks,
+      expectedArtifact: artifact,
+    },
+  );
 }
 
-export async function secureReadWorkspaceFile(
+export async function secureReadWorkspaceArtifact(
   workspaceRoot: string,
   targetPath: string,
-  options: SecureIoOptions,
-): Promise<Buffer> {
+  options: SecureIoOptions & {
+    expectedArtifact?: SecureWorkspaceArtifactIdentity | undefined;
+  },
+): Promise<SecureWorkspaceFileSnapshot> {
   const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
-  await options.hooks?.afterPathSnapshot?.(options.operation, targetPath);
+  if (
+    options.expectedArtifact
+    && !samePathIdentity(identity, options.expectedArtifact)
+  ) {
+    throw new Error("Artifact identity changed during secure IO");
+  }
+  await options.hooks?.afterPathSnapshot?.(options.operation, identity.targetPath);
   await revalidatePathIdentity(workspaceRoot, identity, true);
   const handle = await open(
     identity.targetPath,
@@ -67,10 +138,32 @@ export async function secureReadWorkspaceFile(
   try {
     await assertHandleIdentity(handle, identity);
     await revalidatePathIdentity(workspaceRoot, identity, true);
-    return await handle.readFile();
+    const contents = await handle.readFile();
+    const artifact = await artifactIdentity(handle, identity, contents);
+    if (
+      options.expectedArtifact
+      && !sameArtifactIdentity(artifact, options.expectedArtifact)
+    ) {
+      throw new Error(
+        artifact.sha256 === options.expectedArtifact.sha256
+          ? "Artifact identity changed during secure IO"
+          : "Artifact hash changed during secure IO",
+      );
+    }
+    return { artifact, contents };
   } finally {
     await handle.close();
   }
+}
+
+export async function secureReadWorkspaceFile(
+  workspaceRoot: string,
+  targetPath: string,
+  options: SecureIoOptions,
+): Promise<Buffer> {
+  return (
+    await secureReadWorkspaceArtifact(workspaceRoot, targetPath, options)
+  ).contents;
 }
 
 export async function secureReadWorkspaceText(
@@ -88,25 +181,26 @@ export async function secureRewriteWorkspaceFile(
   options: SecureIoOptions & {
     claimFence?: (() => Promise<void>) | undefined;
   },
-): Promise<void> {
+): Promise<SecureWorkspaceArtifactIdentity> {
   const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
-  await options.hooks?.afterPathSnapshot?.(options.operation, targetPath);
+  await options.hooks?.afterPathSnapshot?.(options.operation, identity.targetPath);
   await revalidatePathIdentity(workspaceRoot, identity, true);
   const handle = await open(
     identity.targetPath,
     constants.O_WRONLY | noFollowFlag(),
   );
+  const bytes = toBuffer(contents);
   try {
     await assertHandleIdentity(handle, identity);
     await revalidatePathIdentity(workspaceRoot, identity, true);
     await options.claimFence?.();
     await handle.truncate(0);
-    await handle.writeFile(contents);
+    await writeAll(handle, bytes, options.operation, identity.targetPath, options.hooks);
     await handle.sync();
+    return artifactIdentity(handle, identity, bytes);
   } finally {
     await handle.close();
   }
-  await revalidatePathIdentity(workspaceRoot, identity, true);
 }
 
 export async function secureWriteWorkspaceFileExclusive(
@@ -114,7 +208,7 @@ export async function secureWriteWorkspaceFileExclusive(
   targetPath: string,
   contents: string | Buffer,
   options: SecureIoOptions,
-): Promise<SecureWorkspacePathIdentity> {
+): Promise<SecureWorkspaceArtifactIdentity> {
   const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
   await secureEnsureWorkspaceDirectory(
     workspaceRoot,
@@ -128,8 +222,8 @@ export async function secureWriteWorkspaceFileExclusive(
   await options.hooks?.afterPathSnapshot?.(options.operation, normalizedTarget);
   await revalidatePathIdentity(workspaceRoot, identity, false);
 
+  const bytes = toBuffer(contents);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let wroteContent = false;
   let createdIdentity: SecureWorkspacePathIdentity | undefined;
   try {
     handle = await open(
@@ -145,49 +239,264 @@ export async function secureWriteWorkspaceFileExclusive(
     };
     await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
     await assertHandleIdentity(handle, createdIdentity);
-    await handle.writeFile(contents);
-    wroteContent = true;
+    await writeAll(
+      handle,
+      bytes,
+      options.operation,
+      normalizedTarget,
+      options.hooks,
+    );
     await handle.sync();
-    await revalidatePathIdentity(workspaceRoot, createdIdentity, true);
+    const artifact = await artifactIdentity(handle, createdIdentity, bytes);
+    await revalidatePathIdentity(workspaceRoot, artifact, true);
+    return artifact;
   } catch (error) {
-    if (handle && !wroteContent) {
-      await removeVerifiedEmptyCreatedFile(
+    await handle?.close().catch(() => undefined);
+    handle = undefined;
+    if (createdIdentity) {
+      await cleanupCreatedArtifact(
         workspaceRoot,
-        normalizedTarget,
-        handle,
+        createdIdentity,
+        options,
       ).catch(() => undefined);
     }
     throw error;
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
 
-  if (!createdIdentity) {
-    throw new Error("Destination identity was not captured");
+export async function securePublishWorkspaceFileAtomic(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string | Buffer,
+  options: SecureAtomicWriteOptions,
+): Promise<SecureWorkspaceArtifactIdentity> {
+  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
+  await secureEnsureWorkspaceDirectory(workspaceRoot, path.dirname(normalizedTarget));
+  const parent = await captureDirectoryIdentity(
+    workspaceRoot,
+    path.dirname(normalizedTarget),
+  );
+  const bytes = toBuffer(contents);
+  const tempArtifact = await writeAtomicTemp(
+    workspaceRoot,
+    normalizedTarget,
+    bytes,
+    options,
+    "publish",
+  );
+
+  await options.afterTempSync?.(tempArtifact);
+  await options.hooks?.afterPathSnapshot?.(options.operation, normalizedTarget);
+  await revalidateDirectoryIdentity(workspaceRoot, parent);
+  if (await secureWorkspacePathExists(workspaceRoot, normalizedTarget)) {
+    throw fileExistsError("Destination already exists");
   }
-  return createdIdentity;
+
+  await link(tempArtifact.targetPath, normalizedTarget);
+  await syncWorkspaceDirectory(workspaceRoot, parent.path);
+  const published = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    normalizedTarget,
+    {
+      operation: `${options.operation}_published_verify`,
+      expectedArtifact: {
+        ...tempArtifact,
+        targetPath: normalizedTarget,
+      },
+    },
+  ).then((snapshot) => snapshot.artifact);
+  await options.afterPublish?.(published, tempArtifact);
+  await secureRemoveWorkspaceArtifact(workspaceRoot, tempArtifact, {
+    operation: `${options.operation}_temp_cleanup`,
+    hooks: options.hooks,
+  });
+  return published;
+}
+
+export async function secureAtomicReplaceWorkspaceFile(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: string | Buffer,
+  options: SecureAtomicWriteOptions,
+): Promise<SecureWorkspaceArtifactIdentity> {
+  const normalizedTarget = assertInsideWorkspace(workspaceRoot, targetPath);
+  await secureEnsureWorkspaceDirectory(workspaceRoot, path.dirname(normalizedTarget));
+  const parent = await captureDirectoryIdentity(
+    workspaceRoot,
+    path.dirname(normalizedTarget),
+  );
+  const bytes = toBuffer(contents);
+  const tempArtifact = await writeAtomicTemp(
+    workspaceRoot,
+    normalizedTarget,
+    bytes,
+    options,
+    "replace",
+  );
+
+  await options.afterTempSync?.(tempArtifact);
+  await options.hooks?.afterPathSnapshot?.(options.operation, normalizedTarget);
+  await revalidateDirectoryIdentity(workspaceRoot, parent);
+  if (options.expectedArtifact) {
+    await secureReadWorkspaceArtifact(workspaceRoot, normalizedTarget, {
+      operation: `${options.operation}_authority_verify`,
+      expectedArtifact: options.expectedArtifact,
+    });
+  } else if (options.requireAbsent && await secureWorkspacePathExists(workspaceRoot, normalizedTarget)) {
+    throw fileExistsError("Destination already exists");
+  }
+
+  await rename(tempArtifact.targetPath, normalizedTarget);
+  await syncWorkspaceDirectory(workspaceRoot, parent.path);
+  const published = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    normalizedTarget,
+    {
+      operation: `${options.operation}_published_verify`,
+      expectedArtifact: {
+        ...tempArtifact,
+        targetPath: normalizedTarget,
+      },
+    },
+  ).then((snapshot) => snapshot.artifact);
+  await options.afterPublish?.(published, tempArtifact);
+  return published;
+}
+
+export async function secureRemoveWorkspaceArtifact(
+  workspaceRoot: string,
+  artifact: SecureWorkspaceArtifactIdentity,
+  options: SecureRemovalOptions,
+): Promise<void> {
+  const targetPath = assertInsideWorkspace(workspaceRoot, artifact.targetPath);
+  const verified = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    targetPath,
+    {
+      operation: options.operation,
+      hooks: options.hooks,
+      expectedArtifact: artifact,
+    },
+  );
+  await options.hooks?.beforeDestructiveOperation?.(
+    options.operation,
+    "quarantine_rename",
+    targetPath,
+  );
+  await secureReadWorkspaceArtifact(workspaceRoot, targetPath, {
+    operation: `${options.operation}_rename_fence`,
+    expectedArtifact: verified.artifact,
+  });
+  await options.claimFence?.();
+
+  const quarantinePath = options.quarantinePath
+    ? assertInsideWorkspace(workspaceRoot, options.quarantinePath)
+    : path.join(
+      artifact.parentPath,
+      `.${path.basename(targetPath)}.${randomUUID()}.quarantine`,
+    );
+  if (path.dirname(quarantinePath) !== artifact.parentPath) {
+    throw new Error("Artifact quarantine must stay in its verified parent");
+  }
+  if (await secureWorkspacePathExists(workspaceRoot, quarantinePath)) {
+    throw fileExistsError("Artifact quarantine already exists");
+  }
+  await rename(targetPath, quarantinePath);
+  await syncWorkspaceDirectory(workspaceRoot, artifact.parentPath);
+  const quarantine = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    quarantinePath,
+    { operation: `${options.operation}_quarantine_verify` },
+  );
+  if (!sameFileArtifact(quarantine.artifact, artifact)) {
+    throw new Error("Quarantined artifact identity changed");
+  }
+  await options.afterQuarantine?.(quarantine.artifact);
+
+  await options.hooks?.beforeDestructiveOperation?.(
+    options.operation,
+    "quarantine_unlink",
+    quarantinePath,
+  );
+  await revalidateOriginalParent(workspaceRoot, artifact);
+  await secureReadWorkspaceArtifact(workspaceRoot, quarantinePath, {
+    operation: `${options.operation}_unlink_fence`,
+    expectedArtifact: quarantine.artifact,
+  });
+  try {
+    await (options.unlinkFile ?? unlink)(quarantinePath);
+    await syncWorkspaceDirectory(workspaceRoot, artifact.parentPath);
+  } catch (error) {
+    await restoreQuarantinedArtifact(
+      workspaceRoot,
+      quarantine.artifact,
+      targetPath,
+    ).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function secureQuarantineWorkspaceArtifact(
+  workspaceRoot: string,
+  artifact: SecureWorkspaceArtifactIdentity,
+  label: string,
+  options: SecureIoOptions,
+): Promise<SecureWorkspaceArtifactIdentity> {
+  await secureReadWorkspaceArtifact(workspaceRoot, artifact.targetPath, {
+    operation: options.operation,
+    hooks: options.hooks,
+    expectedArtifact: artifact,
+  });
+  await options.hooks?.beforeDestructiveOperation?.(
+    options.operation,
+    "quarantine_rename",
+    artifact.targetPath,
+  );
+  await secureReadWorkspaceArtifact(workspaceRoot, artifact.targetPath, {
+    operation: `${options.operation}_rename_fence`,
+    expectedArtifact: artifact,
+  });
+  const quarantinePath = path.join(
+    artifact.parentPath,
+    `.${path.basename(artifact.targetPath)}.${randomUUID()}.${label}`,
+  );
+  await rename(artifact.targetPath, quarantinePath);
+  await syncWorkspaceDirectory(workspaceRoot, artifact.parentPath);
+  const quarantined = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    quarantinePath,
+    { operation: `${options.operation}_quarantine_verify` },
+  ).then((snapshot) => snapshot.artifact);
+  if (!sameFileArtifact(quarantined, artifact)) {
+    throw new Error("Quarantined artifact identity changed");
+  }
+  return quarantined;
 }
 
 export async function secureUnlinkWorkspaceFile(
   workspaceRoot: string,
   targetPath: string,
-  options: SecureIoOptions & {
-    claimFence?: (() => Promise<void>) | undefined;
+  options: SecureRemovalOptions & {
     expectedIdentity?: SecureWorkspacePathIdentity | undefined;
-    unlinkFile?: ((targetPath: string) => Promise<void>) | undefined;
   },
 ): Promise<void> {
-  const identity = await capturePathIdentity(workspaceRoot, targetPath, true);
+  const snapshot = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    targetPath,
+    {
+      operation: `${options.operation}_capture`,
+      hooks: options.hooks,
+    },
+  );
   if (
     options.expectedIdentity
-    && !samePathIdentity(identity, options.expectedIdentity)
+    && !samePathIdentity(snapshot.artifact, options.expectedIdentity)
   ) {
     throw new Error("Destination identity changed before rollback");
   }
-  await options.hooks?.afterPathSnapshot?.(options.operation, targetPath);
-  await revalidatePathIdentity(workspaceRoot, identity, true);
-  await options.claimFence?.();
-  await (options.unlinkFile ?? unlink)(identity.targetPath);
+  await secureRemoveWorkspaceArtifact(workspaceRoot, snapshot.artifact, options);
 }
 
 export async function secureWorkspacePathExists(
@@ -258,6 +567,155 @@ export async function syncWorkspaceDirectory(
     await handle.close();
   }
   await revalidateDirectoryIdentity(workspaceRoot, identity);
+}
+
+export function sameArtifactIdentity(
+  left: SecureWorkspaceArtifactIdentity,
+  right: SecureWorkspaceArtifactIdentity,
+): boolean {
+  return samePathIdentity(left, right)
+    && left.sha256 === right.sha256
+    && left.size === right.size;
+}
+
+async function writeAtomicTemp(
+  workspaceRoot: string,
+  targetPath: string,
+  contents: Buffer,
+  options: SecureAtomicWriteOptions,
+  kind: string,
+): Promise<SecureWorkspaceArtifactIdentity> {
+  const tempPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${randomUUID()}.${kind}.tmp`,
+  );
+  return secureWriteWorkspaceFileExclusive(
+    workspaceRoot,
+    tempPath,
+    contents,
+    {
+      operation: options.operation,
+      hooks: options.hooks,
+    },
+  );
+}
+
+async function writeAll(
+  handle: Awaited<ReturnType<typeof open>>,
+  contents: Buffer,
+  operation: string,
+  targetPath: string,
+  hooks?: SecureWorkspaceIoHooks,
+): Promise<void> {
+  let offset = 0;
+  while (offset < contents.length) {
+    const remaining = contents.length - offset;
+    const chunkLength = offset === 0 && remaining > 1
+      ? Math.max(1, Math.floor(remaining / 2))
+      : remaining;
+    const { bytesWritten } = await handle.write(
+      contents,
+      offset,
+      chunkLength,
+      offset,
+    );
+    if (bytesWritten <= 0) {
+      throw new Error("Secure write made no progress");
+    }
+    offset += bytesWritten;
+    await hooks?.afterWriteChunk?.(
+      operation,
+      targetPath,
+      offset,
+      contents.length,
+    );
+  }
+}
+
+async function artifactIdentity(
+  handle: Awaited<ReturnType<typeof open>>,
+  identity: SecureWorkspacePathIdentity,
+  contents: Buffer,
+): Promise<SecureWorkspaceArtifactIdentity> {
+  const file = await handle.stat();
+  if (
+    !file.isFile()
+    || file.dev !== identity.fileDev
+    || file.ino !== identity.fileIno
+  ) {
+    throw new Error("Path identity changed during secure IO");
+  }
+  return {
+    ...identity,
+    fileDev: file.dev,
+    fileIno: file.ino,
+    sha256: hashContents(contents),
+    size: file.size,
+  };
+}
+
+async function cleanupCreatedArtifact(
+  workspaceRoot: string,
+  identity: SecureWorkspacePathIdentity,
+  options: SecureIoOptions,
+): Promise<void> {
+  const snapshot = await secureReadWorkspaceArtifact(
+    workspaceRoot,
+    identity.targetPath,
+    {
+      operation: `${options.operation}_failed_create_capture`,
+      expectedArtifact: undefined,
+    },
+  );
+  if (!samePathIdentity(snapshot.artifact, identity)) {
+    return;
+  }
+  await secureRemoveWorkspaceArtifact(workspaceRoot, snapshot.artifact, {
+    operation: `${options.operation}_failed_create_cleanup`,
+    hooks: options.hooks,
+  });
+}
+
+async function restoreQuarantinedArtifact(
+  workspaceRoot: string,
+  quarantine: SecureWorkspaceArtifactIdentity,
+  targetPath: string,
+): Promise<void> {
+  await revalidateOriginalParent(workspaceRoot, quarantine);
+  if (await secureWorkspacePathExists(workspaceRoot, targetPath)) {
+    return;
+  }
+  await secureReadWorkspaceArtifact(workspaceRoot, quarantine.targetPath, {
+    operation: "quarantine_restore_verify",
+    expectedArtifact: quarantine,
+  });
+  await rename(quarantine.targetPath, targetPath);
+  await syncWorkspaceDirectory(workspaceRoot, quarantine.parentPath);
+}
+
+async function revalidateOriginalParent(
+  workspaceRoot: string,
+  artifact: SecureWorkspaceArtifactIdentity,
+): Promise<void> {
+  await revalidateDirectoryIdentity(workspaceRoot, {
+    path: artifact.parentPath,
+    realPath: artifact.parentRealPath,
+    dev: artifact.parentDev,
+    ino: artifact.parentIno,
+  });
+}
+
+function sameFileArtifact(
+  left: SecureWorkspaceArtifactIdentity,
+  right: SecureWorkspaceArtifactIdentity,
+): boolean {
+  return left.parentRealPath === right.parentRealPath
+    && left.parentDev === right.parentDev
+    && left.parentIno === right.parentIno
+    && left.fileDev === right.fileDev
+    && left.fileIno === right.fileIno
+    && left.sha256 === right.sha256
+    && left.size === right.size;
 }
 
 function samePathIdentity(
@@ -468,31 +926,20 @@ async function assertNoSymlinkAncestors(
   }
 }
 
-async function removeVerifiedEmptyCreatedFile(
-  workspaceRoot: string,
-  targetPath: string,
-  handle: Awaited<ReturnType<typeof open>>,
-): Promise<void> {
-  const opened = await handle.stat();
-  if (opened.size !== 0) {
-    return;
-  }
-  const canonicalPath = await realpath(targetPath);
-  const canonical = await lstat(canonicalPath);
-  if (
-    canonical.isSymbolicLink()
-    || canonical.dev !== opened.dev
-    || canonical.ino !== opened.ino
-    || canonical.size !== 0
-  ) {
-    return;
-  }
-  await assertCanonicalInsideWorkspace(workspaceRoot, canonicalPath);
-  await unlink(canonicalPath);
+function toBuffer(contents: string | Buffer): Buffer {
+  return Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
+}
+
+function hashContents(contents: Buffer): string {
+  return createHash("sha256").update(contents).digest("hex");
 }
 
 function noFollowFlag(): number {
   return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+}
+
+function fileExistsError(message: string): Error {
+  return Object.assign(new Error(message), { code: "EEXIST" });
 }
 
 function isMissingPathError(error: unknown): boolean {

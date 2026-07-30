@@ -212,6 +212,35 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
   });
 
+  it("offers approval recovery and no rejection for a prepared application", () => {
+    const reject = vi.fn(async () => undefined);
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-prepared",
+          state: "failed",
+          proposalType: "propose_create_note",
+          risk: "high",
+          reason: "Previous approval stopped after publication.",
+          targetPath: "04-Resources/Approved/A.md",
+          payload: {
+            path: "04-Resources/Approved/A.md",
+            body: "# Approved A",
+          },
+          application: {
+            kind: "exclusive_write",
+            destination: "04-Resources/Approved/A.md",
+          },
+        }}
+        onReject={reject}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Resume approval" })).toBeEnabled();
+    expect(screen.getByText(/approval is already prepared/iu)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
+  });
+
   it("disables Review actions while an approval is pending and prevents duplicate requests", async () => {
     let resolveApproval: (() => void) | undefined;
     const approve = vi.fn(() => new Promise<void>((resolve) => {

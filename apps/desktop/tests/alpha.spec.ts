@@ -1,5 +1,5 @@
 import { test, expect, _electron as electron, type Locator } from "@playwright/test";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -75,7 +75,9 @@ test("restores the saved workspace on the next desktop launch", async () => {
   const nextWindow = await nextApp.firstWindow();
   await expect(nextWindow.getByText("Workspace active").first()).toBeVisible();
   await nextWindow.getByRole("button", { name: "Settings" }).click();
-  await expect(nextWindow.getByLabel("Workspace Root")).toHaveValue(workspaceRoot);
+  await expect(nextWindow.getByLabel("Workspace Root")).toHaveValue(
+    await realpath(workspaceRoot),
+  );
   await nextApp.close();
 });
 

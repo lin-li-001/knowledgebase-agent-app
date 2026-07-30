@@ -23,11 +23,11 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   const workspaceContractSource = await readSource(repoRoot, "packages/workspace/src/templates.ts", input.sourceOverrides);
   const generatedWorkspaceContract = await readGeneratedWorkspaceContract(input.workspaceRoot, result);
   const importSourceNoteRoute = defaultRoutingPolicy.importStagingNotePath(
-    "<batch-name>",
+    "<import-id>",
     "<source-stem>",
   );
-  const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`;
-  const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`;
+  const importAttachmentRoute = `${defaultRoutingPolicy.importAttachmentRoot()}/<import-id>/`;
+  const inboxFallbackRoute = `${defaultRoutingPolicy.importInboxDir()}/<import-id>.md`;
   const profileMemoryRoute = "02-Profiles/<profile-id>/Memory.md";
   const profileFinanceRoute = "02-Personal/<profile-id>/Finance/";
   const decisionRoute = ".vault/decisions/<decision-id>.md";
@@ -58,6 +58,9 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
     input.sourceOverrides,
     result,
   );
+  await auditSecureImportExtraction(repoRoot, input.sourceOverrides, result);
+  await auditIdentityBoundRecovery(repoRoot, input.sourceOverrides, result);
+  await auditCrossProcessRoutingLock(repoRoot, input.sourceOverrides, result);
   await auditImportStagingExclusion(repoRoot, input.sourceOverrides, result);
   await auditReviewBypassFields(repoRoot, input.sourceOverrides, result);
   await auditFilesystemWriters(repoRoot, input.sourceOverrides, result);
@@ -139,11 +142,8 @@ function auditGeneratedWorkspaceContract(source: string, result: ProductAuditRes
 }
 
 function documentsObsoletePendingImportRoute(source: string): boolean {
-  return source.includes(
-    "04-Resources/Imports/<batch-name>/<source-stem>.md\\` while pending Review",
-  ) || source.includes(
-    "04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review",
-  );
+  return /04-Resources\/Imports\/<(?:batch-name|import-id)>\/<source-stem>\.md\\?` while pending Review/u
+    .test(source);
 }
 
 async function auditImportRoutingPolicy(repoRoot: string, sourceOverrides: Map<string, string> | undefined, result: ProductAuditResult): Promise<void> {
@@ -208,10 +208,16 @@ async function auditInitialImportHardenedIo(
 
   const importBatch = namedFunction(importerFile, "importDocumentBatch");
   const persistSource = namedFunction(importerFile, "persistSourceNote");
-  const promoteArtifact = namedFunction(
+  const publishFinal = namedFunction(promotionFile, "publishFinal");
+  const publishRecoveredFinal = namedFunction(
     promotionFile,
-    "promoteImportArtifact",
+    "publishRecoveredFinal",
   );
+  const createJournal = namedFunction(
+    promotionFile,
+    "createPromotionJournal",
+  );
+  const persistJournal = namedFunction(promotionFile, "persistJournal");
   const attachmentIsHardened = importsNamedBinding(
     importerFile,
     "./secureWorkspaceIo",
@@ -238,12 +244,27 @@ async function auditInitialImportHardenedIo(
     && importsNamedBinding(
       promotionFile,
       "./secureWorkspaceIo",
-      "secureWriteWorkspaceFileExclusive",
+      "securePublishWorkspaceFileAtomic",
     )
     && hasCallWithOperation(
-      promoteArtifact,
-      "secureWriteWorkspaceFileExclusive",
+      publishFinal,
+      "securePublishWorkspaceFileAtomic",
       "final_create",
+    )
+    && hasCallWithOperation(
+      publishRecoveredFinal,
+      "securePublishWorkspaceFileAtomic",
+      "final_recover_create",
+    )
+    && hasCallWithOperation(
+      createJournal,
+      "secureAtomicReplaceWorkspaceFile",
+      "journal_create",
+    )
+    && hasCallWithOperation(
+      persistJournal,
+      "secureAtomicReplaceWorkspaceFile",
+      "journal_update",
     );
 
   if (!attachmentIsHardened) {
@@ -266,16 +287,306 @@ async function auditInitialImportHardenedIo(
       `hardened workspace IO is missing real-path, ancestor, inode, or exclusive-open checks: ${secureIoPath}`,
     );
   }
+  if (!isAtomicWorkspacePublicationImplementation(secureIoFile)) {
+    result.failures.push(
+      `atomic workspace publication is missing verified temp, sync, publish, or identity-bound cleanup calls: ${secureIoPath}`,
+    );
+  }
   if (
     attachmentIsHardened
     && stagingIsHardened
     && finalIsHardened
     && isHardenedWorkspaceIoImplementation(secureIoFile)
+    && isAtomicWorkspacePublicationImplementation(secureIoFile)
   ) {
     result.passes.push(
-      "initial import attachment, staging, and final writes use hardened workspace IO",
+      "initial import attachment, staging, journal, and final writes use hardened workspace IO",
     );
   }
+}
+
+async function auditSecureImportExtraction(
+  repoRoot: string,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const importerPath = "packages/workspace/src/imports.ts";
+  const extractorPath = "packages/workspace/src/importExtractors.ts";
+  const secureIoPath = "packages/workspace/src/secureWorkspaceIo.ts";
+  const [importerSource, extractorSource, secureIoSource] = await Promise.all([
+    readSource(repoRoot, importerPath, sourceOverrides),
+    readSource(repoRoot, extractorPath, sourceOverrides),
+    readSource(repoRoot, secureIoPath, sourceOverrides),
+  ]);
+  const importerFile = sourceFileFor(importerPath, importerSource);
+  const extractorFile = sourceFileFor(extractorPath, extractorSource);
+  const secureIoFile = sourceFileFor(secureIoPath, secureIoSource);
+  const importBatch = namedFunction(importerFile, "importDocumentBatch");
+  const extractor = namedFunction(extractorFile, "extractDocumentText");
+  const secureCopy = namedFunction(
+    secureIoFile,
+    "secureCopyFileIntoWorkspace",
+  );
+  const extractionCalls = directCallsNamed(importBatch, "extractDocumentText");
+  const consumesVerifiedCopy = extractionCalls.length > 0
+    && extractionCalls.every((call) => argumentIsPropertyOfCallResult(
+      importBatch,
+      call.arguments[1],
+      "contents",
+      "secureCopyFileIntoWorkspace",
+    ));
+  const extractorUsesBuffer = extractor !== undefined
+    && parameterHasType(extractor, 1, "Buffer")
+    && hasPropertyCallOnParameter(extractor, 1, "toString")
+    && !hasDirectCall(extractor, "readFile")
+    && !importsNamedBinding(
+      extractorFile,
+      "node:fs/promises",
+      "readFile",
+    );
+  const copiedArtifactIsReopened = secureCopy !== undefined
+    && hasCallWithObjectProperty(
+      secureCopy,
+      "secureReadWorkspaceArtifact",
+      "expectedArtifact",
+    )
+    && hasCallWithOperation(
+      secureCopy,
+      "secureReadWorkspaceArtifact",
+      "attachment_verify",
+    );
+
+  if (
+    !consumesVerifiedCopy
+    || !extractorUsesBuffer
+    || !copiedArtifactIsReopened
+  ) {
+    result.failures.push(
+      "secure import extraction does not consume identity-verified copied attachment bytes",
+    );
+    return;
+  }
+  result.passes.push(
+    "secure import extraction consumes identity-verified copied attachment bytes",
+  );
+}
+
+async function auditIdentityBoundRecovery(
+  repoRoot: string,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const importerPath = "packages/workspace/src/imports.ts";
+  const promotionPath = "packages/workspace/src/importPromotion.ts";
+  const reviewPath = "apps/desktop/electron/ipc.ts";
+  const secureIoPath = "packages/workspace/src/secureWorkspaceIo.ts";
+  const [importerSource, promotionSource, reviewSource, secureIoSource] =
+    await Promise.all([
+      readSource(repoRoot, importerPath, sourceOverrides),
+      readSource(repoRoot, promotionPath, sourceOverrides),
+      readSource(repoRoot, reviewPath, sourceOverrides),
+      readSource(repoRoot, secureIoPath, sourceOverrides),
+    ]);
+  const importerFile = sourceFileFor(importerPath, importerSource);
+  const promotionFile = sourceFileFor(promotionPath, promotionSource);
+  const reviewFile = sourceFileFor(reviewPath, reviewSource);
+  const secureIoFile = sourceFileFor(secureIoPath, secureIoSource);
+
+  const batchCleanup = namedFunction(importerFile, "cleanupCreatedArtifacts");
+  const retireStaging = namedFunction(promotionFile, "retireStaging");
+  const rollbackFinal = namedFunction(
+    promotionFile,
+    "rollbackPublishedFinal",
+  );
+  const removeRecorded = namedFunction(
+    promotionFile,
+    "removeRecordedIfOwned",
+  );
+  const reviewMove = namedFunction(reviewFile, "moveImportedSourceNote");
+  const persistedReview = namedFunction(
+    reviewFile,
+    "reconcilePersistedImportedApplication",
+  );
+  const secureRemove = namedFunction(
+    secureIoFile,
+    "secureRemoveWorkspaceArtifact",
+  );
+
+  const batchIsIdentityBound = hasCallWithIdentifierArgument(
+    batchCleanup,
+    "secureRemoveWorkspaceArtifact",
+    1,
+    "artifact",
+  );
+  const promotionIsIdentityBound = hasCallWithOperation(
+    retireStaging,
+    "secureRemoveWorkspaceArtifact",
+    "staging_retire",
+  )
+    && hasDirectCall(rollbackFinal, "removeRecordedIfOwned")
+    && hasCallWithIdentifierArgument(
+      removeRecorded,
+      "secureRemoveWorkspaceArtifact",
+      1,
+      "artifact",
+    );
+  const reviewIsIdentityBound = hasCallWithOperation(
+    reviewMove,
+    "secureRemoveWorkspaceArtifact",
+    "staging_retire",
+  )
+    && hasCallWithOperation(
+      reviewMove,
+      "secureRemoveWorkspaceArtifact",
+      "destination_rollback",
+    )
+    && hasCallWithOperation(
+      persistedReview,
+      "secureRemoveWorkspaceArtifact",
+      "persisted_staging_retire",
+    );
+  const removalQuarantinesBeforeDelete = hasDirectCalls(secureRemove, [
+    "secureReadWorkspaceArtifact",
+    "rename",
+    "syncWorkspaceDirectory",
+    "sameFileArtifact",
+    "revalidateOriginalParent",
+  ]) && callsOccurInOrder(secureRemove, [
+    "secureReadWorkspaceArtifact",
+    "rename",
+    "sameFileArtifact",
+    "revalidateOriginalParent",
+  ]);
+
+  if (
+    !batchIsIdentityBound
+    || !promotionIsIdentityBound
+    || !reviewIsIdentityBound
+    || !removalQuarantinesBeforeDelete
+  ) {
+    result.failures.push(
+      "import rollback and retirement cleanup are not identity-bound quarantine operations",
+    );
+    return;
+  }
+  result.passes.push(
+    "import rollback and retirement cleanup are identity-bound quarantine operations",
+  );
+}
+
+async function auditCrossProcessRoutingLock(
+  repoRoot: string,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const reviewPath = "apps/desktop/electron/ipc.ts";
+  const lockPath = "packages/workspace/src/workspaceWriteLock.ts";
+  const [reviewSource, lockSource] = await Promise.all([
+    readSource(repoRoot, reviewPath, sourceOverrides),
+    readSource(repoRoot, lockPath, sourceOverrides),
+  ]);
+  const reviewFile = sourceFileFor(reviewPath, reviewSource);
+  const lockFile = sourceFileFor(lockPath, lockSource);
+  const saveRule = namedFunction(reviewFile, "saveUserRoutingRule");
+  const appendPolicy = namedFunction(reviewFile, "appendRoutingPolicyRule");
+  const syncAgents = namedFunction(reviewFile, "syncAgentsRoutingRules");
+  const activateWorkspace = namedFunction(reviewFile, "activateWorkspace");
+  const acquireLock = namedFunction(lockFile, "acquireFilesystemLock");
+  const holdLock = namedFunction(lockFile, "withFilesystemLock");
+  const withLockMethod = namedMethod(lockFile, "withLock");
+  const lockCall = directCallsNamed(saveRule, "withWorkspaceWriteLock")[0];
+
+  const lockEnclosesRoutingWrites = lockCall !== undefined
+    && callbackArgumentCalls(lockCall, 1, [
+      "appendRoutingPolicyRule",
+      "syncAgentsRoutingRules",
+      "writeRoutingRuleAdr",
+    ]);
+  const routingWritesAreAtomic = hasDirectCall(
+    appendPolicy,
+    "secureAtomicReplaceWorkspaceFile",
+  ) && hasDirectCall(syncAgents, "secureAtomicReplaceWorkspaceFile");
+  const workspaceIsCanonical = hasDirectCall(
+    activateWorkspace,
+    "realpath",
+  ) && hasDirectCallLike(withLockMethod, "realpath");
+  const lockIsFilesystemBacked = hasDirectCalls(acquireLock, [
+    "secureWriteWorkspaceFileExclusive",
+    "syncWorkspaceDirectory",
+    "readContendedLock",
+    "secureRemoveWorkspaceArtifact",
+  ])
+    && hasDirectCall(holdLock, "secureRemoveWorkspaceArtifact")
+    && functionContainsObjectProperties(acquireLock, [
+      "token",
+      "pid",
+      "createdAt",
+      "leaseUntil",
+    ])
+    && functionContainsIdentifier(acquireLock, "deadline")
+    && acquireLock !== undefined
+    && nodesInFunction(acquireLock).some(ts.isWhileStatement);
+
+  if (
+    !importsNamedBinding(
+      reviewFile,
+      "@kb-agent/workspace",
+      "withWorkspaceWriteLock",
+    )
+    || !lockEnclosesRoutingWrites
+    || !routingWritesAreAtomic
+    || !workspaceIsCanonical
+    || !lockIsFilesystemBacked
+  ) {
+    result.failures.push(
+      "routing policy and AGENTS updates are not protected by the canonical cross-process workspace lock",
+    );
+    return;
+  }
+  result.passes.push(
+    "routing policy and AGENTS updates use the canonical cross-process workspace lock",
+  );
+}
+
+function isAtomicWorkspacePublicationImplementation(
+  sourceFile: ts.SourceFile,
+): boolean {
+  const publish = namedFunction(
+    sourceFile,
+    "securePublishWorkspaceFileAtomic",
+  );
+  const replace = namedFunction(
+    sourceFile,
+    "secureAtomicReplaceWorkspaceFile",
+  );
+  const writeTemp = namedFunction(sourceFile, "writeAtomicTemp");
+  return hasDirectCalls(publish, [
+    "writeAtomicTemp",
+    "link",
+    "syncWorkspaceDirectory",
+    "secureReadWorkspaceArtifact",
+    "secureRemoveWorkspaceArtifact",
+  ])
+    && callsOccurInOrder(publish, [
+      "writeAtomicTemp",
+      "link",
+      "syncWorkspaceDirectory",
+      "secureReadWorkspaceArtifact",
+      "secureRemoveWorkspaceArtifact",
+    ])
+    && hasDirectCalls(replace, [
+      "writeAtomicTemp",
+      "rename",
+      "syncWorkspaceDirectory",
+      "secureReadWorkspaceArtifact",
+    ])
+    && callsOccurInOrder(replace, [
+      "writeAtomicTemp",
+      "rename",
+      "syncWorkspaceDirectory",
+      "secureReadWorkspaceArtifact",
+    ])
+    && hasDirectCall(writeTemp, "secureWriteWorkspaceFileExclusive");
 }
 
 function isHardenedWorkspaceIoImplementation(
@@ -317,6 +628,232 @@ function namedFunction(
   return functionDeclarations(sourceFile).find(
     (declaration) => declaration.name?.text === name,
   );
+}
+
+function namedMethod(
+  sourceFile: ts.SourceFile,
+  name: string,
+): ts.MethodDeclaration | undefined {
+  return nodesInSourceFile(sourceFile).find(
+    (node): node is ts.MethodDeclaration => ts.isMethodDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === name,
+  );
+}
+
+function sourceFileFor(relativePath: string, source: string): ts.SourceFile {
+  return ts.createSourceFile(
+    relativePath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+}
+
+function directCallsNamed(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+): ts.CallExpression[] {
+  return declaration === undefined
+    ? []
+    : nodesInFunction(declaration).filter(
+      (node): node is ts.CallExpression => ts.isCallExpression(node)
+        && calledName(node) === callName,
+    );
+}
+
+function argumentIsPropertyOfCallResult(
+  declaration: ts.FunctionDeclaration | undefined,
+  argument: ts.Expression | undefined,
+  propertyName: string,
+  callName: string,
+): boolean {
+  if (
+    declaration === undefined
+    || argument === undefined
+    || !ts.isPropertyAccessExpression(argument)
+    || argument.name.text !== propertyName
+    || !ts.isIdentifier(argument.expression)
+  ) {
+    return false;
+  }
+  const binding = resolvesToBinding(declaration, argument.expression);
+  return binding !== undefined
+    && ts.isVariableDeclaration(binding)
+    && calledNameFromInitializer(binding.initializer) === callName;
+}
+
+function calledNameFromInitializer(
+  initializer: ts.Expression | undefined,
+): string | undefined {
+  let expression = initializer;
+  while (
+    expression !== undefined
+    && (
+      ts.isAwaitExpression(expression)
+      || ts.isParenthesizedExpression(expression)
+    )
+  ) {
+    expression = expression.expression;
+  }
+  return expression !== undefined && ts.isCallExpression(expression)
+    ? calledName(expression)
+    : undefined;
+}
+
+function parameterHasType(
+  declaration: ts.FunctionDeclaration,
+  parameterIndex: number,
+  typeName: string,
+): boolean {
+  const parameter = declaration.parameters[parameterIndex];
+  return parameter?.type !== undefined
+    && ts.isTypeReferenceNode(parameter.type)
+    && ts.isIdentifier(parameter.type.typeName)
+    && parameter.type.typeName.text === typeName;
+}
+
+function hasPropertyCallOnParameter(
+  declaration: ts.FunctionDeclaration,
+  parameterIndex: number,
+  propertyName: string,
+): boolean {
+  const parameter = declaration.parameters[parameterIndex];
+  if (parameter === undefined || !ts.isIdentifier(parameter.name)) {
+    return false;
+  }
+  const parameterName = parameter.name.text;
+  return nodesInFunction(declaration).some(
+    (node) => ts.isCallExpression(node)
+      && ts.isPropertyAccessExpression(node.expression)
+      && ts.isIdentifier(node.expression.expression)
+      && node.expression.expression.text === parameterName
+      && node.expression.name.text === propertyName,
+  );
+}
+
+function hasCallWithObjectProperty(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+  propertyName: string,
+): boolean {
+  return directCallsNamed(declaration, callName).some((call) =>
+    call.arguments.some((argument) => nodesInNode(argument).some(
+      (node) => ts.isPropertyAssignment(node)
+        && propertyNameText(node.name) === propertyName,
+    )));
+}
+
+function hasCallWithIdentifierArgument(
+  declaration: ts.FunctionDeclaration | undefined,
+  callName: string,
+  argumentIndex: number,
+  identifierName: string,
+): boolean {
+  return directCallsNamed(declaration, callName).some(
+    (call) => isIdentifierNamed(call.arguments[argumentIndex], identifierName),
+  );
+}
+
+function callsOccurInOrder(
+  declaration: ts.FunctionDeclaration | undefined,
+  callNames: string[],
+): boolean {
+  if (declaration === undefined) {
+    return false;
+  }
+  const calls = nodesInFunction(declaration)
+    .filter((node): node is ts.CallExpression => ts.isCallExpression(node))
+    .map((call) => ({ name: calledName(call), position: call.pos }));
+  let previousPosition = -1;
+  for (const callName of callNames) {
+    const match = calls.find(
+      (call) => call.name === callName && call.position > previousPosition,
+    );
+    if (!match) {
+      return false;
+    }
+    previousPosition = match.position;
+  }
+  return true;
+}
+
+function callbackArgumentCalls(
+  call: ts.CallExpression,
+  argumentIndex: number,
+  callNames: string[],
+): boolean {
+  const callback = call.arguments[argumentIndex];
+  if (
+    callback === undefined
+    || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))
+  ) {
+    return false;
+  }
+  const called = new Set(
+    nodesInNode(callback.body)
+      .filter((node): node is ts.CallExpression => ts.isCallExpression(node))
+      .map(calledName)
+      .filter((name): name is string => name !== undefined),
+  );
+  return callNames.every((callName) => called.has(callName));
+}
+
+function functionContainsObjectProperties(
+  declaration: ts.FunctionDeclaration | undefined,
+  propertyNames: string[],
+): boolean {
+  if (declaration === undefined) {
+    return false;
+  }
+  const present = new Set(
+    nodesInFunction(declaration).flatMap((node) => {
+      if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
+        return [propertyNameText(node.name)];
+      }
+      return [];
+    }),
+  );
+  return propertyNames.every((propertyName) => present.has(propertyName));
+}
+
+function functionContainsIdentifier(
+  declaration: ts.FunctionDeclaration | undefined,
+  identifierName: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInFunction(declaration).some(
+      (node) => ts.isIdentifier(node) && node.text === identifierName,
+    );
+}
+
+function hasDirectCallLike(
+  declaration: ts.MethodDeclaration | undefined,
+  callName: string,
+): boolean {
+  return declaration !== undefined
+    && nodesInNode(declaration).some(
+      (node) => ts.isCallExpression(node) && calledName(node) === callName,
+    );
+}
+
+function propertyNameText(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name)
+    || ts.isStringLiteral(name)
+    || ts.isNumericLiteral(name)
+    || ts.isNoSubstitutionTemplateLiteral(name)
+    ? name.text
+    : undefined;
+}
+
+function nodesInNode(root: ts.Node): ts.Node[] {
+  const nodes: ts.Node[] = [];
+  const visit = (node: ts.Node): void => {
+    nodes.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(root);
+  return nodes;
 }
 
 function hasDirectCall(
@@ -650,13 +1187,12 @@ function isFinalImportPromotionWrite(node: ts.Node): boolean {
 function isReviewImportPromotionWrite(node: ts.Node): boolean {
   return ts.isCallExpression(node)
     && ts.isIdentifier(node.expression)
-    && node.expression.text === "secureWriteExclusive"
-    && node.arguments.length === 5
+    && node.expression.text === "securePublishWorkspaceFileAtomic"
+    && node.arguments.length >= 4
     && isIdentifierNamed(node.arguments[0], "workspaceRoot")
     && isIdentifierNamed(node.arguments[1], "approvedDestinationPath")
     && isIdentifierNamed(node.arguments[2], "approvedBody")
-    && isIdentifierNamed(node.arguments[3], "fileOps")
-    && isPropertyAccessNamed(node.arguments[4], "application", "ioHooks");
+    && nodeContainsString(node.arguments[3]!, "destination_create");
 }
 
 function isMethodCall(node: ts.CallExpression, receiver: string, method: string): boolean {

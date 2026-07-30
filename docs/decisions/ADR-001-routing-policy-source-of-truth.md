@@ -11,8 +11,8 @@ The product has two places that describe where knowledge artifacts should go:
 - `routingPolicy.ts`, the executable code that chooses filesystem paths for writes.
 
 For example, pending imported source notes go to
-`.app/import-staging/<batch-name>/<source-stem>.md`, while original imported
-files go to `06-Attachments/Imports/<batch-name>/`.
+`.app/import-staging/<import-id>/<source-stem>.md`, while original imported
+files go to `06-Attachments/Imports/<import-id>/`.
 
 This creates an intentional mirror: users need to inspect the rule in plain
 language, while the app needs deterministic code to enforce the rule. If the two
@@ -73,7 +73,8 @@ precedence and user customization rules.
 ## Implementation notes
 
 - `packages/workspace/src/routingPolicy.ts` defines the default executable routing policy.
-- `packages/workspace/src/imports.ts` uses the policy for import summary and attachment paths.
+- `packages/workspace/src/imports.ts` uses the policy for staging, attachment,
+  inbox fallback, and final paths.
 - `packages/workspace/src/workspace.ts` uses the policy when creating default workspace folders and profile memory.
 - `packages/workspace/src/templates.ts` includes the human-readable routing rules in generated `AGENTS.md`.
 - `packages/workspace/src/productAudit.ts` checks routing/contract drift, filesystem writer bypasses, and the presence of this decision mirror.

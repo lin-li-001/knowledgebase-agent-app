@@ -27,12 +27,15 @@ import { defaultRoutingPolicy } from "./routingPolicy";
 import {
   secureCopyFileIntoWorkspace,
   secureEnsureWorkspaceDirectory,
+  secureReadWorkspaceArtifact,
   secureReadWorkspaceDirectory,
   secureReadWorkspaceText,
+  secureRemoveWorkspaceArtifact,
   secureRewriteWorkspaceFile,
   secureUnlinkWorkspaceFile,
   secureWorkspacePathExists,
   secureWriteWorkspaceFileExclusive,
+  type SecureWorkspaceArtifactIdentity,
   type SecureWorkspaceIoHooks,
 } from "./secureWorkspaceIo";
 
@@ -84,6 +87,7 @@ export interface ImportJob {
 }
 
 interface ImportedDocument extends ExtractedDocument {
+  attachmentArtifact: SecureWorkspaceArtifactIdentity;
   attachmentRelativePath: string;
   sourceStem: string;
 }
@@ -117,7 +121,7 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
   const attachmentDir = defaultRoutingPolicy.importAttachmentDir(batchName);
   const attachmentTargetDir = assertInsideWorkspace(input.workspaceRoot, attachmentDir);
   const fileOps: ImportFileOps = { ...defaultImportFileOps, ...input.fileOps };
-  const createdDerivedArtifacts = new Set<string>();
+  const createdDerivedArtifacts = new Map<string, SecureWorkspaceArtifactIdentity>();
   const copiedSourceFiles: string[] = [];
 
   try {
@@ -147,16 +151,24 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
         input.workspaceRoot,
         attachmentRelativePath,
       );
-      await secureCopyFileIntoWorkspace(
+      const copied = await secureCopyFileIntoWorkspace(
         input.workspaceRoot,
         file,
         attachmentTargetPath,
         secureIoOptions("attachment_create", input.ioHooks),
       );
       copiedSourceFiles.push(attachmentRelativePath);
-      const extracted = await extractDocumentText(attachmentTargetPath);
+      const extracted = await extractDocumentText(
+        attachmentTargetPath,
+        copied.contents,
+      );
       const sourceStem = uniqueSourceStem(sourceTitle(extracted.fileName), sourceStems);
-      documents.push({ ...extracted, attachmentRelativePath, sourceStem });
+      documents.push({
+        ...extracted,
+        attachmentArtifact: copied.artifact,
+        attachmentRelativePath,
+        sourceStem,
+      });
     }
 
     const policy = await readWorkspaceRoutingPolicy(
@@ -213,7 +225,7 @@ async function persistSourceNote(
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
   fileOps: ImportFileOps,
-  createdArtifacts: Set<string>,
+  createdArtifacts: Map<string, SecureWorkspaceArtifactIdentity>,
   ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
@@ -247,18 +259,18 @@ async function persistSourceNote(
   });
 
   assertImportStagingPath(workspaceRoot, stagingPath);
-  await secureWriteWorkspaceFileExclusive(
+  const stagingArtifact = await secureWriteWorkspaceFileExclusive(
     workspaceRoot,
     stagingTargetPath,
     rendered,
     secureIoOptions("staging_create", ioHooks),
   );
-  createdArtifacts.add(stagingTargetPath);
+  createdArtifacts.set(stagingTargetPath, stagingArtifact);
 
   if (safetyDecision.decision === "auto_write") {
     const finalTargetPath = assertInsideWorkspace(workspaceRoot, routed.destination);
     try {
-      await promoteImportArtifact({
+      const promoted = await promoteImportArtifact({
         workspaceRoot,
         sourcePath: document.attachmentRelativePath,
         stagingPath,
@@ -266,7 +278,7 @@ async function persistSourceNote(
         ...(ioHooks === undefined ? {} : { ioHooks }),
         unlinkFile: fileOps.unlink,
       });
-      createdArtifacts.add(finalTargetPath);
+      createdArtifacts.set(finalTargetPath, promoted.final);
       createdArtifacts.delete(stagingTargetPath);
     } catch (error) {
       try {
@@ -278,7 +290,12 @@ async function persistSourceNote(
           await secureWorkspacePathExists(workspaceRoot, finalTargetPath)
           && !await secureWorkspacePathExists(workspaceRoot, stagingTargetPath)
         ) {
-          createdArtifacts.add(finalTargetPath);
+          const recovered = await secureReadWorkspaceArtifact(
+            workspaceRoot,
+            finalTargetPath,
+            secureIoOptions("final_recovered_track", ioHooks),
+          );
+          createdArtifacts.set(finalTargetPath, recovered.artifact);
           createdArtifacts.delete(stagingTargetPath);
           return sourceNoteResult(
             document,
@@ -308,7 +325,7 @@ async function persistSourceNote(
       );
       const blockedSafetyDecision = blockedPromotionSafetyDecision(error);
       const blockedNotePath = stagingPath;
-      await secureRewriteWorkspaceFile(
+      const blockedStaging = await secureRewriteWorkspaceFile(
         workspaceRoot,
         stagingTargetPath,
         renderImportedSourceNote({
@@ -325,6 +342,7 @@ async function persistSourceNote(
         }),
         secureIoOptions("staging_blocked_rewrite", ioHooks),
       );
+      createdArtifacts.set(stagingTargetPath, blockedStaging);
 
       return sourceNoteResult(
         document,
@@ -723,17 +741,17 @@ const defaultImportFileOps: ImportFileOps = {
 async function cleanupCreatedArtifacts(
   workspaceRoot: string,
   fileOps: ImportFileOps,
-  createdArtifacts: Set<string>,
+  createdArtifacts: Map<string, SecureWorkspaceArtifactIdentity>,
   ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<void> {
-  for (const targetPath of [...createdArtifacts].reverse()) {
+  for (const artifact of [...createdArtifacts.values()].reverse()) {
     try {
-      if (!await secureWorkspacePathExists(workspaceRoot, targetPath)) {
+      if (!await secureWorkspacePathExists(workspaceRoot, artifact.targetPath)) {
         continue;
       }
-      await secureUnlinkWorkspaceFile(
+      await secureRemoveWorkspaceArtifact(
         workspaceRoot,
-        targetPath,
+        artifact,
         {
           ...secureIoOptions("failed_import_cleanup", ioHooks),
           unlinkFile: fileOps.unlink,

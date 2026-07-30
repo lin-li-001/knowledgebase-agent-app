@@ -73,15 +73,64 @@ final import destinations. Approval does not override an invalid final root.
 Attachment copy, staging creation, and final promotion share a hardened
 filesystem boundary that validates real paths and ancestors, rejects symlinks,
 revalidates device and inode identity, and uses no-follow exclusive creation.
+Extraction consumes bytes read back through a verified attachment file handle;
+extractors do not reopen the attachment pathname.
+
 Auto-write promotion is source-bound and recorded in a durable journal under
-`.app/`; recovery runs on workspace activation and before later imports. A
-recovery accepts only the journaled source, staging path, final path, and
-content hash, then deterministically leaves one authoritative final file.
+`.app/`. A journal records the attachment path, hash, and identity; the staging
+path, hash, device, and inode; the expected final body hash; and the final
+device and inode after publication. Journal creation and phase updates write a
+unique exclusive temp file in the journal directory, complete and `fsync` that
+file, rename it atomically, and `fsync` the directory. Recovery removes
+transaction temp journals when ownership can be proven and quarantines a
+malformed final journal without preventing other valid journals from being
+processed.
+
+An authoritative final path is never written incrementally. Promotion writes
+and verifies a temp file in the canonical destination parent, `fsync`s it,
+publishes it only if the final path is absent by hard-linking the temp inode,
+and `fsync`s the destination parent. The temp and every later cleanup target
+are removed only when their recorded path, parent, device, inode, size, and hash
+still match. Staging retirement and rollback first rename the verified artifact
+to a unique quarantine name in the same verified parent, revalidate the moved
+identity, and only then unlink it. If a staging or final path has been replaced,
+the newer artifact is preserved and recovery fails closed.
+
+Recovery runs on workspace activation and before later imports. Immediately
+before retiring staging, it reopens the exact recorded staging and attachment
+artifacts, verifies their hashes and identities, and verifies that the staged
+attachment binding still names that attachment. A collision or identity
+mismatch is not accepted as an old final.
 
 Review promotion also binds recovery to its persisted application. If a prior
 application selected destination A, retries must finish or reconcile A before a
-new override B can be prepared. An exact approved hash completes A; a mismatch
-fails closed.
+new override B can be prepared. A persisted application intent also removes
+Reject and clear-intent authority: the UI offers Resume approval, and the
+storage claim for rejection fails closed. If final A was published but staging
+retirement or later work failed, a retry verifies and completes A rather than
+writing override B. A mismatch fails closed.
+
+Durable routing-rule updates canonicalize the workspace with `realpath` and
+hold a workspace-local `.app/routing-policy.lock` across policy, `AGENTS.md`,
+and decision-record updates. The lock is acquired with exclusive creation and
+contains a random token, PID, creation timestamp, and lease expiry. Contenders
+retry for a bounded interval; an expired lock is retired through the same
+identity-bound quarantine path. Policy and `AGENTS.md` are each replaced by an
+`fsync`ed temp plus atomic rename and parent-directory `fsync`. They are not one
+cross-file transaction, so a process stop between the two files can temporarily
+leave contract drift; the next locked update reconciles all saved rules and
+Product Audit reports remaining drift.
+
+### Local threat boundary
+
+Node exposes `O_NOFOLLOW`, but it does not expose the directory-handle-relative
+`openat`/`renameat`/`unlinkat` operations needed to eliminate every pathname
+race. These controls are designed for a local, single-user workspace with
+cooperating app processes. They detect symlinks, inode changes, parent swaps,
+and the tested crash windows, and they prefer leaving or quarantining an
+artifact when ownership cannot be proved. They do not claim protection from a
+malicious process with the same filesystem permissions that wins the remaining
+interval between a final identity check and a pathname operation.
 
 ## Consequences
 
@@ -95,12 +144,15 @@ fails closed.
 - Import promotion must preserve the staged note and attachment relationship,
   and must fail closed on collisions, stale approval proof, invalid paths, or
   internal evaluation errors.
-- Original source attachments are copied before extraction and remain available
-  when extraction or a later source in the batch fails.
-- Expired Review application and rejection leases become retryable without
-  discarding persisted application intent.
-- Concurrent durable routing-rule writes are serialized per workspace and
-  replace policy and contract files atomically.
+- Original source attachments are copied and read back through a verified
+  no-follow handle before extraction.
+- Batch rollback, final rollback, and staging retirement remove only artifacts
+  whose recorded identities still match; replacement content survives.
+- Expired Review application leases become retryable without discarding
+  persisted application intent; an item with application intent cannot be
+  claimed for rejection.
+- Concurrent durable routing-rule writes are serialized across app processes;
+  policy and contract files are each replaced atomically.
 - Product audits and tests must cover every import writer and promotion path so
   new code cannot silently bypass safety evaluation.
 
@@ -129,14 +181,17 @@ validation remains deterministic code.
 - `packages/workspace/src/importClassification.ts` combines classification
   signals conservatively.
 - `packages/workspace/src/secureWorkspaceIo.ts` implements the shared hardened
-  filesystem boundary.
+  filesystem boundary, atomic publishers, and identity-bound quarantine.
 - `packages/workspace/src/importPromotion.ts` implements source-bound promotion
   journaling and recovery.
+- `packages/workspace/src/workspaceWriteLock.ts` implements the leased
+  cross-process routing lock.
 - `packages/workspace/src/routingPolicy.ts` defines the staging route and default
   destinations.
 - `packages/workspace/src/indexer.ts` excludes `.app/` content from knowledge
   indexing.
 - `apps/desktop/electron/ipc.ts` re-evaluates safety and applies current Review
   overrides when promoting staged imports.
-- `packages/workspace/src/productAudit.ts` checks writer coverage, staging
-  contracts, precedence text, and Review bypass fields.
+- `packages/workspace/src/productAudit.ts` checks secure extraction data flow,
+  identity-bound cleanup, atomic journal/final publication, cross-process
+  locking, staging contracts, precedence text, and Review bypass fields.

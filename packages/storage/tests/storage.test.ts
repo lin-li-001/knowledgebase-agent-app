@@ -264,6 +264,42 @@ describe("Review item claims", () => {
     );
   });
 
+  it("never lets a persisted application intent be claimed for rejection", async () => {
+    const db = await openTempDb();
+    const item = await insertClaimableReview(db, "review-prepared-reject");
+    await claimReviewItem(db, item.id, {
+      from: ["proposed"],
+      to: "applying",
+      token: "preparing-worker",
+      startedAt: "2000-01-01T00:00:00.000Z",
+      application: {
+        kind: "import_move",
+        destination: "04-Resources/Approved/A.md",
+      },
+    });
+    await expireReviewItemClaims(
+      db,
+      item.workspaceId,
+      "2026-07-29T00:00:00.000Z",
+    );
+
+    await expect(claimReviewItem(db, item.id, {
+      from: ["failed"],
+      to: "rejecting",
+      token: "rejecting-worker",
+      startedAt: "2026-07-29T00:00:00.000Z",
+    })).resolves.toBe(false);
+    await expect(getReviewItem(db, item.id)).resolves.toEqual(
+      expect.objectContaining({
+        state: "failed",
+        application: {
+          kind: "import_move",
+          destination: "04-Resources/Approved/A.md",
+        },
+      }),
+    );
+  });
+
   it("prevents an expired applying worker from completing after takeover", async () => {
     const db = await openTempDb();
     const item = await insertClaimableReview(db, "review-stale-apply");

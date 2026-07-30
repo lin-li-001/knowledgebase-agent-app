@@ -1,7 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppDatabase } from "@kb-agent/storage";
-import { parseMarkdownNote } from "./markdown";
+import { parseMarkdownDocument, parseMarkdownNote } from "./markdown";
 import { defaultRoutingPolicy } from "./routingPolicy";
 import { workspaceIdForRoot } from "./indexer";
 
@@ -126,6 +126,9 @@ async function auditImportBatches(rootPath: string, db: AppDatabase | undefined,
 
   const workspaceId = workspaceIdForRoot(rootPath);
   for (const sourceNote of sourceNotes) {
+    if (sourceNote.staged) {
+      continue;
+    }
     const sourceNotePath = path.relative(rootPath, sourceNote.notePath);
     const indexed = db.sqlite
       .prepare("SELECT 1 FROM notes WHERE workspace_id = ? AND path = ? LIMIT 1")
@@ -145,9 +148,9 @@ async function auditWorkspaceContract(rootPath: string, findings: WorkspaceAudit
   const contractPath = path.join(rootPath, "AGENTS.md");
   const contract = await readFile(contractPath, "utf8").catch(() => "");
   const requiredRoutes = [
-    `${defaultRoutingPolicy.importSummaryDir()}/<batch-name>/<source-stem>.md`,
-    `${defaultRoutingPolicy.importAttachmentRoot()}/<batch-name>/`,
-    `${defaultRoutingPolicy.importInboxDir()}/<batch-name>.md`,
+    `${defaultRoutingPolicy.importStagingRoot()}/<import-id>/<source-stem>.md`,
+    `${defaultRoutingPolicy.importAttachmentRoot()}/<import-id>/`,
+    `${defaultRoutingPolicy.importInboxDir()}/<import-id>.md`,
   ];
   const governanceRoutes = [
     "02-Profiles/<profile-id>/Memory.md",
@@ -166,6 +169,18 @@ async function auditWorkspaceContract(rootPath: string, findings: WorkspaceAudit
         message: `Workspace contract is missing route ${route}.`,
       });
     }
+  }
+
+  if (
+    /Imported source Markdown notes[^\n]*04-Resources\/Imports\/[^\n]*pending Review/iu
+      .test(contract)
+  ) {
+    findings.push({
+      code: "agents_drift",
+      severity: "warning",
+      path: "AGENTS.md",
+      message: "Workspace contract retains an obsolete 04-Resources/Imports pending-note route.",
+    });
   }
 
   for (const route of governanceRoutes) {
@@ -224,27 +239,63 @@ async function collectFiles(rootPath: string, include: (name: string) => boolean
 interface ImportedSourceNote {
   notePath: string;
   attachmentPath: string;
+  staged: boolean;
 }
 
 async function collectImportedSourceNotes(rootPath: string, attachmentRoot: string): Promise<ImportedSourceNote[]> {
-  const markdownPaths = await collectAuditableMarkdownFiles(rootPath);
-  const notes = await Promise.all(markdownPaths.map(async (notePath) => {
+  const [auditablePaths, stagedPaths] = await Promise.all([
+    collectAuditableMarkdownFiles(rootPath),
+    collectMarkdownFiles(
+      path.join(rootPath, defaultRoutingPolicy.importStagingRoot()),
+    ),
+  ]);
+  const markdownPaths = [
+    ...auditablePaths.map((notePath) => ({ notePath, staged: false })),
+    ...stagedPaths.map((notePath) => ({ notePath, staged: true })),
+  ];
+  const notes = await Promise.all(markdownPaths.map(async ({ notePath, staged }) => {
     const raw = await readFile(notePath, "utf8");
     if (!/^source_type:\s*import\s*$/mu.test(raw)) {
       return undefined;
     }
-    const sourceFile = /^source_file:\s*(.+)$/mu.exec(raw)?.[1]?.trim().replace(/^(?:"|')(.*)(?:"|')$/u, "$1");
-    if (!sourceFile) {
+    let document;
+    try {
+      document = parseMarkdownDocument(raw);
+    } catch {
       return undefined;
     }
-    const attachmentPath = path.resolve(path.dirname(notePath), sourceFile);
+    if (document.frontmatter.source_type !== "import") {
+      return undefined;
+    }
+    const sourceFile = document.frontmatter.source_file;
+    if (typeof sourceFile !== "string" || sourceFile.trim() === "") {
+      return undefined;
+    }
+    const routeDestination = document.frontmatter.route_destination;
+    if (
+      staged
+      && (typeof routeDestination !== "string" || routeDestination.trim() === "")
+    ) {
+      return undefined;
+    }
+    const bindingPath = staged
+      ? path.resolve(rootPath, routeDestination as string)
+      : notePath;
+    const attachmentPath = path.resolve(
+      path.dirname(bindingPath),
+      unescapeMarkdownPath(sourceFile),
+    );
     const relativeAttachment = path.relative(attachmentRoot, attachmentPath);
     if (relativeAttachment.startsWith("..") || path.isAbsolute(relativeAttachment)) {
       return undefined;
     }
-    return { notePath, attachmentPath };
+    return { notePath, attachmentPath, staged };
   }));
   return notes.filter((note): note is ImportedSourceNote => Boolean(note));
+}
+
+function unescapeMarkdownPath(value: string): string {
+  return value.replace(/\\([\\()])/gu, "$1");
 }
 
 function auditStatus(findings: WorkspaceAuditFinding[]): WorkspaceAuditStatus {

@@ -79,8 +79,8 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
   });
   const normalizedCurrent = current.replace(/\r\n?/gu, "\n");
 
-  const sourceNoteRoute = ".app/import-staging/<batch-name>/<source-stem>.md";
-  const sourceNoteRouteLine = "- Imported source Markdown notes remain non-indexed under `.app/import-staging/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
+  const sourceNoteRoute = ".app/import-staging/<import-id>/<source-stem>.md";
+  const sourceNoteRouteLine = "- Imported source Markdown notes remain non-indexed under `.app/import-staging/<import-id>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
   const sourceNoteRouteStatusLine = "- Each imported source note records `route_status` and `route_destination`; a Review approval moves that same note to its final destination.";
   const routingPriorityBlock = `Import candidate routing precedence:
 1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.
@@ -99,7 +99,20 @@ export async function syncWorkspaceContract(rootPath: string): Promise<void> {
   const hasSourceNoteRouteStatus = normalizedCurrent.includes("route_status") && normalizedCurrent.includes("route_destination");
 
   const legacyRoute = "- Imported summary notes go to `04-Resources/Imports/<batch-name>.md`.";
-  let next = normalizedCurrent.replace(obsoleteSourceNoteRouteLine, sourceNoteRouteLine);
+  let next = normalizedCurrent
+    .replace(obsoleteSourceNoteRouteLine, sourceNoteRouteLine)
+    .replaceAll(
+      ".app/import-staging/<batch-name>/",
+      ".app/import-staging/<import-id>/",
+    )
+    .replaceAll(
+      "06-Attachments/Imports/<batch-name>/",
+      "06-Attachments/Imports/<import-id>/",
+    )
+    .replaceAll(
+      "00-Inbox/Imports/<batch-name>.md",
+      "00-Inbox/Imports/<import-id>.md",
+    );
   if (!hasSourceNoteRoute && !next.includes(sourceNoteRoute)) {
     next = next.includes(legacyRoute)
       ? next.replace(legacyRoute, sourceNoteRouteLine)

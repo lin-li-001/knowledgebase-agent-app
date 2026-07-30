@@ -46,12 +46,17 @@ export async function claimReviewItem(
   const staleClause = claim.staleBefore && claim.staleClaimToken
     ? " OR (state = ? AND claim_token = ? AND claim_started_at < ?)"
     : "";
+  const applicationAuthorityClause = claim.to === "rejecting"
+    ? " AND application_json IS NULL"
+    : "";
   const result = db.sqlite
     .prepare(
       `UPDATE review_items
-       SET state = ?, claim_token = ?, claim_started_at = ?, application_json = ?,
+       SET state = ?, claim_token = ?, claim_started_at = ?,
+           application_json = COALESCE(?, application_json),
            failure_reason = NULL
-       WHERE id = ? AND (state IN (${placeholders})${staleClause})`,
+       WHERE id = ? AND (state IN (${placeholders})${staleClause})
+         ${applicationAuthorityClause}`,
     )
     .run(
       claim.to,

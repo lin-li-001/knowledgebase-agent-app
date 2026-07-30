@@ -19,11 +19,17 @@ export { auditWorkspace } from "./workspaceAudit";
 export { defaultRoutingPolicy } from "./routingPolicy";
 export { importCandidateRoutingPolicy, importCandidateRoutingPrecedence } from "./importCandidateRoutingPolicy";
 export { createWorkspace, syncWorkspaceContract } from "./workspace";
+export {
+  createWorkspaceWriteLockClient,
+  withWorkspaceWriteLock,
+  workspaceWriteLockRelativePath,
+} from "./workspaceWriteLock";
 export type { NoteFrontmatter } from "./frontmatter";
 export type { IndexWorkspaceResult } from "./indexer";
 export type { ImportArtifactStatus, ImportBatchInput, ImportFileOps, ImportJob, ImportSourceNote } from "./imports";
 export type {
   ImportPromotionHooks,
+  ImportPromotionResult,
   ImportPromotionStep,
   PromoteImportArtifactInput,
 } from "./importPromotion";
@@ -46,19 +52,32 @@ export type {
   SafetyReasonCode,
 } from "./importSafety";
 export type { WorkspaceInfo } from "./workspace";
+export type {
+  WorkspaceWriteLockClient,
+  WorkspaceWriteLockOptions,
+} from "./workspaceWriteLock";
 export {
+  secureAtomicReplaceWorkspaceFile,
   secureCopyFileIntoWorkspace,
   secureEnsureWorkspaceDirectory,
+  securePublishWorkspaceFileAtomic,
+  secureQuarantineWorkspaceArtifact,
+  secureReadWorkspaceArtifact,
   secureReadWorkspaceDirectory,
   secureReadWorkspaceFile,
   secureReadWorkspaceText,
+  secureRemoveWorkspaceArtifact,
   secureRewriteWorkspaceFile,
+  sameArtifactIdentity,
   secureUnlinkWorkspaceFile,
   secureWorkspacePathExists,
   secureWriteWorkspaceFileExclusive,
   syncWorkspaceDirectory,
 } from "./secureWorkspaceIo";
 export type {
+  SecureDestructivePhase,
+  SecureWorkspaceArtifactIdentity,
+  SecureWorkspaceFileSnapshot,
   SecureWorkspaceIoHooks,
   SecureWorkspacePathIdentity,
 } from "./secureWorkspaceIo";

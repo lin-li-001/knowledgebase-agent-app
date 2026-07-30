@@ -64,7 +64,7 @@ describe("importDocumentBatch", () => {
     const pdfPath = path.join(sourceDir, "resume.pdf");
     await writeFile(pdfPath, minimalPdf("Resume Lin Li PDF Import Test\nOpenAI deployment experience"), "binary");
 
-    const document = await extractDocumentText(pdfPath);
+    const document = await extractDocumentText(pdfPath, await readFile(pdfPath));
 
     expect(document.markdownBody).toContain("<!-- Page 1 -->");
     expect(document.markdownBody).toContain("Resume Lin Li PDF Import Test");
@@ -76,7 +76,7 @@ describe("importDocumentBatch", () => {
     const pdfPath = path.join(sourceDir, "three-pages.pdf");
     await writeFile(pdfPath, multiPagePdf(), "binary");
 
-    const document = await extractDocumentText(pdfPath);
+    const document = await extractDocumentText(pdfPath, await readFile(pdfPath));
 
     expect(document.pageCount).toBe(3);
     expect(document.markdownBody).toContain("<!-- Page 1 -->");
@@ -96,7 +96,10 @@ describe("importDocumentBatch", () => {
     const imageOnlyPdfPath = path.join(sourceDir, "scan.pdf");
     await writeFile(imageOnlyPdfPath, imageOnlyPdf(), "binary");
 
-    const document = await extractDocumentText(imageOnlyPdfPath);
+    const document = await extractDocumentText(
+      imageOnlyPdfPath,
+      await readFile(imageOnlyPdfPath),
+    );
 
     expect(document.requiresOcr).toBe(true);
   });
@@ -298,6 +301,8 @@ describe("importDocumentBatch", () => {
       },
     });
 
+    expect(job.failureReason).toBeUndefined();
+    expect(job).toMatchObject({ state: "completed" });
     expect(job.notes[0]).toMatchObject({
       status: "auto_written",
       notePath: "00-Inbox/Imports/Handbook.md",
@@ -451,6 +456,140 @@ describe("importDocumentBatch", () => {
     await expect(
       readFile(path.join(root, job.notes[0]!.notePath), "utf8"),
     ).resolves.not.toContain("Changed external source.");
+  });
+
+  it("never parses outside bytes when a copied attachment is swapped to a symlink before extraction", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "kb-agent-import-outside-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Snapshot.txt");
+    const outsideSource = path.join(outside, "Outside.txt");
+    await writeFile(source, "Original source snapshot.", "utf8");
+    await writeFile(outsideSource, "OUTSIDE BYTES MUST NOT BE PARSED", "utf8");
+    let swapped = false;
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Snapshot Symlink",
+      files: [source],
+      now: "2026-07-29T00:00:00.000Z",
+      ioHooks: {
+        afterPathSnapshot: async (operation, targetPath) => {
+          if (operation !== "attachment_verify" || swapped) {
+            return;
+          }
+          swapped = true;
+          await unlink(targetPath);
+          await symlink(outsideSource, targetPath);
+        },
+      },
+    });
+
+    expect(swapped).toBe(true);
+    expect(job.state).toBe("failed");
+    expect(job.notes).toEqual([]);
+    await expect(readFile(outsideSource, "utf8")).resolves.toBe(
+      "OUTSIDE BYTES MUST NOT BE PARSED",
+    );
+  });
+
+  it("preserves a replacement final when a later source fails batch rollback", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const first = path.join(sourceDir, "First.txt");
+    const second = path.join(sourceDir, "Second.txt");
+    const finalPath = path.join(root, "00-Inbox/Imports/First.md");
+    await writeFile(first, "First source content.", "utf8");
+    await writeFile(second, "Second source content.", "utf8");
+    await mkdir(path.join(root, ".vault"), { recursive: true });
+    await writeFile(
+      path.join(root, ".vault/routing-policy.json"),
+      JSON.stringify({
+        rules: [
+          {
+            pattern: "First",
+            category: "resource",
+            sensitivity: "normal",
+            destination: "00-Inbox/Imports/First.md",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    let injected = false;
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Cleanup Ownership",
+      files: [first, second],
+      now: "2026-07-29T00:00:00.000Z",
+      ioHooks: {
+        afterPathSnapshot: async (operation, targetPath) => {
+          if (
+            operation !== "staging_create"
+            || path.basename(targetPath) !== "Second.md"
+            || injected
+          ) {
+            return;
+          }
+          injected = true;
+          await unlink(finalPath);
+          await writeFile(finalPath, "replacement final authority", "utf8");
+          throw new Error("second source failed after replacement");
+        },
+      },
+    });
+
+    expect(injected).toBe(true);
+    expect(job.state).toBe("failed");
+    await expect(readFile(finalPath, "utf8")).resolves.toBe(
+      "replacement final authority",
+    );
+  });
+
+  it("preserves a replacement staging note when a later source fails batch rollback", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const first = path.join(sourceDir, "First.txt");
+    const second = path.join(sourceDir, "Second.txt");
+    await writeFile(first, "First source content.", "utf8");
+    await writeFile(second, "Second source content.", "utf8");
+    let firstStagingPath: string | undefined;
+    let injected = false;
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Cleanup Staging Ownership",
+      files: [first, second],
+      now: "2026-07-29T00:00:00.000Z",
+      ioHooks: {
+        afterPathSnapshot: async (operation, targetPath) => {
+          if (operation !== "staging_create") {
+            return;
+          }
+          if (path.basename(targetPath) === "First.md") {
+            firstStagingPath = targetPath;
+            return;
+          }
+          if (
+            path.basename(targetPath) === "Second.md"
+            && firstStagingPath
+            && !injected
+          ) {
+            injected = true;
+            await unlink(firstStagingPath);
+            await writeFile(firstStagingPath, "replacement staging authority", "utf8");
+            throw new Error("second source failed after staging replacement");
+          }
+        },
+      },
+    });
+
+    expect(injected).toBe(true);
+    expect(job.state).toBe("failed");
+    await expect(readFile(firstStagingPath!, "utf8")).resolves.toBe(
+      "replacement staging authority",
+    );
   });
 
   it.each([

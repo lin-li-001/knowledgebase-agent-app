@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface ExtractedDocument {
@@ -10,12 +9,15 @@ export interface ExtractedDocument {
   requiresOcr?: boolean;
 }
 
-export async function extractDocumentText(sourcePath: string): Promise<ExtractedDocument> {
+export async function extractDocumentText(
+  sourcePath: string,
+  verifiedContents: Buffer,
+): Promise<ExtractedDocument> {
   const extension = path.extname(sourcePath).toLowerCase();
   const fileName = path.basename(sourcePath);
 
   if (extension === ".md" || extension === ".markdown" || extension === ".txt") {
-    const text = await readFile(sourcePath, "utf8");
+    const text = verifiedContents.toString("utf8");
     return {
       sourcePath,
       fileName,
@@ -28,7 +30,7 @@ export async function extractDocumentText(sourcePath: string): Promise<Extracted
     await ensurePdfRuntime();
     const [{ PDFParse }, { getData }] = await Promise.all([import("pdf-parse"), import("pdf-parse/worker")]);
     PDFParse.setWorker(getData());
-    const parser = new PDFParse({ data: await readFile(sourcePath) });
+    const parser = new PDFParse({ data: verifiedContents });
     try {
       const result = await parser.getText();
       const pages = result.pages.map((page) => page.text.trim());
