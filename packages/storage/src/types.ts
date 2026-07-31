@@ -61,6 +61,67 @@ export interface SessionMessage {
 export interface SearchFilters {
   workspaceId?: string;
   limit?: number;
+  statuses?: string[];
+  sensitivities?: string[];
+  categories?: string[];
+}
+
+export interface VectorSearchFilters {
+  workspaceId?: string;
+  statuses?: string[];
+  sensitivities?: string[];
+  categories?: string[];
+}
+
+export interface NoteVectorRecord {
+  noteId: string;
+  workspaceId: string;
+  status: string;
+  sensitivity: string;
+  category: string;
+  modelId: string;
+  contentHash: string;
+  embedding: number[];
+}
+
+export interface ChunkVectorRecord {
+  chunkId: string;
+  noteId: string;
+  workspaceId: string;
+  status: string;
+  sensitivity: string;
+  category: string;
+  modelId: string;
+  contentHash: string;
+  embedding: number[];
+}
+
+export interface NoteVectorSearchResult {
+  noteId: string;
+  workspaceId: string;
+  score: number;
+  status: string;
+  sensitivity: string;
+  category: string;
+}
+
+export interface ChunkVectorSearchResult {
+  chunkId: string;
+  noteId: string;
+  workspaceId: string;
+  score: number;
+  status: string;
+  sensitivity: string;
+  category: string;
+}
+
+export interface VectorIndex {
+  upsertNotes(records: NoteVectorRecord[]): Promise<void>;
+  upsertChunks(records: ChunkVectorRecord[]): Promise<void>;
+  deleteNotes(noteIds: string[]): Promise<void>;
+  deleteChunks(chunkIds: string[]): Promise<void>;
+  searchNotes(vector: number[], filters: VectorSearchFilters, limit: number): Promise<NoteVectorSearchResult[]>;
+  searchChunks(vector: number[], filters: VectorSearchFilters, limit: number): Promise<ChunkVectorSearchResult[]>;
 }
 
 export interface NoteSearchResult {

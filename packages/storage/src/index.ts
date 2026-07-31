@@ -16,6 +16,7 @@ export {
 } from "./repositories/reviewRepository";
 export { appendMessage } from "./repositories/sessionRepository";
 export { searchNotes, searchSessions } from "./search";
+export { SqliteVectorIndex } from "./vectorIndex";
 export type {
   ActivityEvent,
   AppDatabase,
@@ -25,4 +26,10 @@ export type {
   SearchFilters,
   SessionMessage,
   SessionSearchResult,
+  ChunkVectorRecord,
+  ChunkVectorSearchResult,
+  NoteVectorRecord,
+  NoteVectorSearchResult,
+  VectorIndex,
+  VectorSearchFilters,
 } from "./types";

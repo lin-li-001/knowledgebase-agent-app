@@ -114,7 +114,8 @@ describe("migrations", () => {
       .all()
       .map((row) => (row as { name: string }).name);
     expect(columns).toEqual(expect.arrayContaining(["claim_token", "claim_started_at", "application_json"]));
-    expect(migrated.sqlite.pragma("user_version", { simple: true })).toBe(2);
+    expect(migrated.sqlite.pragma("user_version", { simple: true })).toBe(3);
+    expect(migrated.sqlite.prepare("SELECT name FROM sqlite_master WHERE name IN ('note_embeddings', 'chunk_embeddings')").all()).toHaveLength(2);
   });
 
   it("cascades workspace-owned runtime records", async () => {
