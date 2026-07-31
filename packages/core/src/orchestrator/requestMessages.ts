@@ -8,6 +8,9 @@ export interface RetrievedSnippet {
   text: string;
   snippet?: string;
   matchedFields?: string[];
+  headingPath?: string[];
+  startLine?: number;
+  endLine?: number;
 }
 
 export function buildRequestMessages(
@@ -19,7 +22,10 @@ export function buildRequestMessages(
     .map((snippet) => {
       const evidence = snippet.snippet || snippet.text;
       const matchedFields = snippet.matchedFields?.length ? `\n  Matched fields: ${snippet.matchedFields.join(", ")}` : "";
-      return `- ${snippet.title}\n  Source: ${snippet.path}\n  Evidence: ${evidence}${matchedFields}`;
+      const provenance = snippet.headingPath?.length
+        ? `\n  Location: ${snippet.headingPath.join(" > ")} (lines ${snippet.startLine ?? "?"}-${snippet.endLine ?? "?"})`
+        : "";
+      return `- ${snippet.title}\n  Source: ${snippet.path}\n  Evidence: ${evidence}${matchedFields}${provenance}`;
     })
     .join("\n");
 

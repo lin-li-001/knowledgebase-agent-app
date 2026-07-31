@@ -2,7 +2,7 @@ export { recordActivityEvent, listRecentActivity } from "./activity/activityServ
 export { startImportBatch } from "./imports/importService";
 export { buildTurnContext } from "./orchestrator/contextBuilder";
 export { runTurn } from "./orchestrator/productOrchestrator";
-export { LocalNotesRecallProvider } from "./orchestrator/recallProvider";
+export { LocalNotesRecallProvider, SemanticNotesRecallProvider } from "./orchestrator/recallProvider";
 export { buildRequestMessages } from "./orchestrator/requestMessages";
 export { finalizeTurn } from "./orchestrator/turnFinalizer";
 export { classifyProposalRisk } from "./risk/riskPolicy";

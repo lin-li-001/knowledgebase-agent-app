@@ -112,6 +112,7 @@ function matchesFilters(
   filters: VectorSearchFilters,
 ): boolean {
   return (filters.statuses === undefined || filters.statuses.includes(row.status))
+    && (filters.excludedStatuses === undefined || !filters.excludedStatuses.includes(row.status))
     && (filters.sensitivities === undefined || filters.sensitivities.includes(row.sensitivity))
     && (filters.categories === undefined || filters.categories.includes(row.category));
 }

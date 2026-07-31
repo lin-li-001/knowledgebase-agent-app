@@ -147,8 +147,8 @@ function insertParsedNote(
     .prepare(
       `INSERT INTO notes (
         id, workspace_id, path, title, type, status, owner, scope, sensitivity,
-        tags_json, summary, summary_source, content_hash, modified_at, indexed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        content_category, tags_json, summary, summary_source, content_hash, modified_at, indexed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       noteId,
@@ -160,6 +160,7 @@ function insertParsedNote(
       note.frontmatter.owner,
       note.frontmatter.scope,
       note.frontmatter.sensitivity,
+      note.frontmatter.content_category ?? "unknown",
       JSON.stringify(note.frontmatter.tags),
       summary,
       note.frontmatter.summary ? "frontmatter" : "heuristic",

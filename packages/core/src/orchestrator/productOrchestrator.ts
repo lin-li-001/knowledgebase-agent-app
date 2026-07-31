@@ -24,6 +24,9 @@ export interface SourceEvent {
   text: string;
   snippet?: string;
   matchedFields?: string[];
+  headingPath?: string[];
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface RunTurnInput {
@@ -193,6 +196,15 @@ function sourceEvents(snippets: Awaited<ReturnType<typeof buildTurnContext>>["sn
     }
     if (snippet.matchedFields?.length) {
       source.matchedFields = snippet.matchedFields;
+    }
+    if (snippet.headingPath?.length) {
+      source.headingPath = snippet.headingPath;
+    }
+    if (snippet.startLine !== undefined) {
+      source.startLine = snippet.startLine;
+    }
+    if (snippet.endLine !== undefined) {
+      source.endLine = snippet.endLine;
     }
     return source;
   });

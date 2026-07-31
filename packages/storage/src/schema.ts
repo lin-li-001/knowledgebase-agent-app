@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS notes (
   owner TEXT NOT NULL,
   scope TEXT NOT NULL,
   sensitivity TEXT NOT NULL,
+  content_category TEXT NOT NULL DEFAULT 'unknown',
   tags_json TEXT NOT NULL,
   summary TEXT,
   summary_source TEXT NOT NULL,

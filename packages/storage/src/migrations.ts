@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { schemaSql, vectorSchemaSql } from "./schema";
 
-export const latestMigrationVersion = 3;
+export const latestMigrationVersion = 4;
 
 export function runMigrations(db: Database.Database): void {
   db.pragma("foreign_keys = ON");
@@ -28,6 +28,12 @@ export function runMigrations(db: Database.Database): void {
     if (currentVersion > 0 && currentVersion < 3) {
       db.exec(vectorSchemaSql);
     }
+    const hasNotesTable = Boolean(
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notes'").get(),
+    );
+    if (hasNotesTable && currentVersion > 0 && currentVersion < 4) {
+      db.exec("ALTER TABLE notes ADD COLUMN content_category TEXT NOT NULL DEFAULT 'unknown';");
+    }
     if (currentVersion < 2) {
       db.prepare(
         "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
@@ -36,6 +42,9 @@ export function runMigrations(db: Database.Database): void {
     db.prepare(
       "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
     ).run(3, "local_vector_index", now);
+    db.prepare(
+      "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+    ).run(4, "note_content_category", now);
     db.pragma(`user_version = ${latestMigrationVersion}`);
   });
 

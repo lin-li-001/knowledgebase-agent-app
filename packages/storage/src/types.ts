@@ -62,6 +62,7 @@ export interface SearchFilters {
   workspaceId?: string;
   limit?: number;
   statuses?: string[];
+  excludedStatuses?: string[];
   sensitivities?: string[];
   categories?: string[];
 }
@@ -69,6 +70,7 @@ export interface SearchFilters {
 export interface VectorSearchFilters {
   workspaceId?: string;
   statuses?: string[];
+  excludedStatuses?: string[];
   sensitivities?: string[];
   categories?: string[];
 }
