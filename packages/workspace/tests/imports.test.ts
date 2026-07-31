@@ -26,6 +26,18 @@ describe("importDocumentBatch", () => {
       batchName: "Handbook",
       files: [pdfPath],
       now: "2026-07-21T00:00:00.000Z",
+      semanticEnricher: {
+        async enrich() {
+          return {
+            summary: "A handbook describing product usage policy.",
+            primaryCategory: "resource" as const,
+            alternativeCategories: [],
+            sensitivity: "normal" as const,
+            confidence: 0.91,
+            evidence: ["Handbook content"],
+          };
+        },
+      },
     });
 
     expect(job.state).toBe("completed");
@@ -130,7 +142,7 @@ describe("importDocumentBatch", () => {
     await expect(readFile(path.join(root, job.notes[0]!.notePath), "utf8")).resolves.toContain("## Routing");
   });
 
-  it("derives the summary from whole-document metadata and later content instead of repeating the opening paragraph", async () => {
+  it("writes the semantic summary while keeping the source opening paragraph only in the body", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const source = path.join(sourceDir, "Handbook.txt");
@@ -145,6 +157,18 @@ describe("importDocumentBatch", () => {
       batchName: "Handbook",
       files: [source],
       now: "2026-07-21T00:00:00.000Z",
+      semanticEnricher: {
+        async enrich() {
+          return {
+            summary: "A handbook containing later implementation details.",
+            primaryCategory: "resource" as const,
+            alternativeCategories: [],
+            sensitivity: "normal" as const,
+            confidence: 0.91,
+            evidence: ["Later implementation detail"],
+          };
+        },
+      },
     });
 
     const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
@@ -152,8 +176,32 @@ describe("importDocumentBatch", () => {
     const document = markdownSection(note, "Document");
 
     expect(document).toContain("Opening policy paragraph that must remain only in the document body.");
+    expect(summary).toContain("A handbook containing later implementation details.");
     expect(summary).not.toContain("Opening policy paragraph that must remain only in the document body.");
-    expect(summary).toContain("Later implementation detail used for the summary.");
+  });
+
+  it("preserves the source and omits an invented summary when enrichment fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Unclassified.txt");
+    await writeFile(source, "Source text must remain available.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Unclassified",
+      files: [source],
+      semanticEnricher: {
+        async enrich() {
+          throw new Error("local model unavailable");
+        },
+      },
+    });
+
+    expect(job.state).toBe("completed");
+    expect(job.notes[0]!.status).toBe("pending_review");
+    const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
+    expect(note).toContain("Source text must remain available.");
+    expect(note).not.toMatch(/^summary:/mu);
   });
 
   it("keeps one staged note per source when a batch has multiple unclassified files", async () => {
