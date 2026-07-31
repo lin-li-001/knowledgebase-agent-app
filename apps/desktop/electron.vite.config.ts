@@ -8,7 +8,15 @@ export default defineConfig({
   main: {
     build: {
       rollupOptions: {
-        external: ["better-sqlite3", /^better-sqlite3\/.+/, "@napi-rs/canvas", /^@napi-rs\/canvas\/.+/],
+        external: [
+          "better-sqlite3",
+          /^better-sqlite3\/.+/,
+          "sqlite-vec",
+          /^sqlite-vec\/.+/,
+          /^sqlite-vec-[a-z0-9-]+$/u,
+          "@napi-rs/canvas",
+          /^@napi-rs\/canvas\/.+/,
+        ],
         input: `${root}/electron/main.ts`,
       },
     },

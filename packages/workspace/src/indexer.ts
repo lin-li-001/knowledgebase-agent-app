@@ -140,7 +140,7 @@ function insertParsedNote(
   now: string,
 ): IndexedNoteProjection {
   const relativePath = path.relative(rootPath, note.path);
-  const summary = note.frontmatter.summary ?? firstMeaningfulParagraph(note.body);
+  const summary = note.frontmatter.summary ?? "";
   const noteId = createHash("sha256").update(`${workspaceId}:${relativePath}`).digest("hex");
 
   db.sqlite
@@ -163,7 +163,7 @@ function insertParsedNote(
       note.frontmatter.content_category ?? "unknown",
       JSON.stringify(note.frontmatter.tags),
       summary,
-      note.frontmatter.summary ? "frontmatter" : "heuristic",
+      note.frontmatter.summary ? "frontmatter" : "none",
       note.contentHash,
       now,
       now,
@@ -276,15 +276,6 @@ function chunkEmbeddingInput(note: ParsedMarkdownNote, chunk: ImportedChunk): { 
     noteId: chunk.noteId,
     text: [note.frontmatter.title, chunk.headingPath.join(" > "), chunk.text].filter(Boolean).join("\n"),
   };
-}
-
-function firstMeaningfulParagraph(body: string): string {
-  return (
-    body
-      .split(/\n\s*\n/u)
-      .map((paragraph) => paragraph.replace(/^#{1,6}\s+/u, "").trim())
-      .find(Boolean) ?? ""
-  );
 }
 
 export function workspaceIdForRoot(rootPath: string): string {

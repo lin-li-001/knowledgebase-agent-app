@@ -7,6 +7,8 @@ import {
   secureReadWorkspaceText,
   type ImportJob,
   type ImportSourceNote,
+  type SemanticImportEnricher,
+  type IndexWorkspaceOptions,
 } from "@kb-agent/workspace";
 import { createReviewItem, recordActivity, type AppDatabase, type ReviewItem } from "@kb-agent/storage";
 
@@ -17,6 +19,8 @@ export interface StartImportBatchInput {
   batchName: string;
   files: string[];
   now?: string;
+  semanticEnricher?: SemanticImportEnricher;
+  indexOptions?: IndexWorkspaceOptions;
 }
 
 export async function startImportBatch(input: StartImportBatchInput): Promise<ImportJob> {
@@ -26,9 +30,10 @@ export async function startImportBatch(input: StartImportBatchInput): Promise<Im
     batchName: input.batchName,
     files: input.files,
     now: createdAt,
+    ...(input.semanticEnricher === undefined ? {} : { semanticEnricher: input.semanticEnricher }),
   });
 
-  const indexResult = await indexWorkspace(input.workspaceRoot, input.db);
+  const indexResult = await indexWorkspace(input.workspaceRoot, input.db, input.indexOptions);
   const workspaceId = indexResult.workspaceId;
   await recordImportJob(input.db, workspaceId, job, createdAt);
 

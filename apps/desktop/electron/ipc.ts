@@ -14,6 +14,7 @@ import {
   recordActivityOnce,
   renewReviewItemClaim,
   searchNotes,
+  SqliteVectorIndex,
   searchSessions,
   transitionClaimedReviewItem,
   transitionReviewItem,
@@ -23,8 +24,16 @@ import {
   type AppDatabase,
   type ReviewItem,
 } from "@kb-agent/storage";
-import { MockProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
-import { runTurn, startImportBatch, type ToolHandler, type MvpToolName } from "@kb-agent/core";
+import { MockProvider, OllamaEmbeddingProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
+import {
+  LocalNotesRecallProvider,
+  ModelSemanticImportEnricher,
+  SemanticNotesRecallProvider,
+  runTurn,
+  startImportBatch,
+  type ToolHandler,
+  type MvpToolName,
+} from "@kb-agent/core";
 import {
   assertApprovedImportFinalNotePath,
   assertInsideWorkspace,
@@ -51,6 +60,7 @@ import {
   type ClassificationSignal,
   workspaceIdForRoot,
   type ContentCategory,
+  type IndexWorkspaceOptions,
   type ImportClassification,
   type SafetyDecision,
   type SecureWorkspaceArtifactIdentity,
@@ -226,6 +236,7 @@ export async function handleIpcRequest(
             userMessage: payload.message as string,
             handlers: createDefaultToolHandlers(services),
             signal: controller.signal,
+            recallProviders: createRecallProviders(services),
           })) {
             events.push(event);
           }
@@ -272,7 +283,11 @@ export async function handleIpcRequest(
         result = { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
         return result;
       case "index:rebuild": {
-        const indexResult = await indexWorkspace(requireWorkspaceRoot(services), requireDatabase(services));
+        const indexResult = await indexWorkspace(
+          requireWorkspaceRoot(services),
+          requireDatabase(services),
+          createIndexOptions(services),
+        );
         await recordActivity(requireDatabase(services), {
           id: randomUUID(),
           workspaceId: indexResult.workspaceId,
@@ -291,6 +306,11 @@ export async function handleIpcRequest(
           workspaceId: requireWorkspaceId(services),
           batchName: payload.batchName as string,
           files: payload.filePaths as string[],
+          semanticEnricher: new ModelSemanticImportEnricher(
+            await getModelProvider(services),
+            await getModelName(services),
+          ),
+          indexOptions: createIndexOptions(services),
         });
         result = { ok: true, data: job };
         return result;
@@ -579,7 +599,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         });
       }
       if (item.proposalType === "propose_create_note") {
-        await indexWorkspace(requireWorkspaceRoot(services), db);
+        await indexWorkspace(requireWorkspaceRoot(services), db, createIndexOptions(services));
       }
       await recordActivityOnce(db, {
         id: `review-applied-${id}`,
@@ -632,7 +652,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     await applyMemoryProposal(services, item);
     const appliedAt = new Date().toISOString();
     const entityPath = defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services));
-    await indexWorkspace(requireWorkspaceRoot(services), db);
+    await indexWorkspace(requireWorkspaceRoot(services), db, createIndexOptions(services));
     await recordActivityOnce(db, {
       id: `review-applied-${id}`,
       workspaceId: item.workspaceId,
@@ -2190,7 +2210,11 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
     await writeDesktopSettings(services.settingsPath, { ...settings, workspaceRoot: services.workspaceRoot });
   }
   services.db = openAppDatabase(path.join(services.workspaceRoot, ".app/index.sqlite"));
-  const result = await indexWorkspace(services.workspaceRoot, services.db);
+  const result = await indexWorkspace(
+    services.workspaceRoot,
+    services.db,
+    createIndexOptions(services),
+  );
   services.workspaceId = result.workspaceId;
   services.sessionId = ensureSession(services.db, result.workspaceId);
   await recordActivity(services.db, {
@@ -2442,6 +2466,31 @@ async function getModelProvider(services: IpcServices): Promise<ModelProvider> {
   }
 
   return new MockProvider([{ role: "assistant", content: "Mock response complete." }]);
+}
+
+function createEmbeddingProvider(): OllamaEmbeddingProvider {
+  return new OllamaEmbeddingProvider({
+    model: "bge-m3",
+    baseUrl: "http://127.0.0.1:11434",
+    dimensions: 1024,
+  });
+}
+
+function createIndexOptions(services: IpcServices): IndexWorkspaceOptions {
+  return {
+    embeddingProvider: createEmbeddingProvider(),
+    vectorIndex: new SqliteVectorIndex(requireDatabase(services).sqlite),
+  };
+}
+
+function createRecallProviders(services: IpcServices) {
+  return [
+    new SemanticNotesRecallProvider({
+      embeddingProvider: createEmbeddingProvider(),
+      vectorIndex: new SqliteVectorIndex(requireDatabase(services).sqlite),
+    }),
+    new LocalNotesRecallProvider(),
+  ];
 }
 
 async function getModelName(services: IpcServices): Promise<string> {

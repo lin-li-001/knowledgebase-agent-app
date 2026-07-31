@@ -87,17 +87,22 @@ export class SemanticNotesRecallProvider implements RecallProvider {
   }
 
   async prefetch(input: RecallQuery): Promise<EvidenceBundle[]> {
-    const queryVector = await this.embeddingProvider.embedQuery(input.query);
-    const filters: VectorSearchFilters = { ...this.filters, workspaceId: input.workspaceId };
-    const [noteResults, chunkResults] = await Promise.all([
-      this.vectorIndex.searchNotes(queryVector, filters, this.limit),
-      this.vectorIndex.searchChunks(queryVector, filters, this.limit * 2),
-    ]);
-    const candidates = [
-      ...noteResults.map((result) => this.noteCandidate(input.db, result)),
-      ...chunkResults.map((result) => this.chunkCandidate(input.db, result)),
-    ];
-    return rerankCandidates(candidates, this.limit);
+    try {
+      const queryVector = await this.embeddingProvider.embedQuery(input.query);
+      const filters: VectorSearchFilters = { ...this.filters, workspaceId: input.workspaceId };
+      const [noteResults, chunkResults] = await Promise.all([
+        this.vectorIndex.searchNotes(queryVector, filters, this.limit),
+        this.vectorIndex.searchChunks(queryVector, filters, this.limit * 2),
+      ]);
+      const candidates = [
+        ...noteResults.map((result) => this.noteCandidate(input.db, result)),
+        ...chunkResults.map((result) => this.chunkCandidate(input.db, result)),
+      ];
+      return rerankCandidates(candidates, this.limit);
+    } catch {
+      // Local semantic retrieval is optional; the lexical provider remains available.
+      return [];
+    }
   }
 
   private noteCandidate(db: AppDatabase, result: NoteVectorSearchResult): RerankCandidate {

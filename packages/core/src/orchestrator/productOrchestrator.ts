@@ -42,6 +42,7 @@ export interface RunTurnInput {
   handlers?: Map<MvpToolName, ToolHandler>;
   signal?: AbortSignal;
   now?: string;
+  recallProviders?: import("./recallProvider").RecallProvider[];
 }
 
 const activeSessions = new Set<string>();
@@ -76,6 +77,7 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       workspaceRoot: input.workspaceRoot,
       activeProfileId: input.activeProfileId,
       query: input.userMessage,
+      ...(input.recallProviders === undefined ? {} : { recallProviders: input.recallProviders }),
     });
     const sources = sourceEvents(context.snippets);
     if (sources.length) {

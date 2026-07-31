@@ -1,5 +1,6 @@
 export { recordActivityEvent, listRecentActivity } from "./activity/activityService";
 export { startImportBatch } from "./imports/importService";
+export { ModelSemanticImportEnricher } from "./imports/semanticEnricher";
 export { buildTurnContext } from "./orchestrator/contextBuilder";
 export { runTurn } from "./orchestrator/productOrchestrator";
 export { LocalNotesRecallProvider, SemanticNotesRecallProvider } from "./orchestrator/recallProvider";
