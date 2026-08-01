@@ -54,13 +54,27 @@ export async function indexWorkspace(
     parsedNotes.push(await parseMarkdownNote(filePath));
   }
 
-  const existingNoteIds = db.sqlite
-    .prepare("SELECT id FROM notes WHERE workspace_id = ?")
+  const existingNotes = db.sqlite
+    .prepare("SELECT id, path, content_hash FROM notes WHERE workspace_id = ?")
     .all(workspaceId)
-    .map((row) => (row as { id: string }).id);
+    .map((row) => row as { id: string; path: string; content_hash: string });
+  const existingNotesByPath = new Map(existingNotes.map((note) => [note.path, note]));
+  const newNoteIds = new Set(parsedNotes.map((note) => noteIdForPath(workspaceId, path.relative(normalizedRoot, note.path))));
+  const removedNoteIds = existingNotes.filter((note) => !newNoteIds.has(note.id)).map((note) => note.id);
+  const changedNotes = parsedNotes.filter((note) => {
+    const relativePath = path.relative(normalizedRoot, note.path);
+    return existingNotesByPath.get(relativePath)?.content_hash !== note.contentHash;
+  });
+  const changedNoteIds = changedNotes.map((note) => noteIdForPath(workspaceId, path.relative(normalizedRoot, note.path)));
+  const previousChunkIds = existingChunkIds(db, [...new Set([...removedNoteIds, ...changedNoteIds])]);
+  const vectorRebuild = options.vectorIndex !== undefined && options.embeddingProvider !== undefined
+    ? vectorIndexNeedsRebuild(db, workspaceId, options.embeddingProvider.modelId())
+    : false;
   if (options.vectorIndex !== undefined) {
-    await options.vectorIndex.deleteNotes(existingNoteIds);
-    await options.vectorIndex.deleteChunks(existingChunkIds(db, existingNoteIds));
+    const noteIdsToDelete = vectorRebuild ? existingNotes.map((note) => note.id) : [...new Set([...removedNoteIds, ...changedNoteIds])];
+    const chunkIdsToDelete = vectorRebuild ? existingChunkIds(db, existingNotes.map((note) => note.id)) : previousChunkIds;
+    await options.vectorIndex.deleteNotes(noteIdsToDelete);
+    await options.vectorIndex.deleteChunks(chunkIdsToDelete);
   }
 
   const projections: IndexedNoteProjection[] = [];
@@ -77,7 +91,10 @@ export async function indexWorkspace(
   }
 
   try {
-    await indexVectors(projections, workspaceId, options.embeddingProvider, options.vectorIndex);
+    const projectionsToEmbed = vectorRebuild
+      ? projections
+      : projections.filter((projection) => changedNoteIds.includes(projection.noteId));
+    await indexVectors(projectionsToEmbed, workspaceId, options.embeddingProvider, options.vectorIndex);
     return { workspaceId, noteCount: markdownPaths.length, chunkCount, vectorIndexing: "completed" };
   } catch (error) {
     return {
@@ -217,12 +234,44 @@ function existingChunkIds(db: AppDatabase, noteIds: string[]): string[] {
     .map((row) => (row as { id: string }).id);
 }
 
+function noteIdForPath(workspaceId: string, relativePath: string): string {
+  return createHash("sha256").update(`${workspaceId}:${relativePath}`).digest("hex");
+}
+
+function vectorIndexNeedsRebuild(db: AppDatabase, workspaceId: string, modelId: string): boolean {
+  const expectedNotes = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM notes WHERE workspace_id = ?",
+  ).get(workspaceId) as { count: number };
+  const expectedChunks = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM chunks WHERE note_id IN (SELECT id FROM notes WHERE workspace_id = ?)",
+  ).get(workspaceId) as { count: number };
+  const noteVectors = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM note_embeddings WHERE workspace_id = ?",
+  ).get(workspaceId) as { count: number };
+  const chunkVectors = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM chunk_embeddings WHERE workspace_id = ?",
+  ).get(workspaceId) as { count: number };
+  if (noteVectors.count !== expectedNotes.count || chunkVectors.count !== expectedChunks.count) {
+    return true;
+  }
+  const staleNotes = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM note_embeddings WHERE workspace_id = ? AND model_id <> ?",
+  ).get(workspaceId, modelId) as { count: number };
+  const staleChunks = db.sqlite.prepare(
+    "SELECT COUNT(*) as count FROM chunk_embeddings WHERE workspace_id = ? AND model_id <> ?",
+  ).get(workspaceId, modelId) as { count: number };
+  return staleNotes.count > 0 || staleChunks.count > 0;
+}
+
 async function indexVectors(
   projections: IndexedNoteProjection[],
   workspaceId: string,
   embeddingProvider: WorkspaceEmbeddingProvider,
   vectorIndex: VectorIndex,
 ): Promise<void> {
+  if (projections.length === 0) {
+    return;
+  }
   if (embeddingProvider.dimensions() !== 1024) {
     throw new Error("Local vector index requires 1024-dimensional embeddings");
   }

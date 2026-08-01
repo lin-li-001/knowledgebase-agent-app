@@ -170,14 +170,18 @@ describe("indexWorkspace", () => {
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
     await writeNote(path.join(root, "03-Knowledge/Vector Note.md"), "Vector Note", "## First\n\nFirst section\n\n## Second\n\nSecond section");
 
+    let embeddingCalls = 0;
     const embeddingProvider = {
       modelId: () => "bge-m3",
       dimensions: () => 1024,
-      embedDocuments: async (texts: string[]) => texts.map((_, index) => {
-        const embedding = Array.from({ length: 1024 }, () => 0);
-        embedding[index % 1024] = 1;
-        return embedding;
-      }),
+      embedDocuments: async (texts: string[]) => {
+        embeddingCalls += 1;
+        return texts.map((_, index) => {
+          const embedding = Array.from({ length: 1024 }, () => 0);
+          embedding[index % 1024] = 1;
+          return embedding;
+        });
+      },
     };
     const result = await indexWorkspace(root, db, {
       embeddingProvider,
@@ -188,6 +192,9 @@ describe("indexWorkspace", () => {
     expect(result.chunkCount).toBe(3);
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_embeddings").get()).toEqual({ count: 1 });
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM chunk_embeddings").get()).toEqual({ count: 3 });
+
+    await indexWorkspace(root, db, { embeddingProvider, vectorIndex: new SqliteVectorIndex(db.sqlite) });
+    expect(embeddingCalls).toBe(2);
   });
 
   it("keeps the previous index when a later parse fails", async () => {
