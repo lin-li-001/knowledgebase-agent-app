@@ -15,6 +15,36 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
   ) {}
 
   async enrich(input: SemanticImportInput): Promise<SemanticImportResult> {
+    const chunkResults = await Promise.all(input.chunks.map(async (chunk) => {
+      const result = await this.completeAnalysis(
+        input.title,
+        chunk.text,
+        `Analyze source chunk ${chunk.id}. Focus on the facts and meaning in this chunk.`,
+      );
+      return {
+        headingPath: chunk.headingPath,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...result,
+      };
+    }));
+
+    return this.completeAnalysis(
+      input.title,
+      input.body.slice(0, MAX_DOCUMENT_CHARS),
+      "Aggregate the complete document. Use the chunk analyses as evidence, resolve conflicts conservatively, and do not copy the opening paragraph as the summary.",
+      chunkResults,
+      input,
+    );
+  }
+
+  private async completeAnalysis(
+    title: string,
+    document: string,
+    task: string,
+    chunkAnalyses: unknown[] = [],
+    input?: SemanticImportInput,
+  ): Promise<SemanticImportResult> {
     const response = await this.modelProvider.complete({
       model: this.model,
       messages: [
@@ -22,7 +52,7 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
           role: "system",
           content: [
             "You classify imported knowledge-base documents.",
-            "Understand the document as a whole, then return JSON only.",
+            "Return JSON only.",
             "Do not return Markdown, a code fence, or extra commentary.",
             "summary must be a concise faithful summary, not a copy of the opening paragraph.",
             "Use exactly one primaryCategory from the allowed list.",
@@ -33,7 +63,7 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
         {
           role: "user",
           content: JSON.stringify({
-            task: "Analyze this imported document and classify it.",
+            task,
             outputShape: {
               summary: "string",
               primaryCategory: "finance.utility | finance.insurance | finance.tax | finance.statement | profile.career | profile.personal_fact | memory.candidate | decision.record | project.document | resource | unknown",
@@ -42,15 +72,20 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
               confidence: 0.0,
               evidence: ["short phrases from the document supporting the decision"],
             },
-            title: input.title,
-            document: input.body.slice(0, MAX_DOCUMENT_CHARS),
-            chunkCount: input.chunks.length,
+            title,
+            document,
+            chunkAnalyses,
           }),
         },
       ],
     });
 
-    return normalizeSemanticImportResult(parseJson(response.content), input);
+    const semanticInput = input ?? {
+      title,
+      body: document,
+      chunks: [],
+    };
+    return normalizeSemanticImportResult(parseJson(response.content), semanticInput);
   }
 }
 
