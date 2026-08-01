@@ -70,7 +70,21 @@ export async function extractDocumentText(
   }
 
   if (extension === ".docx") {
-    throw new Error("DOCX import requires the DOCX parser dependency");
+    const [{ convertToHtml }, { default: TurndownService }] = await Promise.all([
+      import("mammoth"),
+      import("turndown"),
+    ]);
+    const converted = await convertToHtml({ buffer: verifiedContents });
+    const markdownBody = new TurndownService({
+      headingStyle: "atx",
+      bulletListMarker: "-",
+    }).turndown(converted.value).trim();
+    return {
+      sourcePath,
+      fileName,
+      text: markdownBody,
+      markdownBody,
+    };
   }
 
   throw new Error(`Unsupported import file type: ${extension || "unknown"}`);
