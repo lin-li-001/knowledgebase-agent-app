@@ -204,7 +204,7 @@ tags: []
 
     expect(job).toMatchObject({
       state: "failed",
-      failureReason: "DOCX import requires the DOCX parser dependency",
+      failureReason: "Invalid or unreadable DOCX file",
       sourceFiles: ["06-Attachments/Imports/Handbook/Handbook.docx"],
     });
     await expect(
@@ -219,7 +219,7 @@ tags: []
         .prepare("SELECT message FROM activity_events WHERE title = 'Import failed' ORDER BY created_at DESC LIMIT 1")
         .get(),
     ).toEqual({
-      message: "DOCX import requires the DOCX parser dependency. Preserved 1 source attachment.",
+      message: "Invalid or unreadable DOCX file. Preserved 1 source attachment.",
     });
   });
 });

@@ -70,11 +70,25 @@ export async function extractDocumentText(
   }
 
   if (extension === ".docx") {
-    const [{ convertToHtml }, { default: TurndownService }] = await Promise.all([
-      import("mammoth"),
-      import("turndown"),
-    ]);
-    const converted = await convertToHtml({ buffer: verifiedContents });
+    let convertToHtml: (input: { buffer: Buffer }) => Promise<{ value: string }>;
+    let TurndownService: new (options?: {
+      headingStyle?: "setext" | "atx";
+      bulletListMarker?: "-" | "*" | "+";
+    }) => { turndown(input: string): string };
+    try {
+      [{ convertToHtml }, { default: TurndownService }] = await Promise.all([
+        import("mammoth"),
+        import("turndown"),
+      ]);
+    } catch {
+      throw new Error("DOCX import requires the DOCX parser dependency");
+    }
+    let converted: { value: string };
+    try {
+      converted = await convertToHtml({ buffer: verifiedContents });
+    } catch {
+      throw new Error("Invalid or unreadable DOCX file");
+    }
     const markdownBody = new TurndownService({
       headingStyle: "atx",
       bulletListMarker: "-",
