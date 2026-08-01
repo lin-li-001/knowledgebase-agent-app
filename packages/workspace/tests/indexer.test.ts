@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openAppDatabase, searchNotes, type AppDatabase } from "@kb-agent/storage";
+import { openAppDatabase, searchNotes, SqliteVectorIndex, type AppDatabase } from "@kb-agent/storage";
 import { indexWorkspace, parseMarkdownNote } from "../src/index";
 
 let opened: AppDatabase[] = [];
@@ -145,14 +145,14 @@ describe("indexWorkspace", () => {
     opened.push(db);
 
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
-    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "Graph memory architecture");
+    await writeNote(path.join(root, "03-Knowledge/Graph Memory.md"), "Graph Memory", "## Overview\n\nGraph memory architecture\n\n## Retrieval\n\nRetrieval details");
     await writeNote(path.join(root, "03-Knowledge/中文搜索.md"), "中文搜索", "中文 搜索 测试");
 
     const result = await indexWorkspace(root, db);
 
     expect(result.noteCount).toBe(2);
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM notes").get()).toEqual({ count: 2 });
-    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM chunks").get()).toEqual({ count: 2 });
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM chunks").get()).toEqual({ count: 4 });
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_fts").get()).toEqual({ count: 2 });
     expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_fts_trigram").get()).toEqual({ count: 2 });
     await expect(searchNotes(db, "memory", { workspaceId: result.workspaceId })).resolves.toEqual(
@@ -161,6 +161,33 @@ describe("indexWorkspace", () => {
     await expect(searchNotes(db, "中文", { workspaceId: result.workspaceId })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ title: "中文搜索" })]),
     );
+  });
+
+  it("projects note and source chunks into the local vector index", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-index-vector-"));
+    const db = openAppDatabase(path.join(root, ".app/index.sqlite"));
+    opened.push(db);
+    await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
+    await writeNote(path.join(root, "03-Knowledge/Vector Note.md"), "Vector Note", "## First\n\nFirst section\n\n## Second\n\nSecond section");
+
+    const embeddingProvider = {
+      modelId: () => "bge-m3",
+      dimensions: () => 1024,
+      embedDocuments: async (texts: string[]) => texts.map((_, index) => {
+        const embedding = Array.from({ length: 1024 }, () => 0);
+        embedding[index % 1024] = 1;
+        return embedding;
+      }),
+    };
+    const result = await indexWorkspace(root, db, {
+      embeddingProvider,
+      vectorIndex: new SqliteVectorIndex(db.sqlite),
+    });
+
+    expect(result.vectorIndexing).toBe("completed");
+    expect(result.chunkCount).toBe(3);
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM note_embeddings").get()).toEqual({ count: 1 });
+    expect(db.sqlite.prepare("SELECT COUNT(*) as count FROM chunk_embeddings").get()).toEqual({ count: 3 });
   });
 
   it("keeps the previous index when a later parse fails", async () => {

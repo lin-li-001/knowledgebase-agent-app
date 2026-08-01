@@ -12,12 +12,28 @@ export interface WorkspaceAuditResult {
   findings: WorkspaceAuditFinding[];
 }
 
+export interface EmbeddingStatus {
+  ollama: {
+    available: boolean;
+    model: string;
+    modelInstalled: boolean;
+    error?: string;
+  };
+  lastIndex: {
+    vectorIndexing: "not_configured" | "completed" | "failed";
+    vectorError?: string;
+    noteCount: number;
+    chunkCount: number;
+  } | null;
+}
+
 export function KnowledgeRoute({
   rebuilding,
   auditing,
   importDisabled,
   auditResult,
   importNotices,
+  embeddingStatus,
   onRebuild,
   onAudit,
   onImport,
@@ -27,6 +43,7 @@ export function KnowledgeRoute({
   importDisabled: boolean;
   auditResult?: WorkspaceAuditResult | null;
   importNotices: string[];
+  embeddingStatus?: EmbeddingStatus | null;
   onRebuild(): Promise<void>;
   onAudit(): Promise<void>;
   onImport(input: { batchName: string; filePaths: string[] }): Promise<void>;
@@ -36,13 +53,14 @@ export function KnowledgeRoute({
       <div className="route-header">
         <h1 id="knowledge-heading">Knowledge</h1>
         <button type="button" disabled={rebuilding} onClick={() => void onRebuild()}>
-          Rebuild Index
+          {embeddingStatus?.lastIndex?.vectorIndexing === "failed" ? "Retry Vector Index" : "Rebuild Index"}
         </button>
         <button type="button" className="secondary-button" disabled={auditing || importDisabled} onClick={() => void onAudit()}>
           Run Audit
         </button>
       </div>
       {rebuilding ? <p className="inline-note">Index rebuilding...</p> : <p>Search English and Chinese notes.</p>}
+      {embeddingStatus ? <EmbeddingStatusPanel status={embeddingStatus} /> : null}
       {auditing ? <p className="inline-note">Workspace audit running...</p> : null}
       {auditResult ? (
         <section className="audit-panel" aria-label="Workspace audit results">
@@ -69,6 +87,25 @@ export function KnowledgeRoute({
         </ul>
       ) : null}
       <ImportDropzone disabled={importDisabled} onImport={onImport} />
+    </section>
+  );
+}
+
+function EmbeddingStatusPanel({ status }: { status: EmbeddingStatus }) {
+  const indexStatus = status.lastIndex?.vectorIndexing ?? "not_configured";
+  const ollamaLabel = !status.ollama.available
+    ? "Ollama unavailable"
+    : status.ollama.modelInstalled
+      ? `${status.ollama.model} ready`
+      : `${status.ollama.model} not installed`;
+  return (
+    <section className="embedding-status" aria-label="Embedding status">
+      <strong>Semantic index</strong>
+      <span>{ollamaLabel}</span>
+      <span>Index: {indexStatus}</span>
+      {!status.ollama.available && status.ollama.error ? <small>{status.ollama.error}</small> : null}
+      {status.ollama.available && !status.ollama.modelInstalled ? <small>Install the configured model in Ollama, then rebuild the index.</small> : null}
+      {status.lastIndex?.vectorError ? <small>{status.lastIndex.vectorError}</small> : null}
     </section>
   );
 }

@@ -1,8 +1,9 @@
 export { recordActivityEvent, listRecentActivity } from "./activity/activityService";
 export { startImportBatch } from "./imports/importService";
+export { ModelSemanticImportEnricher } from "./imports/semanticEnricher";
 export { buildTurnContext } from "./orchestrator/contextBuilder";
 export { runTurn } from "./orchestrator/productOrchestrator";
-export { LocalNotesRecallProvider } from "./orchestrator/recallProvider";
+export { LocalNotesRecallProvider, SemanticNotesRecallProvider } from "./orchestrator/recallProvider";
 export { buildRequestMessages } from "./orchestrator/requestMessages";
 export { finalizeTurn } from "./orchestrator/turnFinalizer";
 export { classifyProposalRisk } from "./risk/riskPolicy";

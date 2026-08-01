@@ -50,6 +50,15 @@ export async function buildTurnContext(input: {
       if (candidate.matchedFields?.length) {
         snippet.matchedFields = candidate.matchedFields;
       }
+      if (candidate.headingPath?.length) {
+        snippet.headingPath = candidate.headingPath;
+      }
+      if (candidate.startLine !== undefined) {
+        snippet.startLine = candidate.startLine;
+      }
+      if (candidate.endLine !== undefined) {
+        snippet.endLine = candidate.endLine;
+      }
       return snippet;
     }),
   };

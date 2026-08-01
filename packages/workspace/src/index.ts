@@ -7,6 +7,8 @@ export {
 export { detectImportSignals, mergeImportClassification } from "./importClassification";
 export { exportLlmsFlat } from "./exporter";
 export { importDocumentBatch } from "./imports";
+export { chunkMarkdownBody } from "./importChunks";
+export { normalizeSemanticImportResult } from "./importSemanticEnrichment";
 export {
   discardImportPromotionJournal,
   promoteImportArtifact,
@@ -29,8 +31,10 @@ export {
   workspaceWriteLockRelativePath,
 } from "./workspaceWriteLock";
 export type { NoteFrontmatter } from "./frontmatter";
-export type { IndexWorkspaceResult } from "./indexer";
+export type { IndexWorkspaceOptions, IndexWorkspaceResult, VectorIndexingStatus, WorkspaceEmbeddingProvider } from "./indexer";
 export type { ImportArtifactStatus, ImportBatchInput, ImportFileOps, ImportJob, ImportSourceNote } from "./imports";
+export type { ChunkMarkdownOptions, ImportedChunk } from "./importChunks";
+export type { SemanticImportEnricher, SemanticImportInput, SemanticImportResult } from "./importSemanticEnrichment";
 export type {
   ImportPromotionHooks,
   ImportPromotionResult,

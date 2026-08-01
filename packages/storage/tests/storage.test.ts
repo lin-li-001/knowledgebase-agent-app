@@ -114,7 +114,8 @@ describe("migrations", () => {
       .all()
       .map((row) => (row as { name: string }).name);
     expect(columns).toEqual(expect.arrayContaining(["claim_token", "claim_started_at", "application_json"]));
-    expect(migrated.sqlite.pragma("user_version", { simple: true })).toBe(2);
+    expect(migrated.sqlite.pragma("user_version", { simple: true })).toBe(4);
+    expect(migrated.sqlite.prepare("SELECT name FROM sqlite_master WHERE name IN ('note_embeddings', 'chunk_embeddings')").all()).toHaveLength(2);
   });
 
   it("cascades workspace-owned runtime records", async () => {
@@ -128,8 +129,8 @@ describe("migrations", () => {
       .prepare(
         `INSERT INTO notes (
           id, workspace_id, path, title, type, status, owner, scope, sensitivity,
-          tags_json, summary_source, content_hash, modified_at, indexed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          content_category, tags_json, summary_source, content_hash, modified_at, indexed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         "note-1",
@@ -141,6 +142,7 @@ describe("migrations", () => {
         "default",
         "personal",
         "normal",
+        "unknown",
         "[]",
         "heuristic",
         "hash",
@@ -495,8 +497,8 @@ function insertSearchableNote(
     .prepare(
       `INSERT INTO notes (
         id, workspace_id, path, title, type, status, owner, scope, sensitivity,
-        tags_json, summary, summary_source, content_hash, modified_at, indexed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        content_category, tags_json, summary, summary_source, content_hash, modified_at, indexed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.id,
@@ -508,6 +510,7 @@ function insertSearchableNote(
       "default",
       "personal",
       "normal",
+      "unknown",
       "[]",
       input.body,
       "heuristic",

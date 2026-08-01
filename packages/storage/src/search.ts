@@ -19,6 +19,7 @@ export async function searchNotes(
   }
   const table = isCjkQuery ? "note_fts_trigram" : "note_fts";
   const workspaceClause = filters.workspaceId ? "AND f.workspace_id = @workspaceId" : "";
+  const metadataFilter = noteMetadataFilter(filters);
   const matchExpression = isCjkQuery
     ? "(f.title LIKE @likeQuery OR f.summary LIKE @likeQuery OR f.headings LIKE @likeQuery OR f.body LIKE @likeQuery)"
     : `${table} MATCH @query`;
@@ -35,7 +36,7 @@ export async function searchNotes(
         f.body,
         snippet(${table}, 5, '', '', '...', 18) as snippet
       FROM ${table} f
-      WHERE ${matchExpression} ${workspaceClause}
+      WHERE ${matchExpression} ${workspaceClause} ${metadataFilter.clause}
       LIMIT @limit`,
     )
     .all({
@@ -43,6 +44,7 @@ export async function searchNotes(
       likeQuery: `%${query.trim()}%`,
       workspaceId: filters.workspaceId,
       limit,
+      ...metadataFilter.params,
     }) as NoteSearchRow[];
 
   return rows.map((row) => {
@@ -65,6 +67,38 @@ export async function searchNotes(
     }
     return result;
   });
+}
+
+function noteMetadataFilter(filters: SearchFilters): { clause: string; params: Record<string, string> } {
+  const conditions: string[] = [];
+  const params: Record<string, string> = {};
+  const addInFilter = (field: "status" | "sensitivity" | "content_category", values: string[] | undefined, prefix: string): void => {
+    if (values === undefined) return;
+    if (values.length === 0) {
+      conditions.push("1 = 0");
+      return;
+    }
+    const placeholders = values.map((value, index) => {
+      const key = `${prefix}${index}`;
+      params[key] = value;
+      return `@${key}`;
+    }).join(", ");
+    conditions.push(`n.${field} IN (${placeholders})`);
+  };
+  addInFilter("status", filters.statuses, "status");
+  addInFilter("sensitivity", filters.sensitivities, "sensitivity");
+  addInFilter("content_category", filters.categories, "category");
+  if (filters.excludedStatuses?.length) {
+    const placeholders = filters.excludedStatuses.map((value, index) => {
+      const key = `excludedStatus${index}`;
+      params[key] = value;
+      return `@${key}`;
+    }).join(", ");
+    conditions.push(`n.status NOT IN (${placeholders})`);
+  }
+  return conditions.length === 0
+    ? { clause: "", params }
+    : { clause: `AND f.note_id IN (SELECT n.id FROM notes n WHERE ${conditions.join(" AND ")})`, params };
 }
 
 interface NoteSearchRow extends NoteSearchResult {

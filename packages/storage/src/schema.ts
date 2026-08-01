@@ -1,3 +1,27 @@
+export const vectorSchemaSql = `
+CREATE VIRTUAL TABLE IF NOT EXISTS note_embeddings USING vec0(
+  embedding float[1024],
+  note_id TEXT,
+  workspace_id TEXT,
+  status TEXT,
+  sensitivity TEXT,
+  category TEXT,
+  model_id TEXT,
+  content_hash TEXT
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings USING vec0(
+  embedding float[1024],
+  chunk_id TEXT,
+  note_id TEXT,
+  workspace_id TEXT,
+  status TEXT,
+  sensitivity TEXT,
+  category TEXT,
+  model_id TEXT,
+  content_hash TEXT
+);`;
+
 export const schemaSql = `PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -23,6 +47,7 @@ CREATE TABLE IF NOT EXISTS notes (
   owner TEXT NOT NULL,
   scope TEXT NOT NULL,
   sensitivity TEXT NOT NULL,
+  content_category TEXT NOT NULL DEFAULT 'unknown',
   tags_json TEXT NOT NULL,
   summary TEXT,
   summary_source TEXT NOT NULL,
@@ -70,6 +95,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_note_id ON chunks(note_id);
+
+${vectorSchemaSql}
 
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,

@@ -24,6 +24,9 @@ export interface SourceEvent {
   text: string;
   snippet?: string;
   matchedFields?: string[];
+  headingPath?: string[];
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface RunTurnInput {
@@ -39,6 +42,7 @@ export interface RunTurnInput {
   handlers?: Map<MvpToolName, ToolHandler>;
   signal?: AbortSignal;
   now?: string;
+  recallProviders?: import("./recallProvider").RecallProvider[];
 }
 
 const activeSessions = new Set<string>();
@@ -73,6 +77,7 @@ export async function* runTurn(input: RunTurnInput): AsyncIterable<TurnEvent> {
       workspaceRoot: input.workspaceRoot,
       activeProfileId: input.activeProfileId,
       query: input.userMessage,
+      ...(input.recallProviders === undefined ? {} : { recallProviders: input.recallProviders }),
     });
     const sources = sourceEvents(context.snippets);
     if (sources.length) {
@@ -193,6 +198,15 @@ function sourceEvents(snippets: Awaited<ReturnType<typeof buildTurnContext>>["sn
     }
     if (snippet.matchedFields?.length) {
       source.matchedFields = snippet.matchedFields;
+    }
+    if (snippet.headingPath?.length) {
+      source.headingPath = snippet.headingPath;
+    }
+    if (snippet.startLine !== undefined) {
+      source.startLine = snippet.startLine;
+    }
+    if (snippet.endLine !== undefined) {
+      source.endLine = snippet.endLine;
     }
     return source;
   });

@@ -7,7 +7,13 @@ import {
   mergeImportClassification,
   type SavedImportRule,
 } from "./importClassification";
+import { chunkMarkdownBody } from "./importChunks";
 import { importCandidateRoutingPolicy } from "./importCandidateRoutingPolicy";
+import {
+  normalizeSemanticImportResult,
+  type SemanticImportEnricher,
+  type SemanticImportResult,
+} from "./importSemanticEnrichment";
 import {
   evaluateImportSafety,
   type ClassificationSignal,
@@ -44,6 +50,7 @@ export interface ImportBatchInput {
   batchName: string;
   files: string[];
   now?: string;
+  semanticEnricher?: SemanticImportEnricher;
   fileOps?: Partial<ImportFileOps>;
   ioHooks?: SecureWorkspaceIoHooks;
 }
@@ -99,6 +106,7 @@ interface WorkspaceRoutingPolicyFile {
 interface RoutedDocument {
   classification: ImportClassification;
   destination: string;
+  summary?: string;
 }
 
 interface RenderSourceNoteInput {
@@ -110,7 +118,7 @@ interface RenderSourceNoteInput {
   notePath: string;
   safetyDecision: SafetyDecision;
   status: ImportArtifactStatus;
-  summary: string;
+  summary?: string;
   title: string;
 }
 
@@ -186,6 +194,7 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
         policy,
         fileOps,
         createdDerivedArtifacts,
+        input.semanticEnricher,
         input.ioHooks,
       ));
     }
@@ -226,10 +235,12 @@ async function persistSourceNote(
   policy: WorkspaceRoutingPolicyFile,
   fileOps: ImportFileOps,
   createdArtifacts: Map<string, SecureWorkspaceArtifactIdentity>,
+  semanticEnricher?: SemanticImportEnricher,
   ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
-  const routed = routeDocument(batchName, title, document, policy);
+  const semanticResult = await enrichImportedDocument(semanticEnricher, importId, title, document);
+  const routed = routeDocument(batchName, title, document, policy, semanticResult);
   const stagingPath = defaultRoutingPolicy.importStagingNotePath(importId, title);
   const stagingTargetPath = assertInsideWorkspace(workspaceRoot, stagingPath);
   const destinationTargetPath = safeWorkspacePath(workspaceRoot, routed.destination);
@@ -254,7 +265,7 @@ async function persistSourceNote(
     notePath,
     safetyDecision,
     status,
-    summary: summaryFor(document),
+    ...(routed.summary === undefined ? {} : { summary: routed.summary }),
     title,
   });
 
@@ -337,7 +348,7 @@ async function persistSourceNote(
           notePath: blockedNotePath,
           safetyDecision: blockedSafetyDecision,
           status: "blocked",
-          summary: summaryFor(document),
+          ...(routed.summary === undefined ? {} : { summary: routed.summary }),
           title,
         }),
         secureIoOptions("staging_blocked_rewrite", ioHooks),
@@ -375,17 +386,56 @@ function sourceNoteResult(
   };
 }
 
+async function enrichImportedDocument(
+  enricher: SemanticImportEnricher | undefined,
+  importId: string,
+  title: string,
+  document: ImportedDocument,
+): Promise<SemanticImportResult | undefined> {
+  if (enricher === undefined || document.requiresOcr || !document.markdownBody.trim()) {
+    return undefined;
+  }
+
+  const chunks = chunkMarkdownBody(document.markdownBody, {
+    noteId: `import:${importId}:${title}`,
+  });
+  try {
+    const rawResult = await enricher.enrich({
+      title,
+      body: document.markdownBody,
+      chunks,
+    });
+    return normalizeSemanticImportResult(rawResult, {
+      title,
+      body: document.markdownBody,
+      chunks,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function routeDocument(
   batchName: string,
   title: string,
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
+  semanticResult?: SemanticImportResult,
 ): RoutedDocument {
   const detectorSignals = detectImportSignals({
     batchName,
     fileName: document.fileName,
     text: document.text,
   });
+  const semanticSignals: ClassificationSignal[] = semanticResult === undefined
+    ? []
+    : [{
+      source: "model",
+      category: semanticResult.primaryCategory,
+      sensitivity: semanticResult.sensitivity,
+      confidence: semanticResult.confidence,
+      evidence: semanticResult.evidence,
+    }];
   const year = firstYear(document.text) ?? firstYear(batchName);
   const isFinance = detectorSignals.some((signal) => signal.category === "finance.utility");
   const hasPersonalFacts = detectorSignals.some((signal) => signal.category === "profile.career");
@@ -398,7 +448,7 @@ function routeDocument(
       : importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
   const savedRuleSignals = savedRoutingRuleSignals(policy, `${title}\n${document.fileName}\n${document.text}`);
   const classification = mergeImportClassification({
-    signals: [...detectorSignals, ...savedRuleSignals],
+    signals: [...semanticSignals, ...detectorSignals, ...savedRuleSignals],
     fallbackDestination,
   });
   const destination = classification.suggestedDestination ?? fallbackDestination;
@@ -406,6 +456,7 @@ function routeDocument(
   return {
     classification,
     destination,
+    ...(semanticResult === undefined ? {} : { summary: semanticResult.summary }),
   };
 }
 
@@ -425,7 +476,7 @@ created: ${input.created}
 tags: ${tags}
 source_type: import
 source_file: ${escapeYamlString(sourceLink)}
-summary: ${escapeYamlString(input.summary)}
+${input.summary === undefined ? "" : `summary: ${escapeYamlString(input.summary)}\n`}
 content_category: ${input.classification.primaryCategory}
 classification_confidence: ${input.classification.confidence}
 classification_evidence: ${JSON.stringify(input.classification.evidence)}
