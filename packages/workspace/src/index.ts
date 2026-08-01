@@ -16,7 +16,9 @@ export {
 } from "./importPromotion";
 export { parseFrontmatter } from "./frontmatter";
 export { indexWorkspace, workspaceIdForRoot } from "./indexer";
+export { shouldWatchWorkspacePath, watchWorkspace, type WorkspaceWatcher } from "./workspaceWatcher";
 export { parseMarkdownDocument, parseMarkdownNote, serializeMarkdownDocument } from "./markdown";
+export { getOcrRuntimeStatus, type OcrRuntimeStatus } from "./importExtractors";
 export { auditWorkspace } from "./workspaceAudit";
 export { defaultRoutingPolicy } from "./routingPolicy";
 export { importCandidateRoutingPolicy, importCandidateRoutingPrecedence } from "./importCandidateRoutingPolicy";

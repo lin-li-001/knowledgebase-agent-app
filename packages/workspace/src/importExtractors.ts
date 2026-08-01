@@ -15,6 +15,20 @@ export interface ExtractedDocument {
   requiresOcr?: boolean;
 }
 
+export interface OcrRuntimeStatus {
+  pdftoppm: boolean;
+  tesseract: boolean;
+  available: boolean;
+}
+
+export async function getOcrRuntimeStatus(): Promise<OcrRuntimeStatus> {
+  const [pdftoppm, tesseract] = await Promise.all([
+    runtimeAvailable("pdftoppm", ["-v"]),
+    runtimeAvailable("tesseract", ["--version"]),
+  ]);
+  return { pdftoppm, tesseract, available: pdftoppm && tesseract };
+}
+
 export async function extractDocumentText(
   sourcePath: string,
   verifiedContents: Buffer,
@@ -53,6 +67,17 @@ export async function extractDocumentText(
             requiresOcr: false,
           };
         }
+      }
+      const layoutText = await tryLayoutPdf(verifiedContents);
+      if (layoutText !== undefined) {
+        return {
+          sourcePath,
+          fileName,
+          text: layoutText.text,
+          markdownBody: layoutText.markdownBody,
+          pageCount: result.total,
+          requiresOcr: false,
+        };
       }
       return {
         sourcePath,
@@ -147,6 +172,29 @@ async function tryOcrPdf(contents: Buffer, pageCount: number): Promise<{ text: s
   }
 }
 
+async function tryLayoutPdf(contents: Buffer): Promise<{ text: string; markdownBody: string } | undefined> {
+  const workingDirectory = await mkdtemp(path.join(tmpdir(), "kb-agent-pdf-layout-"));
+  const pdfPath = path.join(workingDirectory, "source.pdf");
+  try {
+    await writeFile(pdfPath, contents);
+    const { stdout } = await execFileAsync("pdftotext", ["-layout", "-enc", "UTF-8", pdfPath, "-"], {
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    const pages = stdout.split("\f").map((page) => page.trim());
+    if (pages.every((page) => page.length === 0)) return undefined;
+    return {
+      text: pages.join("\n\n").trim(),
+      markdownBody: pages
+        .map((page, index) => `<!-- Page ${index + 1} -->\n\n${page}`)
+        .join("\n\n"),
+    };
+  } catch {
+    return undefined;
+  } finally {
+    await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function ocrLanguage(): Promise<string> {
   const configured = process.env.KB_AGENT_OCR_LANG?.trim();
   if (configured) {
@@ -157,6 +205,15 @@ async function ocrLanguage(): Promise<string> {
     return stdout.includes("chi_sim") ? "eng+chi_sim" : "eng";
   } catch {
     return "eng";
+  }
+}
+
+async function runtimeAvailable(command: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync(command, args, { timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
   }
 }
 

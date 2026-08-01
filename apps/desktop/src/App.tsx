@@ -33,6 +33,11 @@ interface EmbeddingStatus {
     modelInstalled: boolean;
     error?: string;
   };
+  ocr: {
+    pdftoppm: boolean;
+    tesseract: boolean;
+    available: boolean;
+  };
   lastIndex: {
     vectorIndexing: "not_configured" | "completed" | "failed";
     vectorError?: string;

@@ -42,7 +42,12 @@ for (const channel of allowedChannels) {
 }
 
 app.on("window-all-closed", () => {
+  ipcServices.workspaceWatcher?.close();
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  ipcServices.workspaceWatcher?.close();
 });

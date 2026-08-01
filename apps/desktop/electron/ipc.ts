@@ -26,9 +26,8 @@ import {
 } from "@kb-agent/storage";
 import { MockProvider, OllamaEmbeddingProvider, OpenAIProvider, type ModelProvider } from "@kb-agent/model";
 import {
-  LocalNotesRecallProvider,
   ModelSemanticImportEnricher,
-  SemanticNotesRecallProvider,
+  HybridNotesRecallProvider,
   runTurn,
   startImportBatch,
   type ToolHandler,
@@ -43,6 +42,7 @@ import {
   defaultRoutingPolicy,
   evaluateImportSafety,
   fingerprintImportClassification,
+  getOcrRuntimeStatus,
   indexWorkspace,
   mergeImportClassification,
   parseMarkdownDocument,
@@ -66,6 +66,8 @@ import {
   type SafetyDecision,
   type SecureWorkspaceArtifactIdentity,
   type SecureWorkspaceIoHooks,
+  type WorkspaceWatcher,
+  watchWorkspace,
 } from "@kb-agent/workspace";
 import { appendDebugLog } from "./debugLogger";
 import { loadApiKey, readDesktopSettings, saveApiKey, writeDesktopSettings, type SecretStore } from "./secureSettings";
@@ -92,6 +94,9 @@ export interface IpcServices {
   };
   reviewIoHooks?: SecureWorkspaceIoHooks;
   workspaceContractIoHooks?: SecureWorkspaceIoHooks;
+  workspaceWatcher?: WorkspaceWatcher;
+  workspaceIndexRefresh?: Promise<void>;
+  workspaceIndexRefreshPending?: boolean;
 }
 
 export interface ReviewImportFileOps {
@@ -236,6 +241,7 @@ export async function handleIpcRequest(
           ok: true,
           data: {
             ollama: await (await createEmbeddingProvider(services)).status(),
+            ocr: await getOcrRuntimeStatus(),
             lastIndex: services.lastIndexResult ?? null,
           },
         };
@@ -2223,6 +2229,8 @@ function extractMemoryBody(payload: unknown): string | null {
 }
 
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
+  services.workspaceWatcher?.close();
+  delete services.workspaceWatcher;
   services.db?.close();
   services.workspaceRoot = await realpath(path.resolve(rootPath));
   await syncWorkspaceContract(
@@ -2245,6 +2253,7 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
   services.lastIndexResult = result;
   services.workspaceId = result.workspaceId;
   services.sessionId = ensureSession(services.db, result.workspaceId);
+  services.workspaceWatcher = watchWorkspace(services.workspaceRoot, () => scheduleWorkspaceIndexRefresh(services));
   await recordActivity(services.db, {
     id: randomUUID(),
     workspaceId: result.workspaceId,
@@ -2253,6 +2262,34 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
     message: `${result.noteCount} notes indexed.`,
     createdAt: new Date().toISOString(),
   });
+}
+
+function scheduleWorkspaceIndexRefresh(services: IpcServices): void {
+  if (services.workspaceIndexRefresh !== undefined) {
+    services.workspaceIndexRefreshPending = true;
+    return;
+  }
+  const rootPath = services.workspaceRoot;
+  const db = services.db;
+  if (!rootPath || !db) return;
+  services.workspaceIndexRefresh = (async () => {
+    try {
+      const result = await indexWorkspace(rootPath, db, await createIndexOptions(services));
+      if (services.workspaceRoot === rootPath && services.db === db) {
+        services.lastIndexResult = result;
+      }
+    } catch (error) {
+      if (services.workspaceRoot === rootPath && services.db === db && db.sqlite.open) {
+        console.warn("Workspace watcher index refresh failed", error);
+      }
+    } finally {
+      delete services.workspaceIndexRefresh;
+      if (services.workspaceIndexRefreshPending) {
+        services.workspaceIndexRefreshPending = false;
+        scheduleWorkspaceIndexRefresh(services);
+      }
+    }
+  })();
 }
 
 export async function restoreWorkspaceFromSettings(services: IpcServices): Promise<boolean> {
@@ -2514,11 +2551,10 @@ async function createIndexOptions(services: IpcServices): Promise<IndexWorkspace
 
 async function createRecallProviders(services: IpcServices) {
   return [
-    new SemanticNotesRecallProvider({
+    new HybridNotesRecallProvider({
       embeddingProvider: await createEmbeddingProvider(services),
       vectorIndex: new SqliteVectorIndex(requireDatabase(services).sqlite),
     }),
-    new LocalNotesRecallProvider(),
   ];
 }
 

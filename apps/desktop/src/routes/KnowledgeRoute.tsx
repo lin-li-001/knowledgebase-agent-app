@@ -19,6 +19,11 @@ export interface EmbeddingStatus {
     modelInstalled: boolean;
     error?: string;
   };
+  ocr: {
+    pdftoppm: boolean;
+    tesseract: boolean;
+    available: boolean;
+  };
   lastIndex: {
     vectorIndexing: "not_configured" | "completed" | "failed";
     vectorError?: string;
@@ -103,6 +108,8 @@ function EmbeddingStatusPanel({ status }: { status: EmbeddingStatus }) {
       <strong>Semantic index</strong>
       <span>{ollamaLabel}</span>
       <span>Index: {indexStatus}</span>
+      <span>OCR: {status.ocr.available ? "ready" : "runtime unavailable"}</span>
+      {!status.ocr.available ? <small>Scanned PDFs require local pdftoppm and tesseract.</small> : null}
       {!status.ollama.available && status.ollama.error ? <small>{status.ollama.error}</small> : null}
       {status.ollama.available && !status.ollama.modelInstalled ? <small>Install the configured model in Ollama, then rebuild the index.</small> : null}
       {status.lastIndex?.vectorError ? <small>{status.lastIndex.vectorError}</small> : null}
