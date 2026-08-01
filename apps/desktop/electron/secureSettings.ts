@@ -20,6 +20,8 @@ export interface DesktopSettings {
   activeProfileId?: string;
   providerKeyAlias?: string;
   modelName?: string;
+  embeddingBaseUrl?: string;
+  embeddingModel?: string;
   workspaceRoot?: string;
 }
 

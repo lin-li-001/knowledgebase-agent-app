@@ -113,7 +113,12 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "workspace:tree": z.object({}),
   "workspace:read-file": z.object({ path: z.string() }),
   "settings:get": z.object({}),
-  "settings:update": z.object({ apiKey: z.string().optional(), modelName: z.string().optional() }),
+  "settings:update": z.object({
+    apiKey: z.string().optional(),
+    modelName: z.string().optional(),
+    embeddingBaseUrl: z.string().optional(),
+    embeddingModel: z.string().optional(),
+  }),
   "embedding:status": z.object({}),
   "chat:run-turn": z.object({ sessionId: z.string(), message: z.string() }),
   "notes:search": z.object({ query: z.string() }),
@@ -215,6 +220,14 @@ export async function handleIpcRequest(
           const settings = await readDesktopSettings(settingsPath);
           await writeDesktopSettings(settingsPath, { ...settings, modelName: payload.modelName.trim() || "mock" });
         }
+        if (typeof payload.embeddingBaseUrl === "string" || typeof payload.embeddingModel === "string") {
+          const settings = await readDesktopSettings(settingsPath);
+          await writeDesktopSettings(settingsPath, {
+            ...settings,
+            ...(typeof payload.embeddingBaseUrl === "string" ? { embeddingBaseUrl: payload.embeddingBaseUrl.trim() || "http://127.0.0.1:11434" } : {}),
+            ...(typeof payload.embeddingModel === "string" ? { embeddingModel: payload.embeddingModel.trim() || "bge-m3" } : {}),
+          });
+        }
         result = await handleIpcRequest(services, "settings:get", {});
         return result;
       }
@@ -222,7 +235,7 @@ export async function handleIpcRequest(
         result = {
           ok: true,
           data: {
-            ollama: await createEmbeddingProvider().status(),
+            ollama: await (await createEmbeddingProvider(services)).status(),
             lastIndex: services.lastIndexResult ?? null,
           },
         };
@@ -249,7 +262,7 @@ export async function handleIpcRequest(
             userMessage: payload.message as string,
             handlers: createDefaultToolHandlers(services),
             signal: controller.signal,
-            recallProviders: createRecallProviders(services),
+            recallProviders: await createRecallProviders(services),
           })) {
             events.push(event);
           }
@@ -299,7 +312,7 @@ export async function handleIpcRequest(
         const indexResult = await indexWorkspace(
           requireWorkspaceRoot(services),
           requireDatabase(services),
-          createIndexOptions(services),
+          await createIndexOptions(services),
         );
         services.lastIndexResult = indexResult;
         await recordActivity(requireDatabase(services), {
@@ -324,7 +337,7 @@ export async function handleIpcRequest(
             await getModelProvider(services),
             await getModelName(services),
           ),
-          indexOptions: createIndexOptions(services),
+          indexOptions: await createIndexOptions(services),
         });
         result = { ok: true, data: job };
         return result;
@@ -613,7 +626,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         });
       }
       if (item.proposalType === "propose_create_note") {
-        await indexWorkspace(requireWorkspaceRoot(services), db, createIndexOptions(services));
+        await indexWorkspace(requireWorkspaceRoot(services), db, await createIndexOptions(services));
       }
       await recordActivityOnce(db, {
         id: `review-applied-${id}`,
@@ -666,7 +679,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     await applyMemoryProposal(services, item);
     const appliedAt = new Date().toISOString();
     const entityPath = defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services));
-    await indexWorkspace(requireWorkspaceRoot(services), db, createIndexOptions(services));
+    await indexWorkspace(requireWorkspaceRoot(services), db, await createIndexOptions(services));
     await recordActivityOnce(db, {
       id: `review-applied-${id}`,
       workspaceId: item.workspaceId,
@@ -2227,7 +2240,7 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
   const result = await indexWorkspace(
     services.workspaceRoot,
     services.db,
-    createIndexOptions(services),
+    await createIndexOptions(services),
   );
   services.lastIndexResult = result;
   services.workspaceId = result.workspaceId;
@@ -2483,25 +2496,26 @@ async function getModelProvider(services: IpcServices): Promise<ModelProvider> {
   return new MockProvider([{ role: "assistant", content: "Mock response complete." }]);
 }
 
-function createEmbeddingProvider(): OllamaEmbeddingProvider {
+async function createEmbeddingProvider(services: IpcServices): Promise<OllamaEmbeddingProvider> {
+  const settings = services.settingsPath ? await readDesktopSettings(services.settingsPath) : {};
   return new OllamaEmbeddingProvider({
-    model: "bge-m3",
-    baseUrl: "http://127.0.0.1:11434",
+    model: settings.embeddingModel ?? "bge-m3",
+    baseUrl: settings.embeddingBaseUrl ?? "http://127.0.0.1:11434",
     dimensions: 1024,
   });
 }
 
-function createIndexOptions(services: IpcServices): IndexWorkspaceOptions {
+async function createIndexOptions(services: IpcServices): Promise<IndexWorkspaceOptions> {
   return {
-    embeddingProvider: createEmbeddingProvider(),
+    embeddingProvider: await createEmbeddingProvider(services),
     vectorIndex: new SqliteVectorIndex(requireDatabase(services).sqlite),
   };
 }
 
-function createRecallProviders(services: IpcServices) {
+async function createRecallProviders(services: IpcServices) {
   return [
     new SemanticNotesRecallProvider({
-      embeddingProvider: createEmbeddingProvider(),
+      embeddingProvider: await createEmbeddingProvider(services),
       vectorIndex: new SqliteVectorIndex(requireDatabase(services).sqlite),
     }),
     new LocalNotesRecallProvider(),

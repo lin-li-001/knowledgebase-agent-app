@@ -22,6 +22,8 @@ interface WorkspaceState {
 interface SettingsState {
   hasApiKey: boolean;
   modelName?: string;
+  embeddingBaseUrl?: string;
+  embeddingModel?: string;
 }
 
 interface EmbeddingStatus {
@@ -70,7 +72,7 @@ export function App() {
   const [activeRoute, setActiveRoute] = useState<Route>("Chat");
   const api = useMemo(() => (window.kbAgent ? createRendererApi(window.kbAgent.invoke) : null), []);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
-  const [settings, setSettings] = useState<SettingsState>({ hasApiKey: false, modelName: "mock" });
+  const [settings, setSettings] = useState<SettingsState>({ hasApiKey: false, modelName: "mock", embeddingBaseUrl: "http://127.0.0.1:11434", embeddingModel: "bge-m3" });
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [reviewItems, setReviewItems] = useState<ReviewCardItem[]>([]);
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
@@ -248,7 +250,7 @@ export function App() {
     await refreshPanels();
   }
 
-  async function updateSettings(next: { apiKey?: string; modelName?: string }) {
+  async function updateSettings(next: { apiKey?: string; modelName?: string; embeddingBaseUrl?: string; embeddingModel?: string }) {
     if (!api) {
       setError("Desktop bridge unavailable in browser preview.");
       return;
@@ -371,6 +373,8 @@ export function App() {
           <SettingsRoute
             hasApiKey={settings.hasApiKey}
             modelName={settings.modelName ?? "mock"}
+            embeddingBaseUrl={settings.embeddingBaseUrl ?? "http://127.0.0.1:11434"}
+            embeddingModel={settings.embeddingModel ?? "bge-m3"}
             workspaceRoot={workspace?.rootPath ?? ""}
             desktopBridgeReady={desktopBridgeReady}
             onSave={updateSettings}

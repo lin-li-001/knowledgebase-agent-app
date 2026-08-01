@@ -3,6 +3,8 @@ import { useState } from "react";
 export function SettingsRoute({
   hasApiKey,
   modelName,
+  embeddingBaseUrl,
+  embeddingModel,
   workspaceRoot,
   desktopBridgeReady,
   onSave,
@@ -11,14 +13,18 @@ export function SettingsRoute({
 }: {
   hasApiKey: boolean;
   modelName: string;
+  embeddingBaseUrl: string;
+  embeddingModel: string;
   workspaceRoot: string;
   desktopBridgeReady: boolean;
-  onSave(settings: { apiKey?: string; modelName?: string }): Promise<void>;
+  onSave(settings: { apiKey?: string; modelName?: string; embeddingBaseUrl?: string; embeddingModel?: string }): Promise<void>;
   onOpenWorkspace(rootPath: string): Promise<void>;
   onCreateWorkspace(rootPath: string): Promise<void>;
 }) {
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState(modelName);
+  const [embeddingUrl, setEmbeddingUrl] = useState(embeddingBaseUrl);
+  const [embedding, setEmbedding] = useState(embeddingModel);
   const [rootPath, setRootPath] = useState(workspaceRoot);
 
   return (
@@ -49,6 +55,14 @@ export function SettingsRoute({
           <input value={model} onChange={(event) => setModel(event.target.value)} />
         </label>
         <label>
+          Embedding URL
+          <input value={embeddingUrl} onChange={(event) => setEmbeddingUrl(event.target.value)} />
+        </label>
+        <label>
+          Embedding Model
+          <input value={embedding} onChange={(event) => setEmbedding(event.target.value)} />
+        </label>
+        <label>
           Auto-save Feedback
           <select defaultValue="activity-feed">
             <option value="activity-feed">Activity Feed</option>
@@ -67,7 +81,7 @@ export function SettingsRoute({
           Create Workspace
         </button>
       </div>
-      <button type="button" disabled={!desktopBridgeReady} onClick={() => void onSave({ apiKey, modelName: model })}>
+      <button type="button" disabled={!desktopBridgeReady} onClick={() => void onSave({ apiKey, modelName: model, embeddingBaseUrl: embeddingUrl, embeddingModel: embedding })}>
         Save Settings
       </button>
     </section>
