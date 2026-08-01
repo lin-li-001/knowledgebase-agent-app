@@ -24,6 +24,21 @@ interface SettingsState {
   modelName?: string;
 }
 
+interface EmbeddingStatus {
+  ollama: {
+    available: boolean;
+    model: string;
+    modelInstalled: boolean;
+    error?: string;
+  };
+  lastIndex: {
+    vectorIndexing: "not_configured" | "completed" | "failed";
+    vectorError?: string;
+    noteCount: number;
+    chunkCount: number;
+  } | null;
+}
+
 interface ChatSource {
   title: string;
   path: string;
@@ -56,6 +71,7 @@ export function App() {
   const api = useMemo(() => (window.kbAgent ? createRendererApi(window.kbAgent.invoke) : null), []);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [settings, setSettings] = useState<SettingsState>({ hasApiKey: false, modelName: "mock" });
+  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [reviewItems, setReviewItems] = useState<ReviewCardItem[]>([]);
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null);
@@ -63,6 +79,7 @@ export function App() {
   const [auditResult, setAuditResult] = useState<WorkspaceAuditResult | null>(null);
   const [importNotices, setImportNotices] = useState<string[]>([]);
   const [auditing, setAuditing] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "Ask about your notes or propose a safe knowledge update." },
   ]);
@@ -76,15 +93,19 @@ export function App() {
       return;
     }
 
-    const [workspaceResult, settingsResult] = await Promise.all([
+    const [workspaceResult, settingsResult, embeddingResult] = await Promise.all([
       api.invoke<WorkspaceState | null>("workspace:get-active", {}),
       api.invoke<SettingsState>("settings:get", {}),
+      api.invoke<EmbeddingStatus>("embedding:status", {}),
     ]);
     if (workspaceResult.ok) {
       setWorkspace(workspaceResult.data);
     }
     if (settingsResult.ok) {
       setSettings(settingsResult.data);
+    }
+    if (embeddingResult.ok) {
+      setEmbeddingStatus(embeddingResult.data);
     }
 
     if (workspaceResult.ok && workspaceResult.data) {
@@ -166,10 +187,20 @@ export function App() {
     }
 
     setError(null);
-    const result = await api.invoke("index:rebuild", {});
-    if (!result.ok) {
-      setError(result.error);
-      return;
+    setRebuilding(true);
+    try {
+      const result = await api.invoke<{
+        vectorIndexing: "not_configured" | "completed" | "failed";
+        vectorError?: string;
+        noteCount: number;
+        chunkCount: number;
+      }>("index:rebuild", {});
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+    } finally {
+      setRebuilding(false);
     }
     await refreshPanels();
   }
@@ -318,11 +349,12 @@ export function App() {
         ) : null}
         {activeRoute === "Knowledge" ? (
           <KnowledgeRoute
-            rebuilding={false}
+            rebuilding={rebuilding}
             auditing={auditing}
             importDisabled={!workspace}
             auditResult={auditResult}
             importNotices={importNotices}
+            embeddingStatus={embeddingStatus}
             onRebuild={rebuildIndex}
             onAudit={runWorkspaceAudit}
             onImport={runImportBatch}

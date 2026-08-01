@@ -60,6 +60,7 @@ import {
   type ClassificationSignal,
   workspaceIdForRoot,
   type ContentCategory,
+  type IndexWorkspaceResult,
   type IndexWorkspaceOptions,
   type ImportClassification,
   type SafetyDecision,
@@ -81,6 +82,7 @@ export interface IpcServices {
   activeTurns: Set<string>;
   abortControllers?: Map<string, AbortController>;
   modelProvider?: ModelProvider;
+  lastIndexResult?: IndexWorkspaceResult;
   debugLogPath?: string;
   reviewImportFileOps?: Partial<ReviewImportFileOps>;
   reviewApplyHooks?: {
@@ -112,6 +114,7 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "workspace:read-file": z.object({ path: z.string() }),
   "settings:get": z.object({}),
   "settings:update": z.object({ apiKey: z.string().optional(), modelName: z.string().optional() }),
+  "embedding:status": z.object({}),
   "chat:run-turn": z.object({ sessionId: z.string(), message: z.string() }),
   "notes:search": z.object({ query: z.string() }),
   "notes:read": z.object({ path: z.string() }),
@@ -215,6 +218,16 @@ export async function handleIpcRequest(
         result = await handleIpcRequest(services, "settings:get", {});
         return result;
       }
+      case "embedding:status": {
+        result = {
+          ok: true,
+          data: {
+            ollama: await createEmbeddingProvider().status(),
+            lastIndex: services.lastIndexResult ?? null,
+          },
+        };
+        return result;
+      }
       case "chat:run-turn": {
         const root = requireWorkspaceRoot(services);
         const db = requireDatabase(services);
@@ -288,6 +301,7 @@ export async function handleIpcRequest(
           requireDatabase(services),
           createIndexOptions(services),
         );
+        services.lastIndexResult = indexResult;
         await recordActivity(requireDatabase(services), {
           id: randomUUID(),
           workspaceId: indexResult.workspaceId,
@@ -2215,6 +2229,7 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
     services.db,
     createIndexOptions(services),
   );
+  services.lastIndexResult = result;
   services.workspaceId = result.workspaceId;
   services.sessionId = ensureSession(services.db, result.workspaceId);
   await recordActivity(services.db, {

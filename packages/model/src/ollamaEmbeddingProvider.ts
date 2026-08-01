@@ -11,6 +11,13 @@ interface OllamaEmbeddingResponse {
   embeddings?: unknown;
 }
 
+export interface EmbeddingServiceStatus {
+  available: boolean;
+  model: string;
+  modelInstalled: boolean;
+  error?: string;
+}
+
 export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private readonly model: string;
   private readonly baseUrl: string;
@@ -52,6 +59,31 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
       throw new Error("Embedding service returned no query embedding");
     }
     return embedding;
+  }
+
+  async status(): Promise<EmbeddingServiceStatus> {
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}/api/tags`);
+      if (!response.ok) {
+        return { available: false, model: this.model, modelInstalled: false, error: `Ollama returned HTTP ${response.status}` };
+      }
+      const json = (await response.json()) as { models?: Array<{ name?: unknown; model?: unknown }> };
+      const models = Array.isArray(json.models) ? json.models : [];
+      const modelInstalled = models.some((entry) =>
+        entry.name === this.model
+        || entry.model === this.model
+        || entry.name === `${this.model}:latest`
+        || entry.model === `${this.model}:latest`,
+      );
+      return { available: true, model: this.model, modelInstalled };
+    } catch (error) {
+      return {
+        available: false,
+        model: this.model,
+        modelInstalled: false,
+        error: error instanceof Error ? error.message : "Unable to connect to Ollama",
+      };
+    }
   }
 
   private async parseResponse(response: Response, expectedCount: number): Promise<number[][]> {

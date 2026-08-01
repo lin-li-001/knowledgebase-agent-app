@@ -7,6 +7,7 @@ export const allowedChannels = [
   "workspace:read-file",
   "settings:get",
   "settings:update",
+  "embedding:status",
   "chat:run-turn",
   "notes:search",
   "notes:read",

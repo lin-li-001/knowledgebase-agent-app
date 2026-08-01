@@ -111,6 +111,26 @@ h2 {
   color: #59665f;
 }
 
+.embedding-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: baseline;
+  margin-bottom: 16px;
+  border-left: 3px solid #9aa89f;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+
+.embedding-status span,
+.embedding-status small {
+  color: #59665f;
+}
+
+.embedding-status small {
+  flex-basis: 100%;
+}
+
 .empty-box,
 .transcript,
 .review-card {

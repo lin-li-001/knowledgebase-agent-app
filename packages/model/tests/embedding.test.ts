@@ -38,4 +38,18 @@ describe("OllamaEmbeddingProvider", () => {
     });
     await expect(malformed.embedQuery("question")).rejects.toThrow("invalid dimensions");
   });
+
+  it("reports Ollama availability and whether the configured model is installed", async () => {
+    const provider = new OllamaEmbeddingProvider({
+      dimensions: 3,
+      fetchImpl: async () => response({ models: [{ name: "bge-m3:latest" }, { name: "other" }] }),
+    });
+    await expect(provider.status()).resolves.toMatchObject({ available: true, modelInstalled: true });
+
+    const installed = new OllamaEmbeddingProvider({
+      dimensions: 3,
+      fetchImpl: async () => response({ models: [{ name: "bge-m3" }] }),
+    });
+    await expect(installed.status()).resolves.toMatchObject({ available: true, modelInstalled: true });
+  });
 });
