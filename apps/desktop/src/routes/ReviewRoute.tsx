@@ -1,11 +1,16 @@
+import type { ContentCategoryDefinition } from "@kb-agent/workspace";
 import { ReviewItemCard, type ReviewApprovalOptions, type ReviewCardItem } from "../components/ReviewItemCard";
 
 export function ReviewRoute({
   items,
+  activeCategories,
+  categories,
   onApprove,
   onReject,
 }: {
   items: ReviewCardItem[];
+  activeCategories: ContentCategoryDefinition[];
+  categories: ContentCategoryDefinition[];
   onApprove(id: string, options?: ReviewApprovalOptions): Promise<void>;
   onReject(id: string): Promise<void>;
 }) {
@@ -19,7 +24,14 @@ export function ReviewRoute({
       ) : (
         <div className="review-list">
           {items.map((item) => (
-            <ReviewItemCard key={item.id} item={item} onApprove={onApprove} onReject={onReject} />
+            <ReviewItemCard
+              key={item.id}
+              item={item}
+              activeCategories={activeCategories}
+              categories={categories}
+              onApprove={onApprove}
+              onReject={onReject}
+            />
           ))}
         </div>
       )}

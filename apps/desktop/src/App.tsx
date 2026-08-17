@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { ContentCategoryDefinition, ContentCategoryRisk } from "@kb-agent/workspace";
 import type { ActivityItem } from "./components/ActivityFeed";
 import type { ReviewApprovalOptions, ReviewCardItem } from "./components/ReviewItemCard";
 import { WorkspacePanel, type WorkspaceFilePreview, type WorkspaceTreeNode } from "./components/WorkspacePanel";
@@ -7,6 +8,7 @@ import { KnowledgeRoute, type WorkspaceAuditResult } from "./routes/KnowledgeRou
 import { ReviewRoute } from "./routes/ReviewRoute";
 import { SettingsRoute } from "./routes/SettingsRoute";
 import { createRendererApi, type RendererApi } from "./state/api";
+import { initialCategoryFallback } from "./state/categoryCatalog";
 import "./styles.css";
 
 type Route = "Chat" | "Knowledge" | "Review" | "Settings";
@@ -46,6 +48,16 @@ interface EmbeddingStatus {
   } | null;
 }
 
+interface ContentCategoryCatalog {
+  activeCategories: ContentCategoryDefinition[];
+  categories: ContentCategoryDefinition[];
+}
+
+const emptyCategoryCatalog: ContentCategoryCatalog = {
+  activeCategories: initialCategoryFallback,
+  categories: initialCategoryFallback,
+};
+
 interface ChatSource {
   title: string;
   path: string;
@@ -80,6 +92,7 @@ export function App() {
   const [settings, setSettings] = useState<SettingsState>({ hasApiKey: false, modelName: "mock", embeddingBaseUrl: "http://127.0.0.1:11434", embeddingModel: "bge-m3" });
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [reviewItems, setReviewItems] = useState<ReviewCardItem[]>([]);
+  const [categoryCatalog, setCategoryCatalog] = useState<ContentCategoryCatalog>(emptyCategoryCatalog);
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null);
   const [filePreview, setFilePreview] = useState<WorkspaceFilePreview | null>(null);
@@ -116,10 +129,11 @@ export function App() {
     }
 
     if (workspaceResult.ok && workspaceResult.data) {
-      const [activityResult, reviewResult, treeResult] = await Promise.all([
+      const [activityResult, reviewResult, treeResult, categoryResult] = await Promise.all([
         api.invoke<ActivityItem[]>("activity:list", {}),
         api.invoke<ReviewCardItem[]>("review:list", {}),
         api.invoke<WorkspaceTreeNode>("workspace:tree", {}),
+        api.invoke<ContentCategoryCatalog>("categories:list", {}),
       ]);
       if (activityResult.ok) {
         setActivityItems(activityResult.data);
@@ -130,9 +144,13 @@ export function App() {
       if (treeResult.ok) {
         setWorkspaceTree(treeResult.data);
       }
+      if (categoryResult.ok && isContentCategoryCatalog(categoryResult.data)) {
+        setCategoryCatalog(categoryResult.data);
+      }
     } else {
       setWorkspaceTree(null);
       setFilePreview(null);
+      setCategoryCatalog(emptyCategoryCatalog);
     }
   }
 
@@ -327,6 +345,31 @@ export function App() {
     setFilePreview(result.data);
   }
 
+  async function createContentCategory(input: {
+    id: string;
+    label: string;
+    description: string;
+    defaultDestination: string;
+    defaultRisk: ContentCategoryRisk;
+    parentId?: string;
+  }) {
+    if (!api || !workspace) {
+      setError("Open a workspace before creating a category.");
+      return false;
+    }
+
+    setError(null);
+    const result = await api.invoke<ContentCategoryCatalog>("categories:create", input);
+    if (!result.ok) {
+      setError(result.error);
+      return false;
+    }
+    if (isContentCategoryCatalog(result.data)) {
+      setCategoryCatalog(result.data);
+    }
+    return true;
+  }
+
   return (
     <main className="app-shell">
       <nav className="sidebar" aria-label="Primary">
@@ -370,6 +413,8 @@ export function App() {
         {activeRoute === "Review" ? (
           <ReviewRoute
             items={reviewItems}
+            activeCategories={categoryCatalog.activeCategories}
+            categories={categoryCatalog.categories}
             onApprove={(id, options) => updateReviewState("review:approve", id, options)}
             onReject={(id) => updateReviewState("review:reject", id)}
           />
@@ -382,9 +427,11 @@ export function App() {
             embeddingModel={settings.embeddingModel ?? "bge-m3"}
             workspaceRoot={workspace?.rootPath ?? ""}
             desktopBridgeReady={desktopBridgeReady}
+            activeCategories={categoryCatalog.activeCategories}
             onSave={updateSettings}
             onOpenWorkspace={(rootPath) => activateWorkspace("workspace:open", rootPath)}
             onCreateWorkspace={(rootPath) => activateWorkspace("workspace:create", rootPath)}
+            onCreateCategory={createContentCategory}
           />
         ) : null}
       </div>
@@ -397,4 +444,12 @@ export function App() {
       />
     </main>
   );
+}
+
+function isContentCategoryCatalog(value: unknown): value is ContentCategoryCatalog {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const catalog = value as Partial<ContentCategoryCatalog>;
+  return Array.isArray(catalog.activeCategories) && Array.isArray(catalog.categories);
 }

@@ -32,6 +32,7 @@ const allowedWorkerTools = new Set<MvpToolName>([
   "search_notes",
   "read_note",
   "propose_create_note",
+  "propose_annotation",
   "propose_memory",
   "propose_decision",
 ]);
@@ -47,8 +48,9 @@ const eligibilityPatterns = [
   /\bdecision\b/i,
   /\bimport\b/i,
   /\bsummary\b/i,
+  /\b(?:annotate|annotation|add (?:a )?note to|clarif(?:y|ication)|correct (?:the|my) (?:imported )?(?:document|resume|pdf))\b/i,
   /\butility bills?\b/i,
-  /水电|账单|导入|总结|记住/,
+  /水电|账单|导入|总结|记住|备注|补充|更正/,
 ];
 
 export function isReviewEligible(turn: CompletedTurn): boolean {

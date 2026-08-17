@@ -5,9 +5,36 @@ export {
   fingerprintImportClassification,
 } from "./importSafety";
 export { detectImportSignals, mergeImportClassification } from "./importClassification";
+export {
+  activateWorkspaceContentCategory,
+  addWorkspaceUserContentCategory,
+  builtInContentCategoryCatalog,
+  categoryDefinition,
+  contentCategoryConfigPath,
+  contentCategoryContractDrift,
+  createContentCategoryRegistry,
+  defaultContentCategoryConfig,
+  hiddenBuiltInParentCategoryIds,
+  initialActiveBuiltInCategoryIds,
+  isContentCategoryId,
+  isProtectedContentCategory,
+  loadContentCategoryRegistry,
+  normalizeContentCategoryId,
+  renderContentCategoryContract,
+  resolveCategoryDestination,
+  serializeContentCategoryConfig,
+} from "./contentCategories";
 export { exportLlmsFlat } from "./exporter";
 export { importDocumentBatch } from "./imports";
 export { chunkMarkdownBody } from "./importChunks";
+export {
+  appendImportedSourceAnnotation,
+  assertImportedSourceBodyPreserved,
+  importedSourceBodyHash,
+  sourceBodyEndMarker,
+  sourceBodyStartMarker,
+  wrapImportedSourceBody,
+} from "./sourceEvidence";
 export { normalizeSemanticImportResult } from "./importSemanticEnrichment";
 export {
   discardImportPromotionJournal,
@@ -36,6 +63,7 @@ export type { NoteFrontmatter } from "./frontmatter";
 export type { IndexWorkspaceOptions, IndexWorkspaceResult, VectorIndexingStatus, WorkspaceEmbeddingProvider } from "./indexer";
 export type { ImportArtifactStatus, ImportBatchInput, ImportFileOps, ImportJob, ImportSourceNote } from "./imports";
 export type { ChunkMarkdownOptions, ImportedChunk } from "./importChunks";
+export type { ImportedSourceAnnotationInput } from "./sourceEvidence";
 export type { SemanticImportEnricher, SemanticImportInput, SemanticImportResult } from "./importSemanticEnrichment";
 export type {
   ImportPromotionHooks,
@@ -49,9 +77,15 @@ export type { RoutingPolicy } from "./routingPolicy";
 export type { ImportCandidateRoutingPrecedence, ImportCandidateRouteInput } from "./importCandidateRoutingPolicy";
 export type { SavedImportRule } from "./importClassification";
 export type {
+  ContentCategory,
+  ContentCategoryDefinition,
+  ContentCategoryRegistry,
+  ContentCategoryRisk,
+  WorkspaceContentCategoryConfig,
+} from "./contentCategories";
+export type {
   ClassificationSignal,
   ClassificationDiagnostic,
-  ContentCategory,
   ImportApprovalProof,
   ImportClassification,
   ImportOperation,

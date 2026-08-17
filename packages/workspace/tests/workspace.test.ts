@@ -85,6 +85,12 @@ describe("createWorkspace", () => {
     await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
       "Pending import notes are non-indexed under `.app/import-staging/`.",
     );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "The `## Document` body of an imported source note is source evidence.",
+    );
+    await expect(readFile(path.join(rootPath, "AGENTS.md"), "utf8")).resolves.toContain(
+      "append a provenance-bearing `## Annotations` entry",
+    );
     await expect(readFile(path.join(rootPath, ".app/settings.json"), "utf8")).resolves.toContain(
       '"activeProfileId": "default"',
     );
@@ -102,6 +108,7 @@ describe("createWorkspace", () => {
     expect(contract).toContain("Import candidate routing precedence:");
     expect(contract.match(/The Safety Kernel must approve every final import write\./g)).toHaveLength(1);
     expect(contract.match(/Pending import notes are non-indexed under `\.app\/import-staging\/`\./g)).toHaveLength(1);
+    expect(contract.match(/The `## Document` body of an imported source note is source evidence\./g)).toHaveLength(1);
   });
 
   it("upgrades a legacy routing section without duplicating its heading", async () => {

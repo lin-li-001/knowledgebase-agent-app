@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import { assertInsideWorkspace } from "@kb-agent/workspace";
+import { assertImportedSourceBodyPreserved, assertInsideWorkspace } from "@kb-agent/workspace";
 
 export type ReviewState =
   | "proposed"
@@ -76,11 +76,13 @@ export async function applyReviewItem(item: ReviewItem, workspaceRoot: string): 
   }
 
   if (item.patch.kind === "replace_body") {
+    assertImportedSourceBodyPreserved(currentBody, item.patch.nextBody);
     await writeFile(targetPath, item.patch.nextBody, "utf8");
     return { ...item, state: transitionReviewState(item.state, "applied") };
   }
 
   const nextBody = replaceSection(currentBody, item.patch.headingPath, item.patch.nextSectionBody);
+  assertImportedSourceBodyPreserved(currentBody, nextBody);
   await writeFile(targetPath, nextBody, "utf8");
   return { ...item, state: transitionReviewState(item.state, "applied") };
 }

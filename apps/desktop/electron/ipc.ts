@@ -34,7 +34,18 @@ import {
   type MvpToolName,
 } from "@kb-agent/core";
 import {
+  KnowledgeBaseGateway,
+  startKnowledgeBaseGateway,
+  startKnowledgeBaseMcpServer,
+  type GatewayAuditEvent,
+  type RunningGatewayServer,
+  type RunningKnowledgeBaseMcpServer,
+} from "@kb-agent/gateway";
+import {
   assertApprovedImportFinalNotePath,
+  activateWorkspaceContentCategory,
+  addWorkspaceUserContentCategory,
+  appendImportedSourceAnnotation,
   assertInsideWorkspace,
   assertRealPathInsideWorkspace,
   auditWorkspace,
@@ -44,6 +55,8 @@ import {
   fingerprintImportClassification,
   getOcrRuntimeStatus,
   indexWorkspace,
+  loadContentCategoryRegistry,
+  normalizeContentCategoryId,
   mergeImportClassification,
   parseMarkdownDocument,
   recoverImportPromotions,
@@ -95,7 +108,9 @@ export interface IpcServices {
   reviewIoHooks?: SecureWorkspaceIoHooks;
   workspaceContractIoHooks?: SecureWorkspaceIoHooks;
   workspaceWatcher?: WorkspaceWatcher;
-  workspaceIndexRefresh?: Promise<void>;
+  gatewayServer?: RunningGatewayServer;
+  mcpServer?: RunningKnowledgeBaseMcpServer;
+  workspaceIndexRefresh?: Promise<IndexWorkspaceResult>;
   workspaceIndexRefreshPending?: boolean;
 }
 
@@ -132,23 +147,20 @@ const schemas: Record<IpcChannel, z.ZodTypeAny> = {
   "review:approve": z.object({
     id: z.string(),
     targetPathOverride: z.string().optional(),
-    categoryOverride: z.enum([
-      "finance.utility",
-      "finance.insurance",
-      "finance.tax",
-      "finance.statement",
-      "profile.career",
-      "profile.personal_fact",
-      "memory.candidate",
-      "decision.record",
-      "project.document",
-      "resource",
-      "unknown",
-    ]).optional(),
+    categoryOverride: z.string().trim().min(1).max(120).regex(/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/u).optional(),
     saveAsRoutingRule: z.boolean().optional(),
     routingRulePattern: z.string().optional(),
   }),
   "review:reject": z.object({ id: z.string() }),
+  "categories:list": z.object({}),
+  "categories:create": z.object({
+    id: z.string().trim().min(1).max(120).regex(/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/u),
+    label: z.string().trim().min(1).max(120),
+    description: z.string().trim().min(1).max(1_000),
+    defaultDestination: z.string().trim().min(1).max(500),
+    defaultRisk: z.enum(["normal", "review_required"]),
+    parentId: z.string().trim().min(1).max(120).optional(),
+  }),
   "activity:list": z.object({}),
   "index:rebuild": z.object({}),
   "import:start": z.object({ batchName: z.string(), filePaths: z.array(z.string()).min(1) }),
@@ -311,6 +323,42 @@ export async function handleIpcRequest(
       case "review:reject":
         result = await rejectReviewItem(services, payload.id as string);
         return result;
+      case "categories:list": {
+        const registry = await loadContentCategoryRegistry(requireWorkspaceRoot(services));
+        result = {
+          ok: true,
+          data: {
+            activeCategories: registry.activeCategories,
+            categories: registry.categories,
+          },
+        };
+        return result;
+      }
+      case "categories:create": {
+        const registry = await addWorkspaceUserContentCategory(
+          requireWorkspaceRoot(services),
+          {
+            id: payload.id as string,
+            label: payload.label as string,
+            description: payload.description as string,
+            defaultDestination: payload.defaultDestination as string,
+            defaultRisk: payload.defaultRisk as "normal" | "review_required",
+            examples: [],
+            kind: payload.parentId ? "leaf" : "parent",
+            ...(typeof payload.parentId === "string" && payload.parentId.trim()
+              ? { parentId: payload.parentId.trim() }
+              : {}),
+          },
+        );
+        result = {
+          ok: true,
+          data: {
+            activeCategories: registry.activeCategories,
+            categories: registry.categories,
+          },
+        };
+        return result;
+      }
       case "activity:list":
         result = { ok: true, data: await listActivity(requireDatabase(services), requireWorkspaceId(services), 50) };
         return result;
@@ -559,8 +607,20 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
         : "Persisted Review application options are invalid",
     };
   }
+  if (effectiveOptions.categoryOverride !== undefined) {
+    const registry = await loadContentCategoryRegistry(requireWorkspaceRoot(services));
+    const normalizedCategory = normalizeContentCategoryId(effectiveOptions.categoryOverride);
+    if (normalizedCategory === undefined || !registry.categories.some((category) => category.id === normalizedCategory)) {
+      return { ok: false, error: `Unknown content category: ${effectiveOptions.categoryOverride}` };
+    }
+    effectiveOptions.categoryOverride = normalizedCategory;
+  }
 
-  if (item.proposalType === "propose_create_note" || item.proposalType === "propose_decision") {
+  if (
+    item.proposalType === "propose_create_note"
+    || item.proposalType === "propose_decision"
+    || item.proposalType === "propose_annotation"
+  ) {
     const claimToken = randomUUID();
     const claimed = await claimReviewItem(db, id, {
       from: ["proposed", "approved", "failed"],
@@ -631,14 +691,25 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
           createdAt: appliedAt,
         });
       }
-      if (item.proposalType === "propose_create_note") {
-        await indexWorkspace(requireWorkspaceRoot(services), db, await createIndexOptions(services));
+      if (isImportedSourceNotePayload(claimedItem.payload)) {
+        await activateWorkspaceContentCategory(
+          requireWorkspaceRoot(services),
+          routingCategoryFor(claimedItem, effectiveOptions) ?? "unknown",
+        );
       }
+      if (item.proposalType === "propose_create_note" || item.proposalType === "propose_annotation") {
+        await requestWorkspaceIndexRefresh(services);
+      }
+      const activityTitle = item.proposalType === "propose_decision"
+        ? "Decision saved"
+        : item.proposalType === "propose_annotation"
+          ? "Source annotation added"
+          : "Note created";
       await recordActivityOnce(db, {
         id: `review-applied-${id}`,
         workspaceId: item.workspaceId,
         kind: "review",
-        title: item.proposalType === "propose_decision" ? "Decision saved" : "Note created",
+        title: activityTitle,
         message: `Approved ${item.proposalType} proposal was saved.`,
         entityPath,
         reviewItemId: id,
@@ -685,7 +756,7 @@ async function approveReviewItem(services: IpcServices, id: string, options: Rev
     await applyMemoryProposal(services, item);
     const appliedAt = new Date().toISOString();
     const entityPath = defaultRoutingPolicy.profileMemoryPath(await getActiveProfileId(services));
-    await indexWorkspace(requireWorkspaceRoot(services), db, await createIndexOptions(services));
+    await requestWorkspaceIndexRefresh(services);
     await recordActivityOnce(db, {
       id: `review-applied-${id}`,
       workspaceId: item.workspaceId,
@@ -862,6 +933,34 @@ async function applyKnowledgeProposal(
     claimFence?: () => Promise<void>;
   } = {},
 ): Promise<string> {
+  if (item.proposalType === "propose_annotation") {
+    const payload = annotationPayload(item.payload);
+    const workspaceRoot = requireWorkspaceRoot(services);
+    const targetPath = assertInsideWorkspace(workspaceRoot, payload.path);
+    const current = await secureReadWorkspaceArtifact(workspaceRoot, targetPath, {
+      operation: "annotation_source_read",
+      hooks: application.ioHooks,
+    });
+    const next = appendImportedSourceAnnotation(current.contents.toString("utf8"), {
+      body: payload.body,
+      date: new Date().toISOString().slice(0, 10),
+      reviewItemId: item.id,
+      sessionId: item.sourceSessionId,
+      turnId: item.sourceTurnId,
+    });
+    if (next === current.contents.toString("utf8")) {
+      return payload.path;
+    }
+    await application.claimFence?.();
+    await secureAtomicReplaceWorkspaceFile(workspaceRoot, targetPath, next, {
+      operation: "annotation_append",
+      hooks: application.ioHooks,
+      expectedArtifact: current.artifact,
+      tempToken: item.id,
+    });
+    return payload.path;
+  }
+
   if (item.proposalType === "propose_create_note") {
     if (isImportedSourceNotePayload(item.payload)) {
       return moveImportedSourceNote(
@@ -1375,8 +1474,7 @@ function effectiveReviewApproveOptions(
     options.categoryOverride !== undefined
     && (
       typeof options.categoryOverride !== "string"
-      || contentCategoryFrom(options.categoryOverride)
-        !== options.categoryOverride
+      || normalizeContentCategoryId(options.categoryOverride) === undefined
     )
   ) {
     throw new Error("Persisted Review category option is invalid");
@@ -1398,7 +1496,7 @@ function effectiveReviewApproveOptions(
       ? { targetPathOverride: options.targetPathOverride }
       : {}),
     ...(typeof options.categoryOverride === "string"
-      ? { categoryOverride: options.categoryOverride as ContentCategory }
+      ? { categoryOverride: normalizeContentCategoryId(options.categoryOverride) as ContentCategory }
       : {}),
     ...(typeof options.saveAsRoutingRule === "boolean"
       ? { saveAsRoutingRule: options.saveAsRoutingRule }
@@ -1772,6 +1870,10 @@ function updateImportedSourceNoteRoute(
     status: "approved",
     tags: ["imported", "approved"],
     content_category: classification.primaryCategory,
+    category_source: classification.categorySource,
+    category_status: "active",
+    category_risk: classification.categoryRisk ?? "review_required",
+    secondary_categories: classification.alternativeCategories,
     sensitivity: classification.sensitivity,
     classification_confidence: classification.confidence,
     classification_evidence: classification.evidence,
@@ -1851,6 +1953,9 @@ async function reconstructImportedSourcePayload(
   const classification: ImportClassification = {
     primaryCategory: category,
     alternativeCategories: [],
+    categorySource: "detector",
+    categoryStatus: frontmatter.category_status === "proposed" ? "proposed" : "active",
+    categoryRisk: frontmatter.category_risk ?? "review_required",
     sensitivity,
     confidence: frontmatter.classification_confidence ?? 0,
     evidence,
@@ -1875,23 +1980,7 @@ async function reconstructImportedSourcePayload(
 }
 
 function contentCategoryFrom(value: string | undefined): ContentCategory {
-  const categories = new Set<ContentCategory>([
-    "finance.utility",
-    "finance.insurance",
-    "finance.tax",
-    "finance.statement",
-    "profile.career",
-    "profile.personal_fact",
-    "memory.candidate",
-    "decision.record",
-    "project.document",
-    "resource",
-    "unknown",
-  ]);
-  if (value && categories.has(value as ContentCategory)) {
-    return value as ContentCategory;
-  }
-  return "unknown";
+  return normalizeContentCategoryId(value) ?? "unknown";
 }
 
 function replaceMarkdownLinkDestination(
@@ -2208,6 +2297,20 @@ function createNotePayload(payload: unknown): { path: string; body: string } {
   throw new Error("Create-note proposal is missing path or body");
 }
 
+function annotationPayload(payload: unknown): { path: string; body: string } {
+  if (
+    isRecord(payload)
+    && typeof payload.path === "string"
+    && payload.path.trim()
+    && typeof payload.body === "string"
+    && payload.body.trim()
+  ) {
+    return { path: payload.path.trim(), body: payload.body.trim() };
+  }
+
+  throw new Error("Annotation proposal is missing path or body");
+}
+
 function extractDecisionBody(payload: unknown): string {
   if (typeof payload === "object" && payload !== null && "body" in payload && typeof payload.body === "string") {
     const body = payload.body.trim();
@@ -2229,6 +2332,14 @@ function extractMemoryBody(payload: unknown): string | null {
 }
 
 async function activateWorkspace(services: IpcServices, rootPath: string): Promise<void> {
+  await services.mcpServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base MCP Server", error);
+  });
+  delete services.mcpServer;
+  await services.gatewayServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base Gateway", error);
+  });
+  delete services.gatewayServer;
   services.workspaceWatcher?.close();
   delete services.workspaceWatcher;
   services.db?.close();
@@ -2253,6 +2364,7 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
   services.lastIndexResult = result;
   services.workspaceId = result.workspaceId;
   services.sessionId = ensureSession(services.db, result.workspaceId);
+  await startConfiguredGateway(services);
   services.workspaceWatcher = watchWorkspace(services.workspaceRoot, () => scheduleWorkspaceIndexRefresh(services));
   await recordActivity(services.db, {
     id: randomUUID(),
@@ -2264,32 +2376,116 @@ async function activateWorkspace(services: IpcServices, rootPath: string): Promi
   });
 }
 
-function scheduleWorkspaceIndexRefresh(services: IpcServices): void {
-  if (services.workspaceIndexRefresh !== undefined) {
-    services.workspaceIndexRefreshPending = true;
+async function startConfiguredGateway(services: IpcServices): Promise<void> {
+  const token = process.env.KB_AGENT_GATEWAY_TOKEN?.trim();
+  if (!token) {
     return;
   }
-  const rootPath = services.workspaceRoot;
-  const db = services.db;
-  if (!rootPath || !db) return;
-  services.workspaceIndexRefresh = (async () => {
-    try {
-      const result = await indexWorkspace(rootPath, db, await createIndexOptions(services));
-      if (services.workspaceRoot === rootPath && services.db === db) {
-        services.lastIndexResult = result;
-      }
-    } catch (error) {
-      if (services.workspaceRoot === rootPath && services.db === db && db.sqlite.open) {
-        console.warn("Workspace watcher index refresh failed", error);
-      }
-    } finally {
-      delete services.workspaceIndexRefresh;
-      if (services.workspaceIndexRefreshPending) {
-        services.workspaceIndexRefreshPending = false;
-        scheduleWorkspaceIndexRefresh(services);
-      }
+  const configuredPort = process.env.KB_AGENT_GATEWAY_PORT?.trim();
+  const port = configuredPort === undefined || configuredPort === "" ? 8787 : Number(configuredPort);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("KB_AGENT_GATEWAY_PORT must be an integer between 0 and 65535");
+  }
+  const providers = await createRecallProviders(services);
+  const recallProvider = providers[0];
+  if (!recallProvider) {
+    throw new Error("Knowledge Base Gateway requires a recall provider");
+  }
+  const gateway = new KnowledgeBaseGateway({
+    db: requireDatabase(services),
+    workspaceId: requireWorkspaceId(services),
+    workspaceRoot: requireWorkspaceRoot(services),
+    recallProvider,
+    onAuditEvent: (event) => recordGatewayAuditEvent(services, event),
+  });
+  try {
+    services.gatewayServer = await startKnowledgeBaseGateway({
+      gateway,
+      token,
+      port,
+    });
+    console.info(`Knowledge Base Gateway listening on 127.0.0.1:${services.gatewayServer.port}`);
+  } catch (error) {
+    console.warn("Knowledge Base Gateway is disabled because it could not start", error);
+  }
+  const configuredMcpPort = process.env.KB_AGENT_MCP_PORT?.trim();
+  const mcpPort = configuredMcpPort === undefined || configuredMcpPort === "" ? 8788 : Number(configuredMcpPort);
+  if (!Number.isInteger(mcpPort) || mcpPort < 0 || mcpPort > 65535) {
+    throw new Error("KB_AGENT_MCP_PORT must be an integer between 0 and 65535");
+  }
+  try {
+    const allowUnauthenticatedMcp = process.env.KB_AGENT_MCP_ALLOW_NO_AUTH?.trim().toLowerCase() === "true";
+    services.mcpServer = await startKnowledgeBaseMcpServer({
+      gateway,
+      token,
+      port: mcpPort,
+      allowUnauthenticated: allowUnauthenticatedMcp,
+    });
+    if (allowUnauthenticatedMcp) {
+      console.warn("Knowledge Base MCP Server is running without request authentication; keep it bound to loopback and behind a trusted tunnel");
     }
-  })();
+    console.info(`Knowledge Base MCP Server listening on 127.0.0.1:${services.mcpServer.port}/mcp`);
+  } catch (error) {
+    console.warn("Knowledge Base MCP Server is disabled because it could not start", error);
+  }
+}
+
+async function recordGatewayAuditEvent(services: IpcServices, event: GatewayAuditEvent): Promise<void> {
+  const db = services.db;
+  if (!db) return;
+  const details = [
+    event.noteId === undefined ? undefined : `note=${event.noteId}`,
+    event.queryLength === undefined ? undefined : `queryLength=${event.queryLength}`,
+    event.resultCount === undefined ? undefined : `results=${event.resultCount}`,
+    `outcome=${event.outcome}`,
+  ].filter((value): value is string => value !== undefined).join(" ");
+  await recordActivity(db, {
+    id: randomUUID(),
+    workspaceId: event.workspaceId,
+    kind: "gateway",
+    title: `Gateway ${event.operation}`,
+    message: details,
+    ...(event.noteId === undefined ? {} : { entityPath: event.noteId }),
+    createdAt: event.createdAt,
+  });
+}
+
+function scheduleWorkspaceIndexRefresh(services: IpcServices): void {
+  void requestWorkspaceIndexRefresh(services).catch((error: unknown) => {
+    const db = services.db;
+    if (db?.sqlite.open) {
+      console.warn("Workspace watcher index refresh failed", error);
+    }
+  });
+}
+
+async function requestWorkspaceIndexRefresh(services: IpcServices): Promise<IndexWorkspaceResult> {
+  services.workspaceIndexRefreshPending = true;
+  if (services.workspaceIndexRefresh === undefined) {
+    const rootPath = requireWorkspaceRoot(services);
+    const db = requireDatabase(services);
+    const refresh = (async () => {
+      let result = services.lastIndexResult;
+      while (services.workspaceIndexRefreshPending) {
+        services.workspaceIndexRefreshPending = false;
+        result = await indexWorkspace(rootPath, db, await createIndexOptions(services));
+        if (services.workspaceRoot === rootPath && services.db === db) {
+          services.lastIndexResult = result;
+        }
+      }
+      if (result === undefined) {
+        throw new Error("Workspace index refresh completed without a result");
+      }
+      return result;
+    })();
+    services.workspaceIndexRefresh = refresh;
+    void refresh.finally(() => {
+      if (services.workspaceIndexRefresh === refresh) {
+        delete services.workspaceIndexRefresh;
+      }
+    }).catch(() => undefined);
+  }
+  return services.workspaceIndexRefresh;
 }
 
 export async function restoreWorkspaceFromSettings(services: IpcServices): Promise<boolean> {
@@ -2330,7 +2526,7 @@ function createDefaultToolHandlers(services: IpcServices): Map<MvpToolName, Tool
   handlers.set("get_workspace_rules", async () => ({ content: await readFile(path.join(requireWorkspaceRoot(services), "AGENTS.md"), "utf8") }));
   handlers.set("get_profile", async () => readActiveProfileContext(services));
 
-  for (const name of ["propose_create_note", "propose_update_note", "propose_memory", "propose_decision", "propose_delete"] as MvpToolName[]) {
+  for (const name of ["propose_create_note", "propose_annotation", "propose_update_note", "propose_memory", "propose_decision", "propose_delete"] as MvpToolName[]) {
     handlers.set(name, async (args) => createProposalReviewItem(services, name, args));
   }
 

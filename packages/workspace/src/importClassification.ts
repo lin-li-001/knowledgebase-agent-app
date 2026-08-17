@@ -1,10 +1,10 @@
 import type {
   ClassificationSignal,
   ClassificationDiagnostic,
-  ContentCategory,
   ImportClassification,
   ImportSensitivity,
 } from "./importSafety";
+import type { ContentCategory } from "./contentCategories";
 
 export interface SavedImportRule {
   id?: string;
@@ -55,9 +55,12 @@ export function detectImportSignals(input: {
 
   const employmentEvidence = textLines.filter((line) => employmentPattern.test(line));
   if (employmentEvidence.length > 0) {
+    const resumeContext = `${input.batchName}\n${input.fileName}\n${textLines.slice(0, 80).join("\n")}`;
     signals.push({
       source: "detector",
-      category: "profile.career",
+      category: /\b(resume|curriculum\s+vitae|cv|work\s+experience|professional\s+experience)\b/iu.test(resumeContext)
+        ? "profile.career.resume"
+        : "profile.career.work_history",
       sensitivity: "personal",
       confidence: 1,
       evidence: snippets(employmentEvidence),
@@ -70,6 +73,7 @@ export function detectImportSignals(input: {
 export function mergeImportClassification(input: {
   signals: ClassificationSignal[];
   fallbackDestination: string;
+  activeCategoryIds?: ReadonlySet<ContentCategory>;
 }): ImportClassification {
   const signals = input.signals.map(normalizeSignal);
   const categorySignal = winningSignal(signals, (signal) => signal.category !== undefined);
@@ -79,6 +83,10 @@ export function mergeImportClassification(input: {
   return {
     primaryCategory,
     alternativeCategories: alternativeCategories(signals, primaryCategory),
+    categorySource: categorySignal?.source ?? "fallback",
+    categoryStatus: input.activeCategoryIds === undefined || input.activeCategoryIds.has(primaryCategory)
+      ? "active"
+      : "proposed",
     sensitivity: strictestSensitivity(signals),
     confidence: categorySignal === undefined ? 0 : categoryConfidence(categorySignal),
     evidence: uniqueSnippets(signals.flatMap((signal) => signal.evidence)),

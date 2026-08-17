@@ -1,11 +1,17 @@
 import { z } from "zod";
-import type { ContentCategory, ImportSensitivity } from "./importSafety";
+import {
+  builtInContentCategoryCatalog,
+  type ContentCategory,
+  type ContentCategoryDefinition,
+} from "./contentCategories";
+import type { ImportSensitivity } from "./importSafety";
 import type { ImportedChunk } from "./importChunks";
 
 export interface SemanticImportInput {
   title: string;
   body: string;
   chunks: ImportedChunk[];
+  categories?: ContentCategoryDefinition[];
 }
 
 export interface SemanticImportResult {
@@ -21,26 +27,12 @@ export interface SemanticImportEnricher {
   enrich(input: SemanticImportInput): Promise<SemanticImportResult>;
 }
 
-const contentCategories = [
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-  "project.document",
-  "resource",
-  "unknown",
-] as const;
-
 const sensitivities = ["normal", "personal", "private", "restricted"] as const;
 
 const semanticResultSchema = z.object({
   summary: z.string().trim().min(1).max(4_000),
-  primaryCategory: z.enum(contentCategories),
-  alternativeCategories: z.array(z.enum(contentCategories)).default([]),
+  primaryCategory: z.string().trim().min(1).max(120),
+  alternativeCategories: z.array(z.string().trim().min(1).max(120)).default([]),
   sensitivity: z.enum(sensitivities),
   confidence: z.number().finite().min(0).max(1),
   evidence: z.array(z.string().trim().min(1).max(240)).default([]),
@@ -59,6 +51,16 @@ export function normalizeSemanticImportResult(value: unknown, input: SemanticImp
   }
 
   const result = parsed.data;
+  const allowedCategoryIds = new Set(
+    (input.categories ?? builtInContentCategoryCatalog).map((category) => category.id),
+  );
+  if (!allowedCategoryIds.has(result.primaryCategory)) {
+    throw new Error(`Invalid semantic import result primaryCategory: ${result.primaryCategory}`);
+  }
+  const invalidAlternative = result.alternativeCategories.find((category) => !allowedCategoryIds.has(category));
+  if (invalidAlternative !== undefined) {
+    throw new Error(`Invalid semantic import result alternativeCategories: ${invalidAlternative}`);
+  }
   return {
     summary: result.summary,
     primaryCategory: result.primaryCategory,

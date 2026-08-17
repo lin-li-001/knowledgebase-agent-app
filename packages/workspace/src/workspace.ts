@@ -1,6 +1,13 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  contentCategoryConfigPath,
+  defaultContentCategoryConfig,
+  loadContentCategoryRegistry,
+  renderContentCategoryContract,
+  serializeContentCategoryConfig,
+} from "./contentCategories";
+import {
   changesTemplate,
   memoryTemplate,
   profileTemplate,
@@ -60,6 +67,11 @@ export async function createWorkspace(rootPath: string): Promise<WorkspaceInfo> 
     writeFile(path.join(normalizedRoot, ".vault/CHANGES.md"), changesTemplate, {
       flag: "wx",
     }).catch(ignoreExistingFile),
+    writeFile(
+      path.join(normalizedRoot, contentCategoryConfigPath),
+      serializeContentCategoryConfig(defaultContentCategoryConfig()),
+      { flag: "wx" },
+    ).catch(ignoreExistingFile),
     writeFile(
       path.join(normalizedRoot, ".app/settings.json"),
       `${JSON.stringify(settingsTemplate, null, 2)}\n`,
@@ -128,6 +140,9 @@ export async function syncWorkspaceContractLocked(
     "- The Safety Kernel must approve every final import write.",
     "1. Current Review category and destination overrides take precedence over all saved rules and automatic routing.",
     "Saved workspace routing rules never bypass Review.",
+    "- The `## Document` body of an imported source note is source evidence. Agent proposals must not rewrite it.",
+    "- Chat may propose Review-gated metadata changes or append a provenance-bearing `## Annotations` entry. Cross-document synthesis belongs in a separate note that cites its sources.",
+    "- imported source annotations require Review; imported source-body replacement is not allowed",
   ];
   const obsoleteSourceNoteRouteLine = "- Imported source Markdown notes go to `04-Resources/Imports/<batch-name>/<source-stem>.md` while pending Review; low-risk imports are immediately written to `00-Inbox/Imports/`.";
   const hasSourceNoteRoute = normalizedCurrent.includes(sourceNoteRoute);
@@ -161,6 +176,13 @@ export async function syncWorkspaceContractLocked(
   }
 
   next = synchronizeRoutingPriorityBlock(next, routingPriorityBlock);
+
+  const categoryContract = renderContentCategoryContract(
+    await loadContentCategoryRegistry(canonicalRoot),
+  );
+  if (!next.includes("<!-- BEGIN MANAGED: content-categories -->")) {
+    next = `${next.trimEnd()}\n\n${categoryContract}\n`;
+  }
 
   for (const line of safetyContractLines) {
     if (!next.includes(line)) {

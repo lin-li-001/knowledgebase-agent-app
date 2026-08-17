@@ -42,6 +42,12 @@ for (const channel of allowedChannels) {
 }
 
 app.on("window-all-closed", () => {
+  void ipcServices.mcpServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base MCP Server", error);
+  });
+  void ipcServices.gatewayServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base Gateway", error);
+  });
   ipcServices.workspaceWatcher?.close();
   if (process.platform !== "darwin") {
     app.quit();
@@ -49,5 +55,11 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  void ipcServices.mcpServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base MCP Server", error);
+  });
+  void ipcServices.gatewayServer?.close().catch((error: unknown) => {
+    console.warn("Failed to close Knowledge Base Gateway", error);
+  });
   ipcServices.workspaceWatcher?.close();
 });

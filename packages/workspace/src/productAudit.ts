@@ -1,6 +1,11 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import * as ts from "typescript";
+import {
+  contentCategoryContractDrift,
+  loadContentCategoryRegistry,
+  renderContentCategoryContract,
+} from "./contentCategories";
 import { defaultRoutingPolicy } from "./routingPolicy";
 
 export interface ProductAuditInput {
@@ -44,6 +49,14 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   if (generatedWorkspaceContract !== undefined) {
     auditGeneratedWorkspaceContract(generatedWorkspaceContract, result);
   }
+  await auditContentCategoryRegistry(
+    repoRoot,
+    input.workspaceRoot,
+    workspaceContractSource,
+    generatedWorkspaceContract,
+    input.sourceOverrides,
+    result,
+  );
   if (!result.failures.some((failure) => failure.startsWith("workspace contract is missing"))) {
     result.passes.push("routing policy paths are documented in the workspace contract");
   }
@@ -67,6 +80,61 @@ export async function auditProductContracts(input: ProductAuditInput): Promise<P
   await auditFilesystemWriters(repoRoot, input.sourceOverrides, result);
   await auditDecisionMirror(repoRoot, result);
   return result;
+}
+
+async function auditContentCategoryRegistry(
+  repoRoot: string,
+  workspaceRoot: string,
+  workspaceContractSource: string,
+  generatedWorkspaceContract: string | undefined,
+  sourceOverrides: Map<string, string> | undefined,
+  result: ProductAuditResult,
+): Promise<void> {
+  const categorySource = await readSource(
+    repoRoot,
+    "packages/workspace/src/contentCategories.ts",
+    sourceOverrides,
+  );
+  const importSource = await readSource(
+    repoRoot,
+    "packages/workspace/src/imports.ts",
+    sourceOverrides,
+  );
+  const requiredSourceTokens = [
+    ".vault/content-categories.json",
+    "initialActiveBuiltInCategoryIds",
+    "hiddenBuiltInParentCategoryIds",
+    "renderContentCategoryContract",
+  ];
+  const missingSourceTokens = requiredSourceTokens.filter((token) => !categorySource.includes(token));
+  if (missingSourceTokens.length) {
+    result.failures.push(`content category registry is missing contract tokens: ${missingSourceTokens.join(", ")}`);
+  } else if (!workspaceContractSource.includes("renderContentCategoryContract")) {
+    result.failures.push("workspace template does not generate the content category contract");
+  } else if (!importSource.includes("loadContentCategoryRegistry")) {
+    result.failures.push("import classification does not load the workspace content category registry");
+  } else {
+    result.passes.push("progressive content category registry is wired into imports and workspace contracts");
+  }
+
+  if (generatedWorkspaceContract === undefined) {
+    return;
+  }
+
+  try {
+    const registry = await loadContentCategoryRegistry(workspaceRoot);
+    if (!generatedWorkspaceContract.includes("<!-- BEGIN MANAGED: content-categories -->")) {
+      result.failures.push("generated workspace AGENTS.md is missing the managed content category contract");
+    } else if (contentCategoryContractDrift(generatedWorkspaceContract, registry)) {
+      result.failures.push("generated workspace AGENTS.md content category contract differs from the runtime registry");
+    } else if (!generatedWorkspaceContract.includes(renderContentCategoryContract(registry))) {
+      result.failures.push("generated workspace AGENTS.md does not contain the runtime content category contract");
+    } else {
+      result.passes.push("generated workspace AGENTS.md matches the runtime content category registry");
+    }
+  } catch (error) {
+    result.failures.push(`workspace content category registry cannot be loaded: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
 }
 
 const importRoutingContractTerms = [

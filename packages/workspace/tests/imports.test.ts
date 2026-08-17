@@ -15,6 +15,8 @@ import { extractDocumentText } from "../src/importExtractors";
 import { importDocumentBatch } from "../src/index";
 
 describe("importDocumentBatch", () => {
+  it.todo("routes insurance, tax, statements, personal facts, projects, and decisions to final category folders");
+
   it("creates one Markdown note with derived summary, body, source, and route metadata for one PDF", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
@@ -46,6 +48,12 @@ describe("importDocumentBatch", () => {
     const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
     expect(note).toContain("summary:");
     expect(note).not.toContain("## Summary");
+    expect(note).toMatch(/source_sha256: [a-f0-9]{64}/u);
+    expect(note).toMatch(/source_body_sha256: [a-f0-9]{64}/u);
+    expect(note).toContain("source_integrity: source_evidence");
+    expect(note).toContain("extraction_version: 1");
+    expect(note).toContain("<!-- kb-agent:source-body:start -->");
+    expect(note).toContain("<!-- kb-agent:source-body:end -->");
     expect(note).toContain("<!-- Page 1 -->");
     expect(note).toContain("## Source");
     expect(note).toContain("## Routing");
@@ -180,7 +188,7 @@ describe("importDocumentBatch", () => {
     expect(summary).not.toContain("Opening policy paragraph that must remain only in the document body.");
   });
 
-  it("preserves the source and omits an invented summary when enrichment fails", async () => {
+  it("preserves the source and writes a deterministic summary when enrichment fails", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
     const source = path.join(sourceDir, "Unclassified.txt");
@@ -201,7 +209,25 @@ describe("importDocumentBatch", () => {
     expect(job.notes[0]!.status).toBe("pending_review");
     const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
     expect(note).toContain("Source text must remain available.");
-    expect(note).not.toMatch(/^summary:/mu);
+    expect(frontmatterField(note, "summary")).toContain("Unclassified contains 1 document block");
+  });
+
+  it("writes a deterministic summary when no semantic enricher is configured", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-import-"));
+    const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-import-sources-"));
+    const source = path.join(sourceDir, "Offline Handbook.txt");
+    await writeFile(source, "Opening section.\n\nLater representative section.", "utf8");
+
+    const job = await importDocumentBatch({
+      workspaceRoot: root,
+      batchName: "Offline Handbook",
+      files: [source],
+    });
+
+    const note = await readFile(path.join(root, job.notes[0]!.notePath), "utf8");
+    const summary = frontmatterField(note, "summary");
+    expect(summary).toContain("Offline Handbook contains 2 document blocks");
+    expect(summary).toContain("Representative later content: Later representative section.");
   });
 
   it("keeps one staged note per source when a batch has multiple unclassified files", async () => {
@@ -311,7 +337,7 @@ describe("importDocumentBatch", () => {
     expect(job.notes[0]).toMatchObject({
       status: "pending_review",
       notePath: expect.stringMatching(/^\.app\/import-staging\//),
-      destination: "02-Personal/default/Finance/Utilities/2026/Electric Bill.md",
+      destination: "02-Personal/default/Finance/Utilities/Electric Bill.md",
     });
   });
 

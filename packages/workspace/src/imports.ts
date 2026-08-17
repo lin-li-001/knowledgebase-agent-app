@@ -1,6 +1,15 @@
 import { constants } from "node:fs";
 import { access, copyFile, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  categoryDefinition,
+  contentCategoryContractDrift,
+  loadContentCategoryRegistry,
+  normalizeContentCategoryId,
+  resolveCategoryDestination,
+  type ContentCategory,
+  type ContentCategoryRegistry,
+} from "./contentCategories";
 import { extractDocumentText, type ExtractedDocument } from "./importExtractors";
 import {
   detectImportSignals,
@@ -18,7 +27,6 @@ import {
   evaluateImportSafety,
   type ClassificationSignal,
   type ClassificationDiagnostic,
-  type ContentCategory,
   type ImportClassification,
   type ImportSensitivity,
   type SafetyDecision,
@@ -30,6 +38,7 @@ import {
 } from "./importPromotion";
 import { assertInsideWorkspace } from "./pathGuard";
 import { defaultRoutingPolicy } from "./routingPolicy";
+import { importedSourceBodyHash, wrapImportedSourceBody } from "./sourceEvidence";
 import {
   secureCopyFileIntoWorkspace,
   secureEnsureWorkspaceDirectory,
@@ -183,6 +192,11 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
       input.workspaceRoot,
       input.ioHooks,
     );
+    const categoryRegistry = await loadContentCategoryRegistry(input.workspaceRoot);
+    const categoryContractHasDrift = await workspaceCategoryContractHasDrift(
+      input.workspaceRoot,
+      categoryRegistry,
+    );
     const notes: ImportSourceNote[] = [];
     for (const document of documents) {
       notes.push(await persistSourceNote(
@@ -192,6 +206,8 @@ export async function importDocumentBatch(input: ImportBatchInput): Promise<Impo
         created,
         document,
         policy,
+        categoryRegistry,
+        categoryContractHasDrift,
         fileOps,
         createdDerivedArtifacts,
         input.semanticEnricher,
@@ -233,14 +249,30 @@ async function persistSourceNote(
   created: string,
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
+  categoryRegistry: ContentCategoryRegistry,
+  categoryContractHasDrift: boolean,
   fileOps: ImportFileOps,
   createdArtifacts: Map<string, SecureWorkspaceArtifactIdentity>,
   semanticEnricher?: SemanticImportEnricher,
   ioHooks?: SecureWorkspaceIoHooks,
 ): Promise<ImportSourceNote> {
   const title = document.sourceStem;
-  const semanticResult = await enrichImportedDocument(semanticEnricher, importId, title, document);
-  const routed = routeDocument(batchName, title, document, policy, semanticResult);
+  const semanticResult = await enrichImportedDocument(
+    semanticEnricher,
+    importId,
+    title,
+    document,
+    categoryRegistry,
+  );
+  const routed = routeDocument(
+    batchName,
+    title,
+    document,
+    policy,
+    categoryRegistry,
+    categoryContractHasDrift,
+    semanticResult,
+  );
   const stagingPath = defaultRoutingPolicy.importStagingNotePath(importId, title);
   const stagingTargetPath = assertInsideWorkspace(workspaceRoot, stagingPath);
   const destinationTargetPath = safeWorkspacePath(workspaceRoot, routed.destination);
@@ -391,6 +423,7 @@ async function enrichImportedDocument(
   importId: string,
   title: string,
   document: ImportedDocument,
+  categoryRegistry: ContentCategoryRegistry,
 ): Promise<SemanticImportResult | undefined> {
   if (enricher === undefined || document.requiresOcr || !document.markdownBody.trim()) {
     return undefined;
@@ -404,11 +437,13 @@ async function enrichImportedDocument(
       title,
       body: document.markdownBody,
       chunks,
+      categories: categoryRegistry.classifierCategories,
     });
     return normalizeSemanticImportResult(rawResult, {
       title,
       body: document.markdownBody,
       chunks,
+      categories: categoryRegistry.classifierCategories,
     });
   } catch {
     return undefined;
@@ -420,6 +455,8 @@ function routeDocument(
   title: string,
   document: ImportedDocument,
   policy: WorkspaceRoutingPolicyFile,
+  categoryRegistry: ContentCategoryRegistry,
+  categoryContractHasDrift: boolean,
   semanticResult?: SemanticImportResult,
 ): RoutedDocument {
   const detectorSignals = detectImportSignals({
@@ -437,32 +474,52 @@ function routeDocument(
       evidence: semanticResult.evidence,
     }];
   const year = firstYear(document.text) ?? firstYear(batchName);
-  const isFinance = detectorSignals.some((signal) => signal.category === "finance.utility");
-  const hasPersonalFacts = detectorSignals.some((signal) => signal.category === "profile.career");
-  const fallbackDestination = isFinance
-    ? importCandidateRoutingPolicy.financeUtilitiesDestination(
-      year === undefined ? { batchName: title } : { batchName: title, year },
-    )
-    : hasPersonalFacts
-      ? importCandidateRoutingPolicy.profileMemoryDestination("default")
-      : importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
-  const savedRuleSignals = savedRoutingRuleSignals(policy, `${title}\n${document.fileName}\n${document.text}`);
-  const classification = mergeImportClassification({
-    signals: [...semanticSignals, ...detectorSignals, ...savedRuleSignals],
-    fallbackDestination,
+  const inboxFallback = importCandidateRoutingPolicy.inboxFallbackDestination({ batchName });
+  const savedRuleSignals = savedRoutingRuleSignals(
+    policy,
+    `${title}\n${document.fileName}\n${document.text}`,
+    categoryRegistry,
+  );
+  const signals = [...semanticSignals, ...detectorSignals, ...savedRuleSignals];
+  const categoryOnlyClassification = mergeImportClassification({
+    signals,
+    fallbackDestination: inboxFallback,
+    activeCategoryIds: categoryRegistry.activeCategoryIds,
   });
+  const categoryDestination = resolveCategoryDestination({
+    registry: categoryRegistry,
+    category: categoryOnlyClassification.primaryCategory,
+    title,
+    profileId: "default",
+    ...(year === undefined ? {} : { year }),
+  });
+  const fallbackDestination = categoryDestination ?? inboxFallback;
+  const classification = mergeImportClassification({
+    signals,
+    fallbackDestination,
+    activeCategoryIds: categoryRegistry.activeCategoryIds,
+  });
+  classification.categoryRisk = categoryDefinition(
+    categoryRegistry,
+    classification.primaryCategory,
+  )?.defaultRisk ?? "review_required";
+  if (categoryContractHasDrift) {
+    classification.conflict = true;
+    classification.evidence = [...classification.evidence, "AGENTS.md category contract differs from the runtime registry"];
+  }
   const destination = classification.suggestedDestination ?? fallbackDestination;
 
   return {
     classification,
     destination,
-    ...(semanticResult === undefined ? {} : { summary: semanticResult.summary }),
+    summary: semanticResult?.summary ?? summaryFor(document),
   };
 }
 
 function renderImportedSourceNote(input: RenderSourceNoteInput): string {
   const sourceLink = sourceLinkFor(input.notePath, input.attachmentPath);
   const documentBody = input.document.markdownBody || ocrMessage(input.document);
+  const sourceBodyHash = importedSourceBodyHash(documentBody);
   const tags = `[imported, ${input.status.replace(/_/gu, "-")}]`;
 
   return `---
@@ -476,8 +533,16 @@ created: ${input.created}
 tags: ${tags}
 source_type: import
 source_file: ${escapeYamlString(sourceLink)}
+source_sha256: ${input.document.attachmentArtifact.sha256}
+source_body_sha256: ${sourceBodyHash}
+source_integrity: source_evidence
+extraction_version: 1
 ${input.summary === undefined ? "" : `summary: ${escapeYamlString(input.summary)}\n`}
 content_category: ${input.classification.primaryCategory}
+category_source: ${input.classification.categorySource}
+category_status: ${input.classification.categoryStatus}
+category_risk: ${input.classification.categoryRisk ?? "review_required"}
+secondary_categories: ${JSON.stringify(input.classification.alternativeCategories)}
 classification_confidence: ${input.classification.confidence}
 classification_evidence: ${JSON.stringify(input.classification.evidence)}
 review_decision: ${input.safetyDecision.decision}
@@ -490,7 +555,7 @@ ${input.document.pageCount ? `page_count: ${input.document.pageCount}\n` : ""}${
 
 ## Document
 
-${documentBody}
+${wrapImportedSourceBody(documentBody)}
 
 ## Source
 
@@ -526,11 +591,15 @@ function ocrMessage(document: ImportedDocument): string {
     : "No extractable document content was found.";
 }
 
-function savedRoutingRuleSignals(policy: WorkspaceRoutingPolicyFile, haystack: string): ClassificationSignal[] {
+function savedRoutingRuleSignals(
+  policy: WorkspaceRoutingPolicyFile,
+  haystack: string,
+  categoryRegistry: ContentCategoryRegistry,
+): ClassificationSignal[] {
   const normalizedHaystack = haystack.toLocaleLowerCase();
   // The merger keeps the first same-priority signal, making policy order the durable tie-breaker.
   return policy.rules
-    ?.map(parseSavedImportRule)
+    ?.map((rule) => parseSavedImportRule(rule, categoryRegistry))
     .filter((candidate): candidate is SavedImportRule => candidate !== undefined)
     .filter((rule) => normalizedHaystack.includes(rule.pattern.toLocaleLowerCase()))
     .map((rule) => ({
@@ -547,14 +616,18 @@ function savedRoutingRuleSignals(policy: WorkspaceRoutingPolicyFile, haystack: s
     })) ?? [];
 }
 
-function parseSavedImportRule(value: unknown): SavedImportRule | undefined {
+function parseSavedImportRule(
+  value: unknown,
+  categoryRegistry: ContentCategoryRegistry,
+): SavedImportRule | undefined {
   if (!isRecord(value) || !nonEmptyString(value.pattern) || !nonEmptyString(value.destination)) {
     return undefined;
   }
 
   const diagnostics: ClassificationDiagnostic[] = [];
   const diagnosticEvidence: string[] = [];
-  if (hasOwn(value, "category") && !isContentCategory(value.category)) {
+  const normalizedCategory = normalizedRegistryCategory(value.category, categoryRegistry);
+  if (hasOwn(value, "category") && normalizedCategory === undefined) {
     diagnostics.push("INVALID_SAVED_RULE_CATEGORY");
     diagnosticEvidence.push(
       `Saved routing rule has invalid category: ${String(value.category)}`,
@@ -570,31 +643,24 @@ function parseSavedImportRule(value: unknown): SavedImportRule | undefined {
   return {
     pattern: value.pattern,
     destination: value.destination,
-    ...(isContentCategory(value.category) ? { category: value.category } : {}),
+    ...(normalizedCategory === undefined ? {} : { category: normalizedCategory }),
     ...(isImportSensitivity(value.sensitivity) ? { sensitivity: value.sensitivity } : {}),
     ...(nonEmptyString(value.id) ? { id: value.id } : {}),
     ...(diagnostics.length === 0 ? {} : { diagnostics, diagnosticEvidence }),
   };
 }
 
-const contentCategories = new Set<ContentCategory>([
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-  "project.document",
-  "resource",
-  "unknown",
-]);
-
 const importSensitivities = new Set<ImportSensitivity>(["normal", "personal", "private", "restricted"]);
 
-function isContentCategory(value: unknown): value is ContentCategory {
-  return typeof value === "string" && contentCategories.has(value as ContentCategory);
+function normalizedRegistryCategory(
+  value: unknown,
+  categoryRegistry: ContentCategoryRegistry,
+): ContentCategory | undefined {
+  const normalized = normalizeContentCategoryId(value);
+  return normalized !== undefined
+    && categoryRegistry.categories.some((category) => category.id === normalized)
+    ? normalized
+    : undefined;
 }
 
 function isImportSensitivity(value: unknown): value is ImportSensitivity {
@@ -611,6 +677,21 @@ function hasOwn(value: Record<string, unknown>, key: string): boolean {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
+}
+
+async function workspaceCategoryContractHasDrift(
+  workspaceRoot: string,
+  categoryRegistry: ContentCategoryRegistry,
+): Promise<boolean> {
+  try {
+    const agents = await readFile(path.join(workspaceRoot, "AGENTS.md"), "utf8");
+    return contentCategoryContractDrift(agents, categoryRegistry);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function readWorkspaceRoutingPolicy(

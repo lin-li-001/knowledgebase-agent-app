@@ -14,6 +14,8 @@ export const allowedChannels = [
   "review:list",
   "review:approve",
   "review:reject",
+  "categories:list",
+  "categories:create",
   "activity:list",
   "index:rebuild",
   "import:start",

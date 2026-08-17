@@ -34,7 +34,7 @@ describe("detectImportSignals", () => {
 
     expect(signals).toContainEqual(expect.objectContaining({
       source: "detector",
-      category: "profile.career",
+      category: "profile.career.resume",
       sensitivity: "personal",
       confidence: 1,
       evidence: ["Staff Engineer | OpenAI Jan 2024 - Present"],

@@ -1,5 +1,6 @@
 import type { ModelProvider } from "@kb-agent/model";
 import {
+  builtInContentCategoryCatalog,
   normalizeSemanticImportResult,
   type SemanticImportEnricher,
   type SemanticImportInput,
@@ -20,6 +21,8 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
         input.title,
         chunk.text,
         `Analyze source chunk ${chunk.id}. Focus on the facts and meaning in this chunk.`,
+        [],
+        input,
       );
       return {
         headingPath: chunk.headingPath,
@@ -56,6 +59,8 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
             "Do not return Markdown, a code fence, or extra commentary.",
             "summary must be a concise faithful summary, not a copy of the opening paragraph.",
             "Use exactly one primaryCategory from the allowed list.",
+            "Choose the most specific leaf category supported by the document; use a parent only when the document is genuinely broad or evidence is insufficient for a leaf.",
+            "The decision category is only for a document whose primary purpose is a formal decision record. For ordinary project or personal decisions embedded in another document, keep the document's primary category.",
             "Use sensitivity normal, personal, private, or restricted.",
             "confidence must be a number from 0 to 1.",
           ].join(" "),
@@ -64,9 +69,14 @@ export class ModelSemanticImportEnricher implements SemanticImportEnricher {
           role: "user",
           content: JSON.stringify({
             task,
+            allowedCategories: (input?.categories ?? builtInContentCategoryCatalog).map((category) => ({
+              id: category.id,
+              description: category.description,
+              examples: category.examples,
+            })),
             outputShape: {
               summary: "string",
-              primaryCategory: "finance.utility | finance.insurance | finance.tax | finance.statement | profile.career | profile.personal_fact | memory.candidate | decision.record | project.document | resource | unknown",
+              primaryCategory: "exactly one ID from allowedCategories",
               alternativeCategories: ["content category strings"],
               sensitivity: "normal | personal | private | restricted",
               confidence: 0.0,

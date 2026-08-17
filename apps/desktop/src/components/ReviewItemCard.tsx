@@ -1,19 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { ContentCategory } from "@kb-agent/workspace";
-
-const contentCategories = [
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-  "project.document",
-  "resource",
-  "unknown",
-] as const satisfies readonly ContentCategory[];
+import type { ContentCategory, ContentCategoryDefinition } from "@kb-agent/workspace";
+import { categoryDefinitionFallback, initialCategoryFallback } from "../state/categoryCatalog";
 
 export interface ReviewCardItem {
   id: string;
@@ -38,10 +25,14 @@ export interface ReviewApprovalOptions {
 
 export function ReviewItemCard({
   item,
+  activeCategories = initialCategoryFallback,
+  categories = initialCategoryFallback,
   onApprove,
   onReject,
 }: {
   item: ReviewCardItem;
+  activeCategories?: ContentCategoryDefinition[];
+  categories?: ContentCategoryDefinition[];
   onApprove?(id: string, options?: ReviewApprovalOptions): Promise<void>;
   onReject?(id: string): Promise<void>;
 }) {
@@ -60,6 +51,12 @@ export function ReviewItemCard({
   const [destination, setDestination] = useState(editableDestination ?? "");
   const [category, setCategory] = useState<ContentCategory | undefined>(
     persistedApplication.options.categoryOverride ?? importDetails?.category,
+  );
+  const categoryOptions = reviewCategoryOptions(
+    activeCategories,
+    categories,
+    importDetails?.category,
+    category,
   );
   const [saveAsRoutingRule, setSaveAsRoutingRule] = useState(
     persistedApplication.options.saveAsRoutingRule ?? false,
@@ -207,14 +204,23 @@ export function ReviewItemCard({
             <label>
               Category
               <select value={category} onChange={(event) => setCategory(event.currentTarget.value as ContentCategory)}>
-                {contentCategories.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}
+                {categoryOptions.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.label} ({candidate.id}){candidate.proposed ? " - new" : ""}
+                  </option>
+                ))}
               </select>
             </label>
           ) : null}
           <label>
             Destination
-            <input value={destination} onChange={(event) => setDestination(event.currentTarget.value)} />
+            <input
+              aria-describedby="review-destination-help"
+              value={destination}
+              onChange={(event) => setDestination(event.currentTarget.value)}
+            />
           </label>
+          <small id="review-destination-help">Enter the complete Markdown file path, including `.md`.</small>
           <label className="checkbox-row">
             <input
               type="checkbox"
@@ -334,6 +340,9 @@ function reviewTitle(item: ReviewCardItem): string {
   if (item.proposalType === "propose_memory") {
     return "Memory proposal";
   }
+  if (item.proposalType === "propose_annotation") {
+    return "Source annotation proposal";
+  }
 
   return item.targetPath ?? "New note proposal";
 }
@@ -347,6 +356,9 @@ function previewLabel(item: ReviewCardItem): string {
   }
   if (item.proposalType === "propose_create_note") {
     return "Note content";
+  }
+  if (item.proposalType === "propose_annotation") {
+    return "Annotation to append";
   }
   if (item.proposalType === "propose_update_note") {
     return "Patch";
@@ -442,7 +454,29 @@ function importReviewDetails(item: ReviewCardItem): {
 }
 
 function isContentCategory(value: unknown): value is ContentCategory {
-  return typeof value === "string" && (contentCategories as readonly string[]).includes(value);
+  return typeof value === "string"
+    && value.length <= 120
+    && /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/u.test(value);
+}
+
+function reviewCategoryOptions(
+  activeCategories: ContentCategoryDefinition[],
+  categories: ContentCategoryDefinition[],
+  proposedCategory: ContentCategory | undefined,
+  selectedCategory: ContentCategory | undefined,
+): Array<ContentCategoryDefinition & { proposed: boolean }> {
+  const activeIds = new Set(activeCategories.map((category) => category.id));
+  const options = activeCategories.map((category) => ({ ...category, proposed: false }));
+  for (const candidateId of [proposedCategory, selectedCategory]) {
+    if (!candidateId || activeIds.has(candidateId)) {
+      continue;
+    }
+    const candidate = categories.find((category) => category.id === candidateId)
+      ?? categoryDefinitionFallback(candidateId);
+    options.push({ ...candidate, proposed: true });
+    activeIds.add(candidateId);
+  }
+  return options;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

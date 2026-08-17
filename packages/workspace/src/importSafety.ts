@@ -1,19 +1,11 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import {
+  isContentCategoryId,
+  isProtectedContentCategory,
+  type ContentCategory,
+} from "./contentCategories";
 import { assertInsideWorkspace } from "./pathGuard";
-
-export type ContentCategory =
-  | "finance.utility"
-  | "finance.insurance"
-  | "finance.tax"
-  | "finance.statement"
-  | "profile.career"
-  | "profile.personal_fact"
-  | "memory.candidate"
-  | "decision.record"
-  | "project.document"
-  | "resource"
-  | "unknown";
 
 export type ImportSensitivity = "normal" | "personal" | "private" | "restricted";
 export type ReviewDecision = "auto_write" | "review_required" | "blocked";
@@ -29,6 +21,7 @@ export type SafetyReasonCode =
   | "CLASSIFICATION_UNKNOWN"
   | "CLASSIFIER_CONFLICT"
   | "CONFIDENCE_BELOW_THRESHOLD"
+  | "CATEGORY_REQUIRES_ACTIVATION"
   | "SENSITIVITY_REQUIRES_REVIEW"
   | "CATEGORY_REQUIRES_REVIEW"
   | "DESTINATION_REQUIRES_REVIEW"
@@ -53,6 +46,9 @@ export type ClassificationDiagnostic =
 export interface ImportClassification {
   primaryCategory: ContentCategory;
   alternativeCategories: ContentCategory[];
+  categorySource: ClassificationSignal["source"] | "fallback";
+  categoryStatus: "active" | "proposed";
+  categoryRisk?: "normal" | "review_required";
   sensitivity: ImportSensitivity;
   confidence: number;
   evidence: string[];
@@ -83,20 +79,6 @@ export interface SafetyDecision {
   allowedDestination?: string;
 }
 
-const CONTENT_CATEGORIES = new Set<ContentCategory>([
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-  "project.document",
-  "resource",
-  "unknown",
-]);
-
 const IMPORT_SENSITIVITIES = new Set<ImportSensitivity>([
   "normal",
   "personal",
@@ -112,19 +94,9 @@ const IMPORT_OPERATIONS = new Set<ImportOperation>([
   "delete",
 ]);
 
-const PROTECTED_CATEGORIES = new Set<ContentCategory>([
-  "finance.utility",
-  "finance.insurance",
-  "finance.tax",
-  "finance.statement",
-  "profile.career",
-  "profile.personal_fact",
-  "memory.candidate",
-  "decision.record",
-]);
-
 const PROTECTED_DESTINATION_ROOTS = [
   "02-Personal",
+  "02-Profiles",
   "07-Private",
   path.join(".vault", "decisions"),
 ];
@@ -133,6 +105,7 @@ const APPROVED_FINAL_ROOTS = [
   "00-Inbox",
   "01-Projects",
   "02-Personal",
+  "02-Profiles",
   "03-Knowledge",
   "04-Resources",
   "07-Private",
@@ -231,10 +204,16 @@ function evaluateImportSafetyInternal(intent: ImportWriteIntent): SafetyDecision
     if (classification.confidence < intent.autoWriteThreshold) {
       reviewReasons.push("CONFIDENCE_BELOW_THRESHOLD");
     }
+    if (classification.categoryStatus === "proposed") {
+      reviewReasons.push("CATEGORY_REQUIRES_ACTIVATION");
+    }
+    if (classification.categoryRisk === "review_required") {
+      reviewReasons.push("CATEGORY_REQUIRES_REVIEW");
+    }
     if (classification.sensitivity !== "normal") {
       reviewReasons.push("SENSITIVITY_REQUIRES_REVIEW");
     }
-    if (PROTECTED_CATEGORIES.has(classification.primaryCategory)) {
+    if (isProtectedContentCategory(classification.primaryCategory)) {
       reviewReasons.push("CATEGORY_REQUIRES_REVIEW");
     }
     if (hasConflictingSafetySignal(classification, intent.autoWriteThreshold)) {
@@ -351,6 +330,9 @@ function validateClassification(
     !isContentCategory(classification.primaryCategory) ||
     !Array.isArray(classification.alternativeCategories) ||
     !classification.alternativeCategories.every(isContentCategory) ||
+    !isCategorySource(classification.categorySource) ||
+    (classification.categoryStatus !== "active" && classification.categoryStatus !== "proposed") ||
+    (classification.categoryRisk !== undefined && classification.categoryRisk !== "normal" && classification.categoryRisk !== "review_required") ||
     !isImportSensitivity(classification.sensitivity) ||
     !isConfidence(classification.confidence) ||
     !Array.isArray(classification.evidence) ||
@@ -403,7 +385,7 @@ function hasConflictingSafetySignal(
   return classification.signals.some((signal) => {
     const protectedOrUnknownCategory =
       signal.category === "unknown" ||
-      (signal.category !== undefined && PROTECTED_CATEGORIES.has(signal.category));
+      (signal.category !== undefined && isProtectedContentCategory(signal.category));
     const sensitiveSignal = signal.sensitivity !== undefined && signal.sensitivity !== "normal";
     const belowThreshold =
       signal.confidence !== undefined && signal.confidence < autoWriteThreshold;
@@ -444,7 +426,15 @@ function isValidApprovalProof(
 }
 
 function isContentCategory(value: unknown): value is ContentCategory {
-  return typeof value === "string" && CONTENT_CATEGORIES.has(value as ContentCategory);
+  return isContentCategoryId(value);
+}
+
+function isCategorySource(value: unknown): value is ImportClassification["categorySource"] {
+  return value === "fallback"
+    || value === "detector"
+    || value === "model"
+    || value === "saved_user_policy"
+    || value === "current_user_override";
 }
 
 function isImportSensitivity(value: unknown): value is ImportSensitivity {

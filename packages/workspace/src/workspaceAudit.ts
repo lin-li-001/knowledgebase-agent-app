@@ -4,6 +4,7 @@ import type { AppDatabase } from "@kb-agent/storage";
 import { parseMarkdownDocument, parseMarkdownNote } from "./markdown";
 import { defaultRoutingPolicy } from "./routingPolicy";
 import { workspaceIdForRoot } from "./indexer";
+import { contentCategoryContractDrift, loadContentCategoryRegistry } from "./contentCategories";
 
 export type WorkspaceAuditStatus = "pass" | "warning" | "fail";
 export type WorkspaceAuditSeverity = "info" | "warning" | "error";
@@ -159,6 +160,32 @@ async function auditWorkspaceContract(rootPath: string, findings: WorkspaceAudit
     "Import candidate routing precedence",
   ];
   const importedSourceNoteRouteStatusFields = ["route_status", "route_destination"];
+
+  try {
+    const registry = await loadContentCategoryRegistry(rootPath);
+    if (!contract.includes("<!-- BEGIN MANAGED: content-categories -->")) {
+      findings.push({
+        code: "routing_drift",
+        severity: "warning",
+        path: "AGENTS.md",
+        message: "Workspace contract is missing the managed content category section.",
+      });
+    } else if (contentCategoryContractDrift(contract, registry)) {
+      findings.push({
+        code: "routing_drift",
+        severity: "warning",
+        path: "AGENTS.md",
+        message: "Managed content categories differ from .vault/content-categories.json.",
+      });
+    }
+  } catch (error) {
+    findings.push({
+      code: "routing_drift",
+      severity: "error",
+      path: ".vault/content-categories.json",
+      message: error instanceof Error ? error.message : "Content category registry is invalid.",
+    });
+  }
 
   for (const route of requiredRoutes) {
     if (!contract.includes(route)) {

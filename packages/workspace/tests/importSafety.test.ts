@@ -17,6 +17,8 @@ function classification(
   return {
     primaryCategory: "resource",
     alternativeCategories: [],
+    categorySource: "detector",
+    categoryStatus: "active",
     sensitivity: "normal",
     confidence: 1,
     evidence: ["source evidence"],
@@ -81,7 +83,6 @@ describe("evaluateImportSafety", () => {
     ["template", "05-Templates/Imported.md"],
     ["attachment", "06-Attachments/Imports/A.md"],
     ["unknown top-level root", "09-Unknown/A.md"],
-    ["legacy profile root", "02-Profiles/default/Memory.md"],
     ["non-Markdown file", "04-Resources/Imports/A.txt"],
     ["Markdown-like directory", "04-Resources/Imports/A.md/child"],
   ])("blocks %s as an unapproved final destination", (_name, destination) => {
@@ -97,6 +98,7 @@ describe("evaluateImportSafety", () => {
     "00-Inbox/Imports/A.md",
     "01-Projects/default/A.md",
     "02-Personal/default/A.md",
+    "02-Profiles/default/Memory.md",
     "03-Knowledge/A.md",
     "04-Resources/A.md",
     "07-Private/A.md",
@@ -161,6 +163,39 @@ describe("evaluateImportSafety", () => {
 
     expect(result.decision).toBe("review_required");
     expect(result.reasonCodes).toContain("CATEGORY_REQUIRES_REVIEW");
+  });
+
+  it("requires Review before a newly proposed category is activated", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        classification: classification({
+          primaryCategory: "resource.book",
+          categoryStatus: "proposed",
+          confidence: 0.98,
+        }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      decision: "review_required",
+      reasonCodes: ["CATEGORY_REQUIRES_ACTIVATION"],
+    });
+  });
+
+  it("honors a category policy that always requires Review", () => {
+    const result = evaluateImportSafety(
+      validIntent({
+        classification: classification({
+          primaryCategory: "legal.contract",
+          categoryStatus: "active",
+          categoryRisk: "review_required",
+          confidence: 0.98,
+        }),
+      }),
+    );
+
+    expect(result.reasonCodes).toContain("CATEGORY_REQUIRES_REVIEW");
+    expect(result.decision).toBe("review_required");
   });
 
   it("requires Review for protected destinations", () => {

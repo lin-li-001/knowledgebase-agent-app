@@ -7,6 +7,7 @@ import { ImportDropzone } from "../src/components/ImportDropzone";
 import { ReviewItemCard } from "../src/components/ReviewItemCard";
 import { ChatRoute } from "../src/routes/ChatRoute";
 import { KnowledgeRoute } from "../src/routes/KnowledgeRoute";
+import { SettingsRoute } from "../src/routes/SettingsRoute";
 
 describe("desktop shell", () => {
   afterEach(() => {
@@ -23,6 +24,39 @@ describe("desktop shell", () => {
     expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
     expect(screen.getByRole("complementary", { name: "Activity" })).toBeVisible();
     expect(screen.getByText("No activity yet")).toBeVisible();
+  });
+
+  it("creates a custom category from Settings", async () => {
+    const onCreateCategory = vi.fn(async () => true);
+    render(
+      <SettingsRoute
+        hasApiKey={false}
+        modelName="mock"
+        embeddingBaseUrl="http://127.0.0.1:11434"
+        embeddingModel="bge-m3"
+        workspaceRoot="/tmp/kb"
+        desktopBridgeReady
+        activeCategories={[]}
+        onSave={async () => undefined}
+        onOpenWorkspace={async () => undefined}
+        onCreateWorkspace={async () => undefined}
+        onCreateCategory={onCreateCategory}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Category ID"), { target: { value: "writing" } });
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "Writing" } });
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Personal writing projects." } });
+    fireEvent.change(screen.getByLabelText("Default Destination"), { target: { value: "02-Personal/default/Writing/" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Category" }));
+
+    await waitFor(() => expect(onCreateCategory).toHaveBeenCalledWith({
+      id: "writing",
+      label: "Writing",
+      description: "Personal writing projects.",
+      defaultDestination: "02-Personal/default/Writing/",
+      defaultRisk: "normal",
+    }));
   });
 
   it("renders review proposal payload details", () => {
@@ -60,6 +94,30 @@ describe("desktop shell", () => {
     expect(screen.getByText("hello my name is lin li, i have two kids grace and leo")).toBeVisible();
     expect(screen.getByText("Assistant message")).toBeVisible();
     expect(screen.getByText("Nice to meet you, Lin Li.")).toBeVisible();
+  });
+
+  it("labels source annotations as additions rather than document rewrites", () => {
+    render(
+      <ReviewItemCard
+        item={{
+          id: "review-annotation",
+          state: "proposed",
+          proposalType: "propose_annotation",
+          risk: "medium",
+          targetPath: "04-Resources/Resume.md",
+          reason: "User clarified an imported source.",
+          payload: {
+            path: "04-Resources/Resume.md",
+            body: "This project was completed at Example Corp.",
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Source annotation proposal")).toBeVisible();
+    expect(screen.getByText("Annotation to append")).toBeVisible();
+    expect(screen.getByText("This project was completed at Example Corp.")).toBeVisible();
+    expect(screen.queryByLabelText("Destination")).not.toBeInTheDocument();
   });
 
   it("disables review actions after a proposal is applied", () => {
@@ -129,7 +187,8 @@ describe("desktop shell", () => {
     ).toBeVisible();
     expect(screen.getByLabelText("Category")).toHaveValue("finance.utility");
 
-    fireEvent.change(screen.getByLabelText("Category"), { target: { value: "finance.insurance" } });
+    expect(screen.queryByRole("option", { name: /Insurance/iu })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Category"), { target: { value: "resource" } });
     fireEvent.change(screen.getByLabelText("Destination"), {
       target: { value: "02-Personal/default/Finance/Insurance/Policy.md" },
     });
@@ -140,7 +199,7 @@ describe("desktop shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     expect(approve).toHaveBeenCalledWith("review-1", {
-      categoryOverride: "finance.insurance",
+      categoryOverride: "resource",
       targetPathOverride: "02-Personal/default/Finance/Insurance/Policy.md",
       saveAsRoutingRule: true,
       routingRulePattern: "policy number",

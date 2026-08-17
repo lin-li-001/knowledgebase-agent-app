@@ -4,7 +4,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CostEstimate, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent } from "@kb-agent/model";
 import { appendMessage } from "@kb-agent/storage";
-import { parseMarkdownNote, promoteImportArtifact } from "@kb-agent/workspace";
+import {
+  importedSourceBodyHash,
+  parseMarkdownNote,
+  promoteImportArtifact,
+  wrapImportedSourceBody,
+} from "@kb-agent/workspace";
 import { allowedChannels, handleIpcRequest, isAllowedChannel, restoreWorkspaceFromSettings, type IpcServices } from "../electron/ipc";
 import { readDesktopSettings } from "../electron/secureSettings";
 
@@ -21,6 +26,51 @@ describe("IPC contract", () => {
   it("does not expose unknown channels", () => {
     expect(allowedChannels).not.toContain("shell:exec");
     expect(isAllowedChannel("shell:exec")).toBe(false);
+  });
+
+  it("lists progressive categories and creates a durable user category", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-categories-"));
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      settingsPath: path.join(root, ".desktop/settings.json"),
+    };
+    opened.push(services);
+    await handleIpcRequest(services, "workspace:create", { rootPath: root });
+
+    await expect(handleIpcRequest(services, "categories:list", {})).resolves.toEqual(
+      expect.objectContaining({
+        ok: true,
+        data: expect.objectContaining({
+          activeCategories: expect.arrayContaining([
+            expect.objectContaining({ id: "profile" }),
+            expect.objectContaining({ id: "project" }),
+            expect.objectContaining({ id: "knowledge" }),
+            expect.objectContaining({ id: "resource" }),
+          ]),
+          categories: expect.arrayContaining([
+            expect.objectContaining({ id: "finance.tax" }),
+          ]),
+        }),
+      }),
+    );
+
+    await expect(handleIpcRequest(services, "categories:create", {
+      id: "writing",
+      label: "Writing",
+      description: "Personal writing projects and drafts.",
+      defaultDestination: "02-Personal/default/Writing/",
+      defaultRisk: "normal",
+    })).resolves.toEqual(expect.objectContaining({
+      ok: true,
+      data: expect.objectContaining({
+        activeCategories: expect.arrayContaining([
+          expect.objectContaining({ id: "writing", source: "user" }),
+        ]),
+      }),
+    }));
+
+    await expect(readFile(path.join(root, ".vault/content-categories.json"), "utf8")).resolves.toContain('"id": "writing"');
+    await expect(readFile(path.join(root, "AGENTS.md"), "utf8")).resolves.toContain("`writing`");
   });
 
   it("rejects notes:read paths that escape the workspace", async () => {
@@ -712,6 +762,93 @@ Review can create notes.
     );
   });
 
+  it("appends approved chat annotations without changing imported source evidence", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-annotation-"));
+    const relativePath = "04-Resources/Resume.md";
+    const sourceBody = "Original resume evidence.";
+    await mkdir(path.join(root, "04-Resources"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n", "utf8");
+    await writeFile(path.join(root, relativePath), verifiedImportedNote("Resume", sourceBody), "utf8");
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await expect(handleIpcRequest(services, "workspace:open", { rootPath: root })).resolves.toEqual(
+      expect.objectContaining({ ok: true }),
+    );
+
+    services.db?.sqlite.prepare(
+      `INSERT INTO review_items (
+        id, workspace_id, state, risk, proposal_type, payload_json, reason,
+        target_path, source_session_id, source_turn_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "review-annotation",
+      services.workspaceId,
+      "proposed",
+      "medium",
+      "propose_annotation",
+      JSON.stringify({ path: relativePath, body: "User confirmed this project was completed at Example Corp." }),
+      "User clarified an imported source.",
+      relativePath,
+      services.sessionId,
+      "turn-annotation",
+      "2026-08-16T00:00:00.000Z",
+    );
+
+    await expect(handleIpcRequest(services, "review:approve", { id: "review-annotation" })).resolves.toEqual(
+      { ok: true, data: { id: "review-annotation", state: "applied" } },
+    );
+    const updated = await readFile(path.join(root, relativePath), "utf8");
+    expect(updated).toContain(`${wrapImportedSourceBody(sourceBody)}`);
+    expect(updated).toContain("## Annotations");
+    expect(updated).toContain("User confirmed this project was completed at Example Corp.");
+    expect(updated).toContain("turn `turn-annotation`");
+  });
+
+  it("fails annotation approval after the imported source body changes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-annotation-"));
+    const relativePath = "04-Resources/Resume.md";
+    await mkdir(path.join(root, "04-Resources"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "# Workspace Contract\n", "utf8");
+    await writeFile(
+      path.join(root, relativePath),
+      verifiedImportedNote("Resume", "Changed source body.", importedSourceBodyHash("Original source body.")),
+      "utf8",
+    );
+    const services: IpcServices = {
+      activeTurns: new Set(),
+      settingsPath: path.join(root, ".app/settings.json"),
+    };
+    opened.push(services);
+    await expect(handleIpcRequest(services, "workspace:open", { rootPath: root })).resolves.toEqual(
+      expect.objectContaining({ ok: true }),
+    );
+    services.db?.sqlite.prepare(
+      `INSERT INTO review_items (
+        id, workspace_id, state, risk, proposal_type, payload_json, reason,
+        target_path, source_session_id, source_turn_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "review-changed-source",
+      services.workspaceId,
+      "proposed",
+      "medium",
+      "propose_annotation",
+      JSON.stringify({ path: relativePath, body: "Must not be appended." }),
+      "reason",
+      relativePath,
+      services.sessionId,
+      "turn-1",
+      new Date().toISOString(),
+    );
+
+    const result = await handleIpcRequest(services, "review:approve", { id: "review-changed-source" });
+    expect(result).toEqual({ ok: false, error: "Imported source body integrity check failed" });
+    await expect(readFile(path.join(root, relativePath), "utf8")).resolves.not.toContain("Must not be appended.");
+  });
+
   it("applies user routing overrides and records durable routing rules during review", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-ipc-"));
     await mkdir(path.join(root, "03-Knowledge"), { recursive: true });
@@ -983,6 +1120,26 @@ January bill.
     ).resolves.toEqual({ ok: true, data: { id: "review-import-source-note", state: "applied" } });
     await expect(readFile(path.join(root, destination), "utf8")).resolves.toBe(promotedBody);
     await expect(readFile(path.join(root, "04-Resources/Approved/Do Not Write.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("activates a hidden import category only after Review approval", async () => {
+    const { root, services, destination } = await setupImportedReview();
+
+    await expect(handleIpcRequest(services, "review:approve", {
+      id: "review-import-source-note",
+    })).resolves.toEqual({
+      ok: true,
+      data: { id: "review-import-source-note", state: "applied" },
+    });
+
+    const config = JSON.parse(
+      await readFile(path.join(root, ".vault/content-categories.json"), "utf8"),
+    ) as { activeBuiltInCategories: string[] };
+    expect(config.activeBuiltInCategories).toEqual(expect.arrayContaining([
+      "finance",
+      "finance.utility",
+    ]));
+    await expect(readFile(path.join(root, destination), "utf8")).resolves.toContain("category_status: active");
   });
 
   it("preserves import sensitivity, PDF metadata, and a balanced-parenthesis attachment link on approval", async () => {
@@ -2687,6 +2844,9 @@ function financeImportClassification() {
   return {
     primaryCategory: "finance.utility",
     alternativeCategories: [],
+    categorySource: "detector",
+    categoryStatus: "proposed",
+    categoryRisk: "review_required",
     sensitivity: "personal",
     confidence: 0.8,
     evidence: ["Amount: $123.45", "Due: 2026-01-15"],
@@ -2769,6 +2929,40 @@ tags: []
 ---
 
 # ${title}
+`;
+}
+
+function verifiedImportedNote(
+  title: string,
+  sourceBody: string,
+  sourceBodyHash = importedSourceBodyHash(sourceBody),
+): string {
+  return `---
+title: ${title}
+type: resource
+status: approved
+owner: default
+scope: personal
+sensitivity: personal
+created: 2026-08-16
+tags: [imported]
+source_type: import
+source_file: ../06-Attachments/Imports/${title}.pdf
+source_sha256: ${"a".repeat(64)}
+source_body_sha256: ${sourceBodyHash}
+source_integrity: source_evidence
+extraction_version: 1
+---
+
+# ${title}
+
+## Document
+
+${wrapImportedSourceBody(sourceBody)}
+
+## Source
+
+- Original PDF
 `;
 }
 

@@ -75,6 +75,8 @@ async function adversarialPromotion(
     classification: {
       primaryCategory: "resource",
       alternativeCategories: [],
+      categorySource: "detector",
+      categoryStatus: "active",
       sensitivity: "normal",
       confidence: 1,
       evidence: [],
@@ -874,6 +876,8 @@ async function decoyPromotion(fileOps: ImportFileOps) {
     classification: {
       primaryCategory: "resource",
       alternativeCategories: [],
+      categorySource: "detector",
+      categoryStatus: "active",
       sensitivity: "normal",
       confidence: 1,
       evidence: [],
@@ -1335,6 +1339,7 @@ void shouldSkipDirectory(".app");
       const secureIoSource = await readFile(path.join(repoRoot, "packages/workspace/src/secureWorkspaceIo.ts"), "utf8");
       const writeLockSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspaceWriteLock.ts"), "utf8");
       const importRoutingSource = await readFile(path.join(repoRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), "utf8");
+      const contentCategoriesSource = await readFile(path.join(repoRoot, "packages/workspace/src/contentCategories.ts"), "utf8");
       const workspaceSource = await readFile(path.join(repoRoot, "packages/workspace/src/workspace.ts"), "utf8");
       const indexerSource = await readFile(path.join(repoRoot, "packages/workspace/src/indexer.ts"), "utf8");
       const ipcSource = await readFile(path.join(repoRoot, "apps/desktop/electron/ipc.ts"), "utf8");
@@ -1345,6 +1350,7 @@ void shouldSkipDirectory(".app");
       await writeFile(path.join(tempRoot, "packages/workspace/src/secureWorkspaceIo.ts"), secureIoSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/workspaceWriteLock.ts"), writeLockSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/importCandidateRoutingPolicy.ts"), importRoutingSource);
+      await writeFile(path.join(tempRoot, "packages/workspace/src/contentCategories.ts"), contentCategoriesSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/workspace.ts"), workspaceSource);
       await writeFile(path.join(tempRoot, "packages/workspace/src/indexer.ts"), indexerSource);
       await mkdir(path.join(tempRoot, "apps/desktop/electron"), { recursive: true });

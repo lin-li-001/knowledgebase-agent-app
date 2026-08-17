@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyReviewItem, transitionReviewState } from "../src/index";
+import { importedSourceBodyHash, wrapImportedSourceBody } from "@kb-agent/workspace";
 
 describe("review lifecycle", () => {
   it("allows valid transitions", () => {
@@ -65,6 +66,27 @@ describe("review lifecycle", () => {
     await expect(readFile(targetPath, "utf8")).resolves.toBe("changed body");
   });
 
+  it("rejects generic patches that rewrite an imported source body", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "kb-agent-review-"));
+    const targetPath = path.join(root, "Resume.md");
+    const sourceBody = "Original resume evidence.";
+    const current = importedSourceNote(sourceBody);
+    const changed = importedSourceNote("Rewritten resume evidence.", importedSourceBodyHash(sourceBody));
+    await writeFile(targetPath, current, "utf8");
+
+    await expect(applyReviewItem({
+      id: "review-source-rewrite",
+      state: "approved",
+      targetPath,
+      patch: {
+        kind: "replace_body",
+        baseContentHash: hash(current),
+        nextBody: changed,
+      },
+    }, root)).rejects.toThrow("Imported source body cannot be modified");
+    await expect(readFile(targetPath, "utf8")).resolves.toBe(current);
+  });
+
   it("rejects patches outside the workspace", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-review-"));
     const outsideRoot = await mkdtemp(path.join(tmpdir(), "kb-agent-review-outside-"));
@@ -89,4 +111,30 @@ describe("review lifecycle", () => {
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function importedSourceNote(body: string, bodyHash = importedSourceBodyHash(body)): string {
+  return `---
+title: Resume
+type: resource
+status: approved
+owner: default
+scope: personal
+sensitivity: personal
+created: 2026-08-16
+tags: [imported]
+source_type: import
+source_file: Resume.pdf
+source_sha256: ${"a".repeat(64)}
+source_body_sha256: ${bodyHash}
+source_integrity: source_evidence
+extraction_version: 1
+---
+
+# Resume
+
+## Document
+
+${wrapImportedSourceBody(body)}
+`;
 }

@@ -170,6 +170,7 @@ export interface HybridNotesRecallProviderOptions {
   embeddingProvider: EmbeddingProvider;
   vectorIndex: VectorIndex;
   limit?: number;
+  maxChunksPerNote?: number;
   filters?: Omit<VectorSearchFilters, "workspaceId">;
   rrfK?: number;
 }
@@ -182,6 +183,7 @@ export class HybridNotesRecallProvider implements RecallProvider {
   private readonly vectorIndex: VectorIndex;
   private readonly filters: Omit<VectorSearchFilters, "workspaceId">;
   private readonly rrfK: number;
+  private readonly maxChunksPerNote: number;
 
   constructor(options: HybridNotesRecallProviderOptions) {
     this.limit = options.limit ?? 5;
@@ -189,25 +191,42 @@ export class HybridNotesRecallProvider implements RecallProvider {
     this.vectorIndex = options.vectorIndex;
     this.filters = options.filters ?? { excludedStatuses: ["pending_review", "blocked", "rejected"] };
     this.rrfK = options.rrfK ?? 60;
+    this.maxChunksPerNote = options.maxChunksPerNote ?? 2;
   }
 
   async prefetch(input: RecallQuery): Promise<EvidenceBundle[]> {
+    const filters: VectorSearchFilters = { ...this.filters, workspaceId: input.workspaceId };
+    const lexicalPromise = searchNotes(input.db, input.query, {
+      workspaceId: input.workspaceId,
+      limit: this.limit * 4,
+      ...(filters.excludedStatuses ? { excludedStatuses: filters.excludedStatuses } : {}),
+      ...(filters.statuses ? { statuses: filters.statuses } : {}),
+      ...(filters.sensitivities ? { sensitivities: filters.sensitivities } : {}),
+      ...(filters.categories ? { categories: filters.categories } : {}),
+    }).catch((): NoteSearchResult[] => []);
+    const semanticPromise = this.embeddingProvider.embedQuery(input.query)
+      .then(async (queryVector) => {
+        const [noteResults, chunkResults] = await Promise.all([
+          this.vectorIndex.searchNotes(queryVector, filters, this.limit * 4)
+            .catch((): NoteVectorSearchResult[] => []),
+          this.vectorIndex.searchChunks(queryVector, filters, this.limit * 8)
+            .catch((): ChunkVectorSearchResult[] => []),
+        ]);
+        return { noteResults, chunkResults };
+      })
+      .catch(() => ({
+        noteResults: [] as NoteVectorSearchResult[],
+        chunkResults: [] as ChunkVectorSearchResult[],
+      }));
+
     try {
-      const queryVector = await this.embeddingProvider.embedQuery(input.query);
-      const filters: VectorSearchFilters = { ...this.filters, workspaceId: input.workspaceId };
-      const [lexicalResults, noteResults, chunkResults] = await Promise.all([
-        searchNotes(input.db, input.query, {
-          workspaceId: input.workspaceId,
-          limit: this.limit * 4,
-          ...(filters.excludedStatuses ? { excludedStatuses: filters.excludedStatuses } : {}),
-          ...(filters.statuses ? { statuses: filters.statuses } : {}),
-          ...(filters.sensitivities ? { sensitivities: filters.sensitivities } : {}),
-          ...(filters.categories ? { categories: filters.categories } : {}),
-        }),
-        this.vectorIndex.searchNotes(queryVector, filters, this.limit * 4),
-        this.vectorIndex.searchChunks(queryVector, filters, this.limit * 8),
-      ]);
-      return this.rerankHybridCandidates(input.db, lexicalResults, noteResults, chunkResults);
+      const [lexicalResults, semanticResults] = await Promise.all([lexicalPromise, semanticPromise]);
+      return this.rerankHybridCandidates(
+        input.db,
+        lexicalResults,
+        semanticResults.noteResults,
+        semanticResults.chunkResults,
+      );
     } catch {
       return [];
     }
@@ -221,67 +240,91 @@ export class HybridNotesRecallProvider implements RecallProvider {
   ): EvidenceBundle[] {
     const lexicalRanks = rankBy(lexicalResults, (result) => result.noteId);
     const noteRanks = rankBy(noteResults, (result) => result.noteId);
-    const chunkRanks = rankBy(chunkResults, (result) => result.chunkId);
-    const candidates: RerankCandidate[] = [];
+    const chunkNoteRanks = rankBy(chunkResults, (result) => result.noteId);
+    const lexicalByNote = new Map(lexicalResults.map((result) => [result.noteId, result]));
+    const semanticByNote = new Map(noteResults.map((result) => [result.noteId, result]));
+    const chunksByNote = new Map<string, ChunkVectorSearchResult[]>();
 
     for (const result of chunkResults) {
-      const score = rrfScore(chunkRanks.get(result.chunkId)!, this.rrfK)
-        + rrfScore(lexicalRanks.get(result.noteId), this.rrfK)
-        + rrfScore(noteRanks.get(result.noteId), this.rrfK)
-        + 0.001;
-      candidates.push({
-        key: `chunk:${result.chunkId}`,
-        score,
-        evidence: this.chunkEvidence(db, result, score),
-      });
+      const existing = chunksByNote.get(result.noteId) ?? [];
+      existing.push(result);
+      chunksByNote.set(result.noteId, existing);
     }
 
-    for (const result of lexicalResults) {
-      const score = rrfScore(lexicalRanks.get(result.noteId), this.rrfK)
-        + rrfScore(noteRanks.get(result.noteId), this.rrfK);
-      candidates.push({
-        key: `note:${result.noteId}`,
+    const noteIds = new Set([
+      ...lexicalResults.map((result) => result.noteId),
+      ...noteResults.map((result) => result.noteId),
+      ...chunkResults.map((result) => result.noteId),
+    ]);
+    const groups = [...noteIds].map((noteId) => {
+      const score = rrfScore(lexicalRanks.get(noteId), this.rrfK)
+        + rrfScore(noteRanks.get(noteId), this.rrfK)
+        + rrfScore(chunkNoteRanks.get(noteId), this.rrfK);
+      const chunks = (chunksByNote.get(noteId) ?? [])
+        .slice(0, this.maxChunksPerNote)
+        .map((result) => this.chunkEvidence(db, result, score));
+      const evidence = chunks.length > 0
+        ? chunks
+        : [this.noteEvidence(db, noteId, lexicalByNote.get(noteId), semanticByNote.get(noteId), score)];
+      return { noteId, score, evidence };
+    }).sort((left, right) => right.score - left.score || left.noteId.localeCompare(right.noteId));
+
+    const results: EvidenceBundle[] = [];
+    for (let candidateIndex = 0; results.length < this.limit; candidateIndex += 1) {
+      let added = false;
+      for (const group of groups) {
+        const evidence = group.evidence[candidateIndex];
+        if (evidence === undefined) continue;
+        results.push(evidence);
+        added = true;
+        if (results.length >= this.limit) break;
+      }
+      if (!added) break;
+    }
+    return results;
+  }
+
+  private noteEvidence(
+    db: AppDatabase,
+    noteId: string,
+    lexicalResult: NoteSearchResult | undefined,
+    semanticResult: NoteVectorSearchResult | undefined,
+    score: number,
+  ): EvidenceBundle {
+    if (lexicalResult !== undefined) {
+      return {
+        provider: this.name,
+        sourceType: "note",
+        title: lexicalResult.title,
+        path: lexicalResult.path,
+        text: lexicalResult.summary ?? lexicalResult.snippet ?? "",
+        ...(lexicalResult.summary
+          ? { snippet: lexicalResult.summary }
+          : lexicalResult.snippet
+            ? { snippet: lexicalResult.snippet }
+            : {}),
+        ...(lexicalResult.matchedFields?.length ? { matchedFields: lexicalResult.matchedFields } : {}),
         score,
-        evidence: {
-          provider: this.name,
-          sourceType: "note",
-          title: result.title,
-          path: result.path,
-          text: result.summary ?? result.snippet ?? "",
-          ...(result.summary ? { snippet: result.summary } : result.snippet ? { snippet: result.snippet } : {}),
-          ...(result.matchedFields?.length ? { matchedFields: result.matchedFields } : {}),
-          score,
-          noteId: result.noteId,
-        },
-      });
+        noteId,
+      };
     }
 
-    for (const result of noteResults) {
-      if (lexicalRanks.has(result.noteId)) continue;
-      const note = db.sqlite.prepare("SELECT title, path, summary FROM notes WHERE id = ?").get(result.noteId) as {
-        title: string;
-        path: string;
-        summary?: string;
-      } | undefined;
-      const score = rrfScore(noteRanks.get(result.noteId), this.rrfK);
-      candidates.push({
-        key: `note:${result.noteId}`,
-        score,
-        evidence: {
-          provider: this.name,
-          sourceType: "note",
-          title: note?.title ?? result.noteId,
-          path: note?.path ?? "",
-          text: note?.summary ?? "",
-          ...(note?.summary ? { snippet: note.summary } : {}),
-          score,
-          noteId: result.noteId,
-          matchedFields: ["title", "summary", "content_category"],
-        },
-      });
-    }
-
-    return rerankCandidates(candidates, this.limit);
+    const note = db.sqlite.prepare("SELECT title, path, summary FROM notes WHERE id = ?").get(noteId) as {
+      title: string;
+      path: string;
+      summary?: string;
+    } | undefined;
+    return {
+      provider: this.name,
+      sourceType: "note",
+      title: note?.title ?? noteId,
+      path: note?.path ?? "",
+      text: note?.summary ?? "",
+      ...(note?.summary ? { snippet: note.summary } : {}),
+      score,
+      noteId,
+      ...(semanticResult === undefined ? {} : { matchedFields: ["title", "summary", "content_category"] }),
+    };
   }
 
   private chunkEvidence(db: AppDatabase, result: ChunkVectorSearchResult, score: number): EvidenceBundle {
@@ -317,7 +360,12 @@ export class HybridNotesRecallProvider implements RecallProvider {
 }
 
 function rankBy<T>(results: T[], keyOf: (result: T) => string): Map<string, number> {
-  return new Map(results.map((result, index) => [keyOf(result), index + 1]));
+  const ranks = new Map<string, number>();
+  results.forEach((result, index) => {
+    const key = keyOf(result);
+    if (!ranks.has(key)) ranks.set(key, index + 1);
+  });
+  return ranks;
 }
 
 function rrfScore(rank: number | undefined, k: number): number {

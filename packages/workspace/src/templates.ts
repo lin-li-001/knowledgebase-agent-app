@@ -1,9 +1,16 @@
+import {
+  createContentCategoryRegistry,
+  renderContentCategoryContract,
+} from "./contentCategories";
+
 export const workspaceRoutingPolicyContract = `## Routing Policy
 
 The app uses a code-enforced routing policy for filesystem writes. This contract explains the default paths so users can inspect and audit where knowledge goes.
 
 - Imported source Markdown notes remain non-indexed under \`.app/import-staging/<import-id>/<source-stem>.md\` while pending Review; low-risk imports are immediately written to \`00-Inbox/Imports/\`.
 - Each imported source note records \`route_status\` and \`route_destination\`; a Review approval moves that same note to its final destination.
+- The \`## Document\` body of an imported source note is source evidence. Agent proposals must not rewrite it.
+- Chat may propose Review-gated metadata changes or append a provenance-bearing \`## Annotations\` entry. Cross-document synthesis belongs in a separate note that cites its sources.
 - Pending import notes are non-indexed under \`.app/import-staging/\`.
 - The Safety Kernel must approve every final import write.
 - Imported original files go to \`06-Attachments/Imports/<batch-name>/\`.
@@ -26,6 +33,7 @@ Saved workspace routing rules never bypass Review.
 Read tools may inspect notes and indexed sessions. Write tools must follow the risk policy:
 - low-risk new notes may auto-save and record activity
 - profile, memory, sensitive, private, formal-note updates require Review
+- imported source annotations require Review; imported source-body replacement is not allowed
 - delete, overwrite, move, and external account changes require explicit confirmation
 `;
 
@@ -33,7 +41,10 @@ export const workspaceContract = `# Workspace Contract
 
 Markdown files are the source of truth. SQLite files under \`.app/\` are derived runtime state.
 
-${workspaceRoutingPolicyContract}`;
+${workspaceRoutingPolicyContract}
+
+${renderContentCategoryContract(createContentCategoryRegistry())}
+`;
 
 export const profileTemplate = `---
 title: Default Profile

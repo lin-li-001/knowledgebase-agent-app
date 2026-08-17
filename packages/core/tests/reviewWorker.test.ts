@@ -96,6 +96,40 @@ describe("review worker", () => {
     ]);
   });
 
+  it("allows a source annotation proposal for an explicit document clarification", async () => {
+    const annotationTurn = {
+      ...baseTurn,
+      userMessage: "Add a note to my imported resume: this project was completed at Example Corp.",
+    };
+    const calls: unknown[] = [];
+    const handlers = new Map<MvpToolName, ToolHandler>([[
+      "propose_annotation",
+      async (input) => {
+        calls.push(input);
+        return { reviewItemId: "review-annotation" };
+      },
+    ]]);
+    const provider = new MockProvider([{
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "call-annotation",
+        name: "propose_annotation",
+        argumentsJson: JSON.stringify({
+          path: "04-Resources/Resume.md",
+          body: "User confirmed this project was completed at Example Corp.",
+          source: { origin: "turn_reflection" },
+        }),
+      }],
+    }]);
+
+    await expect(runReviewJob({ turn: annotationTurn, modelProvider: provider, model: "mock", handlers })).resolves.toEqual({
+      state: "reviewed",
+      toolCalls: ["propose_annotation"],
+    });
+    expect(calls).toHaveLength(1);
+  });
+
   it("rejects unsafe worker tool calls", async () => {
     const provider = new MockProvider([
       {

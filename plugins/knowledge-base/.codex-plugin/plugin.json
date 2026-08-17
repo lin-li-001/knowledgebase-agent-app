@@ -1,0 +1,19 @@
+{
+  "name": "knowledge-base",
+  "version": "0.1.0",
+  "description": "Search a user's governed personal knowledge base for facts from their education, career, projects, decisions, preferences, and saved materials, with Review-gated note proposals.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Knowledge Base",
+    "shortDescription": "Find personal facts and saved knowledge with source citations.",
+    "longDescription": "Use this plugin when a question may depend on the user's own records, including education and graduation dates, career history, personal facts and preferences, projects, prior decisions, or saved notes and reference materials. Search the connected knowledge base and cite returned note paths and line locations. Only accepted, externally eligible notes are exposed; private, restricted, pending, blocked, and rejected content stays local. When the user explicitly asks to save something, the plugin may create a local Review proposal but never writes a note without local approval.",
+    "developerName": "Knowledge Base Agent",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Search my connected knowledge base before answering questions that may depend on my education, career, personal facts, preferences, projects, decisions, saved notes, or reference materials.",
+      "Use returned note paths and line locations as citations, and do not invent personal facts when the knowledge base has no supporting evidence.",
+      "Only propose saving content when I explicitly ask, and require local Review approval before any note is written."
+    ]
+  }
+}

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@kb-agent/core": "workspace:^",
+    "@kb-agent/gateway": "workspace:^",
     "@kb-agent/model": "workspace:^",
     "@kb-agent/storage": "workspace:^",
     "@kb-agent/workspace": "workspace:^",

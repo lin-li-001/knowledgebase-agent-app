@@ -78,13 +78,13 @@ describe("startImportBatch", () => {
       expect.objectContaining({
         status: "pending_review",
         safetyDecision: expect.objectContaining({ decision: "review_required" }),
-        destination: "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md",
+        destination: "02-Personal/default/Finance/Utilities/2026-01 Electric.md",
       }),
     ]);
     const sourceNotePath = job.notes[0]!.notePath;
     const stagedBody = await readFile(path.join(root, sourceNotePath), "utf8");
     expect(stagedBody).toContain("route_status: pending_review");
-    await expect(readFile(path.join(root, "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(root, "02-Personal/default/Finance/Utilities/2026-01 Electric.md"), "utf8")).rejects.toThrow();
 
     expect(
       db.sqlite
@@ -94,7 +94,7 @@ describe("startImportBatch", () => {
       {
         proposalType: "propose_create_note",
         risk: "high",
-        targetPath: "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md",
+        targetPath: "02-Personal/default/Finance/Utilities/2026-01 Electric.md",
         payloadJson: expect.any(String),
       },
     ]);
@@ -105,7 +105,7 @@ describe("startImportBatch", () => {
       expect.objectContaining({
         sourceNotePath,
         body: stagedBody,
-        destination: "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md",
+        destination: "02-Personal/default/Finance/Utilities/2026-01 Electric.md",
         sourceFile: "2026-01 Electric.txt",
         classification: expect.objectContaining({
           primaryCategory: "finance.utility",
@@ -129,7 +129,7 @@ describe("startImportBatch", () => {
   it("records a blocked import as an error without creating an approvable Review item", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-"));
     const sourceDir = await mkdtemp(path.join(tmpdir(), "kb-agent-core-import-sources-"));
-    const destination = "02-Personal/default/Finance/Utilities/2026/2026-01 Electric.md";
+    const destination = "02-Personal/default/Finance/Utilities/2026-01 Electric.md";
     await mkdir(path.join(root, ".app"), { recursive: true });
     await mkdir(path.dirname(path.join(root, destination)), { recursive: true });
     const db = openAppDatabase(path.join(root, ".app/index.sqlite"));

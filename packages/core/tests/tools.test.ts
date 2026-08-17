@@ -12,5 +12,12 @@ describe("tool registry", () => {
       expect(tool.maxResultSize).toBeGreaterThan(0);
       expect(tool.riskCategory).toMatch(/read|low|medium|high|explicit/u);
     }
+
+    const annotation = registry.get("propose_annotation");
+    expect(annotation?.riskCategory).toBe("medium");
+    expect(annotation?.parameters.safeParse({
+      path: "04-Resources/Resume.md",
+      body: "User confirmed the project context.",
+    }).success).toBe(true);
   });
 });

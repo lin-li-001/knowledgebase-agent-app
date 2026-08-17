@@ -23,6 +23,8 @@ Rules:
 - Prefer propose_memory for stable user preferences or personal facts.
 - Prefer propose_decision for durable project or architecture decisions.
 - Prefer propose_create_note when an import summary or resource note should be created.
+- Use propose_annotation only when the user explicitly supplements or corrects one specific imported source document. Append the clarification; never rewrite its Document section.
+- Use propose_create_note for cross-document career, project, or technical synthesis and cite the source document paths instead of copying their full text.
 - Every proposal tool call must include a source object with origin "turn_reflection", the original userMessage, the assistantMessage, and a short reason.
 - Never delete, overwrite, move files, call external connectors, use shell/browser access, or access arbitrary filesystem APIs.
 
